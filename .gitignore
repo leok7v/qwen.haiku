@@ -1,0 +1,52 @@
+# Build outputs
+build/
+Build/
+DerivedData/
+*.o
+*.a
+llm/llm
+tools/dump_kvs
+tools/q4k_diff
+tools/q5k_diff
+tools/q6k_diff
+tools/q8k_diff
+
+# Xcode user state
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+.clangd/
+.cache/
+
+# Project-local scratch
+tmp/
+
+# AI agent tooling — local only, never committed.
+# (Patterns match both directories and symlinks of the same name.)
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.agents
+.agents/
+.claude
+.claude/
+.gemini
+.gemini/
+.agentignore
+.claudeignore
+.geminiignore
+.cursorignore
+.aiderignore
+.claude-template-applied
+
+# Downloaded model files — anything ending in .gguf
+# (the app stores these in Library/Caches/, not the repo, but
+#  occasionally tools/ shells stash one here for debugging)
+*.gguf
