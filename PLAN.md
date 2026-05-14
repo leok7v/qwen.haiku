@@ -195,6 +195,33 @@ Future investigation:
   some specific decode step. Catch with `LLM_TRACE_TOKENS=1` and
   see whether llama.cpp picks the same token at that position.
 
+## Perf vs llama.cpp (Apple M3, 4 threads, 2026-05-14)
+
+`tools/perf-bench.sh` feeds ~512 prefill tokens, asks for 128 new
+tokens at T=0, repeats 3x; llama-bench is run with default
+`p=512 n=128 r=3` on both Metal and CPU.
+
+| runner | pp tok/s | tg tok/s | pp gap | tg gap |
+|---|---|---|---|---|
+| ours (CPU NEON + dispatch_apply) | ~22 | ~22 | 1.0x | 1.0x |
+| llama.cpp CPU (`-ngl 0`)         | 266 | 29  | 12x  | 1.3x |
+| llama.cpp Metal (default)        | 1047 | 47 | 48x  | 2.1x |
+
+Interpretation:
+- **Token-generation (tg) is competitive.** Within 1.3x of llama.cpp
+  CPU on the per-token decode loop where both runners do one
+  forward step at a time. Our NEON Q-quant kernels + GCD threading
+  are pulling their weight.
+- **Prompt-processing (pp) is 12x behind.** llama.cpp batches
+  prefill tokens into a single GEMM with `n_batch=2048`, getting
+  huge memory-bandwidth amortization; we run per-token. Closing
+  this gap is the same multi-token batched-forward refactor that
+  task #35 (chunked SSM) needs - around 1000 LOC touching KV
+  writes, conv state, attention, RMS norm, FFN. Not a small
+  commit.
+- **Metal adds another ~3x** on top of CPU on both phases; this is
+  the GPU-parallelism win and is out of scope for a CPU-only runner.
+
 ## Things that look like bugs but aren't
 
 A fresh agent (or human) should know about these before reaching for
