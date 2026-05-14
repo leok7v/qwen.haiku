@@ -37,16 +37,33 @@ public enum QwenError: Error, CustomStringConvertible {
 public final class Qwen: @unchecked Sendable {
 
     public struct Options {
-        public var temperature: Float
-        public var topK:        Int
-        public var maxNew:      Int
-        public var minNew:      Int
-        public init(temperature: Float = 0.0, topK: Int = 40,
-                    maxNew: Int = 256, minNew: Int = 0) {
-            self.temperature = temperature
-            self.topK        = topK
-            self.maxNew      = maxNew
-            self.minNew      = minNew
+        public var temperature:       Float
+        public var topK:              Int
+        public var topP:              Float
+        public var minP:              Float
+        public var repetitionPenalty: Float
+        public var repetitionWindow:  Int
+        public var maxNew:            Int
+        public var minNew:            Int
+        public var seed:              UInt64
+        public init(temperature:       Float  = 0.0,
+                    topK:              Int    = 40,
+                    topP:              Float  = 0.0,
+                    minP:              Float  = 0.0,
+                    repetitionPenalty: Float  = 1.0,
+                    repetitionWindow:  Int    = 64,
+                    maxNew:            Int    = 256,
+                    minNew:            Int    = 0,
+                    seed:              UInt64 = 0) {
+            self.temperature       = temperature
+            self.topK              = topK
+            self.topP              = topP
+            self.minP              = minP
+            self.repetitionPenalty = repetitionPenalty
+            self.repetitionWindow  = repetitionWindow
+            self.maxNew            = maxNew
+            self.minNew            = minNew
+            self.seed              = seed
         }
     }
 
@@ -107,16 +124,25 @@ public final class Qwen: @unchecked Sendable {
         let box = ContinuationBox(onToken: onToken)
         let boxRef = Unmanaged.passRetained(box)
         defer { boxRef.release() }
+        var sampler = llm_sampler(
+            temperature:        options.temperature,
+            top_k:              Int32(options.topK),
+            top_p:              options.topP,
+            min_p:              options.minP,
+            repetition_penalty: options.repetitionPenalty,
+            repetition_window:  Int32(options.repetitionWindow))
         _ = ids.withUnsafeBufferPointer { buf -> Int32 in
-            return Int32(llm_generate(
-                ctx,
-                buf.baseAddress, n,
-                Int32(options.maxNew),
-                Int32(options.minNew),
-                options.temperature,
-                Int32(options.topK),
-                qwenTokenTrampoline,
-                UnsafeMutableRawPointer(boxRef.toOpaque())))
+            return withUnsafePointer(to: &sampler) { sp in
+                Int32(llm_generate(
+                    ctx,
+                    buf.baseAddress, n,
+                    Int32(options.maxNew),
+                    Int32(options.minNew),
+                    sp,
+                    options.seed,
+                    qwenTokenTrampoline,
+                    UnsafeMutableRawPointer(boxRef.toOpaque())))
+            }
         }
     }
 

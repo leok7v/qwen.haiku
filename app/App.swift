@@ -113,15 +113,22 @@ final class QwenViewModel {
     private func loadModel() async {
         if let dl = self.downloader {
             let path = dl.localURL
-            // Chat sampling: Qwen3.5 non-thinking default is T=1.0,
-            // top_k=20. minNew=8 suppresses eos / `<|im_end|>` for the
-            // first 8 sampling steps so the model is forced to commit
-            // to actual content instead of emitting an immediate
-            // end-of-turn (an occasional T=1.0 failure mode that
-            // produces an empty assistant bubble). top_p / min_p /
-            // penalties land with task #21.
-            let opts = Qwen.Options(temperature: 1.0, topK: 20,
-                                    maxNew: 512, minNew: 8)
+            // Chat sampling. Qwen3.5 page-recommended values for
+            // non-thinking mode are T=1.0, top_p=1.0, top_k=20,
+            // presence_penalty=2.0, but on a 0.8B model those values
+            // happily generate "**Life is what is** /no /no /no"
+            // repetition loops. Pulled top_p down to 0.95 and added
+            // repetition_penalty=1.1 (llama.cpp's typical chat
+            // preset) to keep the model out of the loop attractor.
+            // minNew=8 suppresses eos / `<|im_end|>` for the first 8
+            // sampling steps so the model can't emit an empty bubble.
+            let opts = Qwen.Options(temperature:       1.0,
+                                    topK:              20,
+                                    topP:              0.95,
+                                    repetitionPenalty: 1.1,
+                                    repetitionWindow:  64,
+                                    maxNew:            512,
+                                    minNew:            8)
             do {
                 let loaded = try await Task.detached(priority: .userInitiated) {
                     try Qwen(modelPath: path, options: opts)

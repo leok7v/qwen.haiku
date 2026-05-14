@@ -27,6 +27,7 @@
 //        streamed token-by-token.
 
 #include "tensor.c"
+#include "llm.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -1420,6 +1421,7 @@ int g_no_q8k_rt = 0;
 // perf rewrites that change the underlying logits but keep the
 // argmax stable.
 static int g_trace_tokens = 0;
+static int g_min_new      = 0;
 
 // DUMP(label, data, n) - one-line dump-when-this-layer-is-selected.
 // Captures `c` (the llm_ctx) and `L` (the current layer index) from
@@ -1973,59 +1975,182 @@ static int32_t sample_argmax(const struct tensor * logits) {
     return best;
 }
 
-static int32_t sample_temperature_topk(const struct tensor * logits,
-                                       float temperature, int32_t top_k) {
-    int32_t r = 0;
-    if (temperature <= 0.0f) {
-        r = sample_argmax(logits);
-    } else {
-        int64_t n = tensor_nelements(logits);
-        // Build top-k by linear scan (k is small; vocab size up to ~150k).
-        int32_t k = top_k > 0 ? top_k : (int32_t)n;
-        if (k > 64) { k = 64; }  // hard cap for the rnd-phase sampler
-        int32_t idx[64];
-        float   val[64];
-        int32_t filled = 0;
-        for (int64_t i = 0; i < n; i++) {
-            float lv = logits->data[i];
-            if (filled < k) {
-                idx[filled] = (int32_t)i;
-                val[filled] = lv;
-                filled++;
-            } else {
-                int32_t worst = 0;
-                for (int32_t j = 1; j < k; j++) {
-                    if (val[j] < val[worst]) { worst = j; }
-                }
-                if (lv > val[worst]) {
-                    idx[worst] = (int32_t)i;
-                    val[worst] = lv;
-                }
-            }
+// xoroshiro128** PRNG (Blackman/Vigna, public-domain reference).
+// Cheap, seedable, much better statistical quality than libc rand().
+// Returns a uniform u64; the sampler divides into [0, 1) below.
+struct rng { uint64_t s0, s1; };
+
+static inline uint64_t rng_rotl(uint64_t x, int k) {
+    return (x << k) | (x >> (64 - k));
+}
+
+static uint64_t rng_next(struct rng * r) {
+    uint64_t s0    = r->s0;
+    uint64_t s1    = r->s1;
+    uint64_t res   = rng_rotl(s0 * 5, 7) * 9;
+    s1            ^= s0;
+    r->s0          = rng_rotl(s0, 24) ^ s1 ^ (s1 << 16);
+    r->s1          = rng_rotl(s1, 37);
+    return res;
+}
+
+// SplitMix64 to expand a single 64-bit seed into the two-word state.
+static void rng_seed(struct rng * r, uint64_t seed) {
+    uint64_t z = seed + 0x9e3779b97f4a7c15ULL;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    r->s0 = z ^ (z >> 31);
+    z     = (r->s0 + 0x9e3779b97f4a7c15ULL);
+    z     = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z     = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    r->s1 = z ^ (z >> 31);
+    // Avoid the all-zero state, which would lock xoroshiro at zero.
+    if (r->s0 == 0 && r->s1 == 0) { r->s0 = 1; }
+}
+
+static inline float rng_uniform(struct rng * r) {
+    // 24-bit mantissa, divided to [0, 1).
+    return (float)(rng_next(r) >> 40) / (float)(1u << 24);
+}
+
+struct llm_sampler llm_sampler_default(void) {
+    struct llm_sampler s;
+    s.temperature        = 1.0f;
+    s.top_k              = 20;
+    s.top_p              = 0.95f;
+    s.min_p              = 0.0f;
+    s.repetition_penalty = 1.05f;
+    s.repetition_window  = 64;
+    return s;
+}
+
+// Apply repetition penalty in-place to `logits`: any token id that
+// appears in the recent-history window is scaled by /penalty
+// (positive logits become less likely) or *penalty (negative logits
+// become MORE negative). Standard llama.cpp convention.
+static void apply_rep_penalty(struct tensor * logits,
+                              const int32_t * history, int32_t hist_n,
+                              float penalty, int32_t window) {
+    if (penalty == 1.0f || hist_n == 0) { return; }
+    int32_t start = (window > 0 && window < hist_n) ? hist_n - window : 0;
+    int64_t vlen  = tensor_nelements(logits);
+    for (int32_t i = start; i < hist_n; i++) {
+        int32_t t = history[i];
+        if (t >= 0 && (int64_t)t < vlen) {
+            float lv = logits->data[t];
+            logits->data[t] = (lv > 0.0f) ? (lv / penalty) : (lv * penalty);
         }
-        // Softmax over top-k with temperature.
-        float m = val[0];
-        for (int32_t j = 1; j < filled; j++) {
-            if (val[j] > m) { m = val[j]; }
-        }
-        float sum = 0.0f;
-        for (int32_t j = 0; j < filled; j++) {
-            val[j] = expf((val[j] - m) / temperature);
-            sum   += val[j];
-        }
-        float u = (float)rand() / (float)RAND_MAX;
-        float c = 0.0f;
-        int32_t picked = 0;
-        for (int32_t j = 0; j < filled; j++) {
-            c += val[j] / sum;
-            if (u <= c) {
-                picked = j;
-                j      = filled;
-            }
-        }
-        r = idx[picked];
     }
-    return r;
+}
+
+// Top-k filter into parallel arrays (idx, val) of length filled.
+// Linear scan; k is capped to LLM_SAMPLE_TOPK_MAX so the working set
+// fits in a stack buffer.
+#define LLM_SAMPLE_TOPK_MAX 256
+
+static int32_t topk_collect(const struct tensor * logits, int32_t k,
+                            int32_t * idx, float * val) {
+    int64_t n      = tensor_nelements(logits);
+    if (k <= 0 || k > LLM_SAMPLE_TOPK_MAX) { k = LLM_SAMPLE_TOPK_MAX; }
+    int32_t filled = 0;
+    for (int64_t i = 0; i < n; i++) {
+        float lv = logits->data[i];
+        if (filled < k) {
+            idx[filled] = (int32_t)i;
+            val[filled] = lv;
+            filled++;
+        } else {
+            int32_t worst = 0;
+            for (int32_t j = 1; j < k; j++) {
+                if (val[j] < val[worst]) { worst = j; }
+            }
+            if (lv > val[worst]) {
+                idx[worst] = (int32_t)i;
+                val[worst] = lv;
+            }
+        }
+    }
+    return filled;
+}
+
+// Softmax over `filled` candidates with temperature; writes the
+// normalized probability into `val` (replacing logits).
+static void topk_softmax(float * val, int32_t filled, float temperature) {
+    float m = val[0];
+    for (int32_t j = 1; j < filled; j++) {
+        if (val[j] > m) { m = val[j]; }
+    }
+    float sum = 0.0f;
+    for (int32_t j = 0; j < filled; j++) {
+        val[j] = expf((val[j] - m) / temperature);
+        sum   += val[j];
+    }
+    if (sum > 0.0f) {
+        for (int32_t j = 0; j < filled; j++) { val[j] /= sum; }
+    }
+}
+
+// Sort (idx, val) pairs by val descending using insertion sort
+// (filled <= 256 in practice; cheaper than qsort overhead).
+static void topk_sort_desc(int32_t * idx, float * val, int32_t filled) {
+    for (int32_t i = 1; i < filled; i++) {
+        float   v = val[i];
+        int32_t k = idx[i];
+        int32_t j = i - 1;
+        while (j >= 0 && val[j] < v) {
+            val[j + 1] = val[j];
+            idx[j + 1] = idx[j];
+            j--;
+        }
+        val[j + 1] = v;
+        idx[j + 1] = k;
+    }
+}
+
+static int32_t sample_with(struct tensor * logits,
+                           const struct llm_sampler * sp,
+                           struct rng * rng,
+                           const int32_t * history, int32_t hist_n) {
+    apply_rep_penalty(logits, history, hist_n,
+                      sp->repetition_penalty, sp->repetition_window);
+    if (sp->temperature <= 0.0f) {
+        return sample_argmax(logits);
+    }
+    int32_t idx[LLM_SAMPLE_TOPK_MAX];
+    float   val[LLM_SAMPLE_TOPK_MAX];
+    int32_t k = sp->top_k > 0 ? sp->top_k : LLM_SAMPLE_TOPK_MAX;
+    if (k > LLM_SAMPLE_TOPK_MAX) { k = LLM_SAMPLE_TOPK_MAX; }
+    int32_t filled = topk_collect(logits, k, idx, val);
+    topk_softmax(val, filled, sp->temperature);
+    topk_sort_desc(idx, val, filled);
+    // Top-p (nucleus): keep the smallest prefix whose cumulative
+    // probability >= top_p. Effective only when 0 < top_p < 1.
+    int32_t cutoff = filled;
+    if (sp->top_p > 0.0f && sp->top_p < 1.0f) {
+        float acc = 0.0f;
+        for (int32_t j = 0; j < filled; j++) {
+            acc += val[j];
+            if (acc >= sp->top_p) { cutoff = j + 1; j = filled; }
+        }
+    }
+    // Min-p: drop tokens whose probability < min_p * top_prob.
+    if (sp->min_p > 0.0f) {
+        float thresh = sp->min_p * val[0];
+        int32_t j2   = 1;
+        while (j2 < cutoff && val[j2] >= thresh) { j2++; }
+        cutoff = j2;
+    }
+    // Re-normalize and roulette-wheel sample from the surviving set.
+    float sum = 0.0f;
+    for (int32_t j = 0; j < cutoff; j++) { sum += val[j]; }
+    float u = rng_uniform(rng) * sum;
+    float c = 0.0f;
+    int32_t picked = 0;
+    for (int32_t j = 0; j < cutoff; j++) {
+        c += val[j];
+        if (u <= c) { picked = j; j = cutoff; }
+    }
+    return idx[picked];
 }
 
 // ---------------------------------------------------------------------------
@@ -2109,12 +2234,25 @@ typedef int (*llm_token_cb)(const char * utf8, void * user);
 int llm_generate(struct llm_ctx * c,
                  const int32_t * prompt_ids, int prompt_n,
                  int max_new, int min_new,
-                 float temperature, int top_k,
+                 const struct llm_sampler * sampler_in,
+                 uint64_t seed,
                  llm_token_cb cb, void * user) {
-    int32_t generated = 0;
-    int32_t pos       = 0;
-    int32_t stop      = 0;
-    double  t0        = llm_monotonic_seconds();
+    struct llm_sampler sp = {0};
+    if (sampler_in != NULL) { sp = *sampler_in; }
+    struct rng rng;
+    rng_seed(&rng, seed != 0 ? seed : (uint64_t)time(NULL));
+    int32_t   generated = 0;
+    int32_t   pos       = 0;
+    int32_t   stop      = 0;
+    double    t0        = llm_monotonic_seconds();
+    // Repetition-penalty history: include the full prompt so the
+    // model is discouraged from immediately echoing the input back,
+    // plus everything it generates in this call. Capacity grows on
+    // demand (single realloc up front sized for the worst case).
+    int32_t * history = (int32_t *)llm_oom(
+        calloc((size_t)(prompt_n + max_new + 1), sizeof(int32_t)));
+    int32_t   hist_n  = 0;
+    for (int32_t i = 0; i < prompt_n; i++) { history[hist_n++] = prompt_ids[i]; }
     // Pre-fill prompt.
     for (int32_t i = 0; i < prompt_n && !stop; i++) {
         struct tensor * logits = llm_forward_step(c, prompt_ids[i], pos);
@@ -2145,7 +2283,8 @@ int llm_generate(struct llm_ctx * c,
                 logits->data[c->cfg.eot_id] = -INFINITY;
             }
         }
-        int32_t next = sample_temperature_topk(logits, temperature, top_k);
+        int32_t next = sample_with(logits, &sp, &rng, history, hist_n);
+        history[hist_n++] = next;
         if (mask) {
             if (c->cfg.eos_id >= 0 && c->cfg.eos_id < (int32_t)tensor_nelements(logits)) {
                 logits->data[c->cfg.eos_id] = saved_eos;
@@ -2173,6 +2312,7 @@ int llm_generate(struct llm_ctx * c,
     double t2 = llm_monotonic_seconds();
     c->t_gen_s     = t2 - t1;
     c->n_generated = generated;
+    free(history);
     return generated;
 }
 
@@ -2348,7 +2488,7 @@ static int32_t print_cb(const char * s, void * user) {
 }
 
 static int32_t run_single(const char * prompt, int32_t max_new,
-                          float temperature, int32_t top_k) {
+                          const struct llm_sampler * sp, uint64_t seed) {
     struct llm_ctx * c = llm_create(llm_cli_gguf_path());
     int32_t r = 0;
     if (!c->loaded) {
@@ -2371,7 +2511,7 @@ static int32_t run_single(const char * prompt, int32_t max_new,
         for (int32_t i = 0; i < n; i++) printf("%d ", (int)ids[i]);
         printf("\n---\n%s", prompt);
         fflush(stdout);
-        llm_generate(c, ids, n, max_new, 0, temperature, top_k,
+        llm_generate(c, ids, n, max_new, g_min_new, sp, seed,
                      print_cb, NULL);
         printf("\n");
         fprintf(stderr,
@@ -2383,7 +2523,8 @@ static int32_t run_single(const char * prompt, int32_t max_new,
     return r;
 }
 
-static int32_t run_repl(float temperature, int32_t top_k, int32_t max_new) {
+static int32_t run_repl(const struct llm_sampler * sp,
+                        uint64_t seed, int32_t max_new) {
     struct llm_ctx * c = llm_create(llm_cli_gguf_path());
     int32_t r = 0;
     if (!c->loaded) {
@@ -2406,7 +2547,7 @@ static int32_t run_repl(float temperature, int32_t top_k, int32_t max_new) {
                 int32_t nids = tok_encode(&c->tok, framed, ids, 2048);
                 printf("\nassistant: ");
                 fflush(stdout);
-                llm_generate(c, ids, nids, max_new, 0, temperature, top_k,
+                llm_generate(c, ids, nids, max_new, g_min_new, sp, seed,
                              print_cb, NULL);
                 printf("\n\n> ");
                 fflush(stdout);
@@ -2420,10 +2561,13 @@ static int32_t run_repl(float temperature, int32_t top_k, int32_t max_new) {
 int main(int argc, char ** argv) {
     int32_t mode = 0;  // 0=help, 1=self-test, 2=single, 3=repl
     const char * prompt = "Hello, my name is";
-    float   temperature = 0.0f;
-    int32_t top_k       = 40;
-    int32_t max_new     = 64;
-    int32_t dump_layer  = -1;
+    struct llm_sampler sp = {0};        // greedy by default
+    sp.top_k              = 40;
+    sp.repetition_penalty = 1.0f;
+    sp.repetition_window  = 64;
+    uint64_t seed         = 0;          // 0 = derive from wall clock
+    int32_t  max_new      = 64;
+    int32_t  dump_layer   = -1;
     for (int32_t i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--self-test") == 0) {
             mode = 1;
@@ -2433,11 +2577,23 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "--repl") == 0) {
             mode = 3;
         } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
-            temperature = (float)atof(argv[++i]);
+            sp.temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
-            top_k = atoi(argv[++i]);
+            sp.top_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
+            sp.top_p = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--min-p") == 0 && i + 1 < argc) {
+            sp.min_p = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--rep-penalty") == 0 && i + 1 < argc) {
+            sp.repetition_penalty = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--rep-window") == 0 && i + 1 < argc) {
+            sp.repetition_window = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--max-new") == 0 && i + 1 < argc) {
             max_new = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--min-new") == 0 && i + 1 < argc) {
+            g_min_new = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--dump-layer") == 0 && i + 1 < argc) {
             dump_layer = atoi(argv[++i]);
         }
@@ -2449,9 +2605,9 @@ int main(int argc, char ** argv) {
     if (mode == 1) {
         rc = llm_self_test();
     } else if (mode == 2) {
-        rc = run_single(prompt, max_new, temperature, top_k);
+        rc = run_single(prompt, max_new, &sp, seed);
     } else if (mode == 3) {
-        rc = run_repl(temperature, top_k, max_new);
+        rc = run_repl(&sp, seed, max_new);
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  llm --self-test\n"

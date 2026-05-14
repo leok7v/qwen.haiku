@@ -69,13 +69,38 @@ const char * llm_get_error(const struct llm_ctx * ctx);
 int llm_tokenize(struct llm_ctx * ctx, const char * text,
                  int32_t * out_ids, int max_ids);
 
+// Sampler parameters. Mirrors llama.cpp's `common_params_sampling`
+// for the subset we care about. Zero-initialized struct = greedy
+// (argmax), no filters, no penalty. See `llm_sampler_default` for a
+// chat-friendly preset.
+struct llm_sampler {
+    float    temperature;        // 0 = greedy; >0 = softmax temperature
+    int      top_k;              // 0 or 1 = greedy; >1 = keep top k
+    float    top_p;              // 0 or 1 = off; (0,1) = nucleus sampling
+    float    min_p;              // 0 = off; (0,1) = keep tokens with
+                                 // prob >= min_p * top_prob (post-softmax)
+    float    repetition_penalty; // 1.0 = off; 1.05-1.3 typical. Logit
+                                 // of any token in the recent-history
+                                 // window is divided by this when
+                                 // positive, multiplied when negative.
+    int      repetition_window;  // 0 = penalize against all tokens
+                                 // emitted in this generate() call so
+                                 // far; >0 = only the last N.
+};
+
+// Chat preset: T=1.0, top_k=20, top_p=0.95, min_p=0, rep=1.05, win=64.
+// Roughly matches Qwen3.5 non-thinking recommended sampling.
+struct llm_sampler llm_sampler_default(void);
+
 // Run inference: prefill the prompt token ids, then sample up to
 // `max_new` tokens, calling `cb(decoded_piece, user)` once per
 // generated token. Stops early on EOS or when `cb` returns non-zero.
 //
-// `temperature` of 0 selects greedy/argmax (top-k is ignored).
-// `top_k` of 0 or 1 also collapses to greedy; larger values do
-// top-k sampling with the given temperature.
+// `sampler` controls how each token is chosen. Pass NULL for the
+// zero-initialized (greedy) default. See `struct llm_sampler`.
+// `seed` initializes a per-call PRNG (xoroshiro128**) used by the
+// stochastic sampler paths; pass 0 to derive from the wall clock.
+// Greedy sampling (temperature == 0) ignores the seed entirely.
 // `min_new` clamps generation to at least that many tokens by
 // suppressing eos / eot at the sampling step (logit -> -infinity)
 // until the count is reached. 0 disables. Useful for chat where
@@ -87,7 +112,8 @@ int llm_tokenize(struct llm_ctx * ctx, const char * text,
 int llm_generate(struct llm_ctx * ctx,
                  const int32_t * prompt_ids, int prompt_n,
                  int max_new, int min_new,
-                 float temperature, int top_k,
+                 const struct llm_sampler * sampler,
+                 uint64_t seed,
                  llm_token_cb cb, void * user);
 
 // Model metadata accessors. Cheap (O(1)).
