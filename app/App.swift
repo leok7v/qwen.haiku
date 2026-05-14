@@ -113,19 +113,21 @@ final class QwenViewModel {
     private func loadModel() async {
         if let dl = self.downloader {
             let path = dl.localURL
-            // Chat sampling. Qwen3.5 page-recommended values for
-            // non-thinking mode are T=1.0, top_p=1.0, top_k=20,
-            // presence_penalty=2.0, but on a 0.8B model those values
-            // happily generate "**Life is what is** /no /no /no"
-            // repetition loops. Pulled top_p down to 0.95 and added
-            // repetition_penalty=1.1 (llama.cpp's typical chat
-            // preset) to keep the model out of the loop attractor.
-            // minNew=8 suppresses eos / `<|im_end|>` for the first 8
-            // sampling steps so the model can't emit an empty bubble.
-            let opts = Qwen.Options(temperature:       1.0,
-                                    topK:              20,
-                                    topP:              0.95,
-                                    repetitionPenalty: 1.1,
+            // Chat sampling. im.ai's defaults on the same Qwen3.5-0.8B
+            // GGUF - empirically tuned to produce clean haikus where
+            // the Qwen3.5 page's T=1.0/top_p=1.0/presence=2.0 spec
+            // happily loops on "/no /no /no" or hallucinates fake
+            // close-tags like `</thrank>`. Notable departures from the
+            // page: temperature 0.7 (less randomness), repPenalty
+            // 1.25 (more aggressive than llama.cpp's 1.05 default),
+            // minP 0.05 (drops the long-tail bad-token cliff the
+            // 0.8B model otherwise samples from). minNew=8 suppresses
+            // eos / `<|im_end|>` for the first 8 sampling steps.
+            let opts = Qwen.Options(temperature:       0.7,
+                                    topK:              40,
+                                    topP:              0.9,
+                                    minP:              0.05,
+                                    repetitionPenalty: 1.25,
                                     repetitionWindow:  64,
                                     maxNew:            512,
                                     minNew:            8)
@@ -257,6 +259,7 @@ struct ContentView: View {
         "Why is there something rather than nothing?",
         "What is free will?",
         "How do memories shape who we are?",
+        "Why does my coffee always go cold the moment I look away?",
     ]
 
     var body: some View {

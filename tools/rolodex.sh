@@ -30,8 +30,9 @@ for q in "${prompts[@]}"; do
     echo "=========================="
     echo "[$i/${#prompts[@]}] $q"
     echo "--------------------------"
-    "$OURS" --single "$framed" --temperature 1.0 --top-k 20 --top-p 0.95 \
-        --rep-penalty 1.1 --min-new 8 --seed "$SEED" --max-new "$N" 2>/dev/null \
+    "$OURS" --single "$framed" --temperature 0.7 --top-k 40 --top-p 0.9 \
+        --min-p 0.05 --rep-penalty 1.25 --rep-window 64 \
+        --min-new 8 --seed "$SEED" --max-new "$N" 2>/dev/null \
         | awk '/^---$/{flag=1; next} flag' \
         | awk 'BEGIN{p=0} {
             if (p) { print; next }
