@@ -1425,6 +1425,7 @@ struct llm_ctx {
     double                 t_gen_s;
     int32_t                n_prefill;
     int32_t                n_generated;
+    int32_t                pos;             // see footnote (4)
 };
 
 // llm_ctx footnotes:
@@ -1444,6 +1445,13 @@ struct llm_ctx {
 //     llm_generate's prefill and decode loops, read back via the
 //     llm_pp_per_sec / llm_tg_per_sec / llm_n_* accessors. Zero
 //     before any call has completed.
+//
+// (4) pos: next free position in the KV cache. Carries across
+//     consecutive llm_generate calls so multi-turn chat does not
+//     need to reformat and re-prefill prior turns - tokenize only
+//     the new delta (e.g. `<|im_start|>user\nQ<|im_end|>\n` +
+//     gen header) and call llm_generate again. llm_reset() zeroes
+//     this back to 0 along with the SSM/conv recurrent state.
 
 static int g_dump_layer = -1;
 int g_no_q8k_rt = 0;
@@ -2279,6 +2287,7 @@ void llm_destroy(struct llm_ctx * c) {
 void llm_reset(struct llm_ctx * c) {
     if (c != NULL) {
         ssm_cache_reset(&c->ssm, &c->cfg);
+        c->pos = 0;
     }
 }
 
@@ -2307,7 +2316,7 @@ int llm_generate(struct llm_ctx * c,
     struct rng rng;
     rng_seed(&rng, seed != 0 ? seed : (uint64_t)time(NULL));
     int32_t   generated = 0;
-    int32_t   pos       = 0;
+    int32_t   pos       = c->pos;        // resume after previous call
     int32_t   stop      = 0;
     double    t0        = llm_monotonic_seconds();
     // Repetition-penalty history: include the full prompt so the
@@ -2326,7 +2335,7 @@ int llm_generate(struct llm_ctx * c,
     }
     double t1 = llm_monotonic_seconds();
     c->t_prefill_s = t1 - t0;
-    c->n_prefill   = pos;
+    c->n_prefill   = prompt_n;
     int32_t last = prompt_n > 0 ? prompt_ids[prompt_n - 1] : c->cfg.bos_id;
     // Decode loop.
     while (!stop && generated < max_new && pos < c->cfg.max_position) {
@@ -2381,6 +2390,7 @@ int llm_generate(struct llm_ctx * c,
     double t2 = llm_monotonic_seconds();
     c->t_gen_s     = t2 - t1;
     c->n_generated = generated;
+    c->pos         = pos;                // persist across calls
     free(history);
     return generated;
 }
@@ -2614,44 +2624,42 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
         fprintf(stderr, "llm: load failed: %s\n", llm_get_error(c));
         r = 1;
     } else {
-        struct chars history = {0};
+        // Persistent KV: only the DELTA gets tokenized each turn.
+        // Turn 0 carries the system prefix inline with the first
+        // user message (matches im.ai's framing). Subsequent turns
+        // tokenize a bare `<|im_start|>user\n{Q}<|im_end|>\n` +
+        // assistant gen header. llm_generate advances c->pos so the
+        // next call's prefill writes into KV at the correct offset.
+        struct chars delta = {0};
         int32_t * ids = (int32_t *)llm_oom(calloc(16384, sizeof(int32_t)));
         for (int32_t t = 0; t < n_prompts && r == 0; t++) {
-            // Build the user turn's body. Only turn 0 carries the
-            // system prefix; subsequent turns are bare questions.
-            chars_put(&history, "<|im_start|>user\n", 17);
+            delta.count = 0;
+            if (delta.data != NULL) { delta.data[0] = '\0'; }
+            chars_put(&delta, "<|im_start|>user\n", 17);
             if (t == 0 && system_prompt != NULL && system_prompt[0] != '\0') {
-                chars_put(&history, system_prompt,
+                chars_put(&delta, system_prompt,
                           (int32_t)strlen(system_prompt));
-                chars_put(&history, "\n\n", 2);
+                chars_put(&delta, "\n\n", 2);
             }
-            chars_put(&history, prompts[t],
+            chars_put(&delta, prompts[t],
                       (int32_t)strlen(prompts[t]));
-            chars_put(&history,
+            chars_put(&delta,
                       "<|im_end|>\n<|im_start|>assistant\n"
                       "<think>\n\n</think>\n\n",
                       52);
-            chars_put(&history, "", 0);  // null-term
+            chars_put(&delta, "", 0);  // null-term
             printf("\n--- turn %d/%d ---\n", (int)(t + 1), (int)n_prompts);
             if (t == 0 && system_prompt != NULL && system_prompt[0] != '\0') {
                 printf("[system inline] %s\n", system_prompt);
             }
             printf("[user] %s\n[assistant] ", prompts[t]);
             fflush(stdout);
-            int32_t nids = tok_encode(&c->tok, history.data,
-                                      ids, 16384);
-            // Reset recurrent state so each turn's prefill rebuilds
-            // SSM/conv state from zero. KV cache is naturally
-            // overwritten by the next forward pass.
-            llm_reset(c);
+            int32_t nids = tok_encode(&c->tok, delta.data, ids, 16384);
             struct chars reply = {0};
             llm_generate(c, ids, nids, max_new, g_min_new, sp, seed,
                          capture_cb, &reply);
             chars_put(&reply, "", 0);
             strip_reasoning_for_history(&reply);
-            // Also strip a trailing `<|im_end|>` plus its newline if
-            // the model emitted it as raw text (it shouldn't, since
-            // we now stop on the token id, but defensive).
             const char eot[] = "<|im_end|>";
             int32_t eot_len = (int32_t)(sizeof(eot) - 1);
             if (reply.count >= eot_len &&
@@ -2662,32 +2670,17 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
             }
             fwrite(reply.data, 1, (size_t)reply.count, stdout);
             fflush(stdout);
-            // Replace the trailing assistant-prompt prefix with the
-            // captured reply + `<|im_end|>\n` so the next turn's
-            // tokenize sees a finished assistant block.
-            const char prefix[] = "<|im_start|>assistant\n"
-                                  "<think>\n\n</think>\n\n";
-            int32_t prefix_len = (int32_t)(sizeof(prefix) - 1);
-            // history.count includes the prefix at the tail (and a
-            // trailing NUL); drop the prefix + NUL to splice in the
-            // assistant block.
-            if (history.count >= prefix_len + 1) {
-                history.count -= prefix_len + 1;
-            }
-            chars_put(&history, "<|im_start|>assistant\n",
-                      22);
-            chars_put(&history, reply.data,
-                      reply.count);
-            chars_put(&history, "<|im_end|>\n", 11);
             printf("\n");
             fprintf(stderr,
-                    "pp: %.2f tok/s (%d tok)  tg: %.2f tok/s (%d tok)\n",
+                    "pp: %.2f tok/s (%d tok)  tg: %.2f tok/s (%d tok)  "
+                    "kv pos=%d\n",
                     llm_pp_per_sec(c), (int)llm_n_prefill(c),
-                    llm_tg_per_sec(c), (int)llm_n_generated(c));
+                    llm_tg_per_sec(c), (int)llm_n_generated(c),
+                    (int)c->pos);
             chars_free(&reply);
         }
         free(ids);
-        chars_free(&history);
+        chars_free(&delta);
     }
     llm_destroy(c);
     return r;
