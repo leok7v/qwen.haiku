@@ -2108,7 +2108,8 @@ typedef int (*llm_token_cb)(const char * utf8, void * user);
 
 int llm_generate(struct llm_ctx * c,
                  const int32_t * prompt_ids, int prompt_n,
-                 int max_new, float temperature, int top_k,
+                 int max_new, int min_new,
+                 float temperature, int top_k,
                  llm_token_cb cb, void * user) {
     int32_t generated = 0;
     int32_t pos       = 0;
@@ -2127,7 +2128,32 @@ int llm_generate(struct llm_ctx * c,
     // Decode loop.
     while (!stop && generated < max_new && pos < c->cfg.max_position) {
         struct tensor * logits = llm_forward_step(c, last, pos);
+        // While below min_new, force the model to keep producing
+        // content by zeroing out the eos / eot logits (effectively
+        // -infinity once normalized). Restored automatically once
+        // generated >= min_new.
+        float saved_eos = 0.0f;
+        float saved_eot = 0.0f;
+        int32_t mask    = (generated < min_new);
+        if (mask) {
+            if (c->cfg.eos_id >= 0 && c->cfg.eos_id < (int32_t)tensor_nelements(logits)) {
+                saved_eos = logits->data[c->cfg.eos_id];
+                logits->data[c->cfg.eos_id] = -INFINITY;
+            }
+            if (c->cfg.eot_id >= 0 && c->cfg.eot_id < (int32_t)tensor_nelements(logits)) {
+                saved_eot = logits->data[c->cfg.eot_id];
+                logits->data[c->cfg.eot_id] = -INFINITY;
+            }
+        }
         int32_t next = sample_temperature_topk(logits, temperature, top_k);
+        if (mask) {
+            if (c->cfg.eos_id >= 0 && c->cfg.eos_id < (int32_t)tensor_nelements(logits)) {
+                logits->data[c->cfg.eos_id] = saved_eos;
+            }
+            if (c->cfg.eot_id >= 0 && c->cfg.eot_id < (int32_t)tensor_nelements(logits)) {
+                logits->data[c->cfg.eot_id] = saved_eot;
+            }
+        }
         pos++;
         generated++;
         if (g_trace_tokens) { fprintf(stderr, "[tok] %d\n", (int)next); }
@@ -2345,7 +2371,7 @@ static int32_t run_single(const char * prompt, int32_t max_new,
         for (int32_t i = 0; i < n; i++) printf("%d ", (int)ids[i]);
         printf("\n---\n%s", prompt);
         fflush(stdout);
-        llm_generate(c, ids, n, max_new, temperature, top_k,
+        llm_generate(c, ids, n, max_new, 0, temperature, top_k,
                      print_cb, NULL);
         printf("\n");
         fprintf(stderr,
@@ -2380,7 +2406,7 @@ static int32_t run_repl(float temperature, int32_t top_k, int32_t max_new) {
                 int32_t nids = tok_encode(&c->tok, framed, ids, 2048);
                 printf("\nassistant: ");
                 fflush(stdout);
-                llm_generate(c, ids, nids, max_new, temperature, top_k,
+                llm_generate(c, ids, nids, max_new, 0, temperature, top_k,
                              print_cb, NULL);
                 printf("\n\n> ");
                 fflush(stdout);

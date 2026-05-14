@@ -76,11 +76,18 @@ int llm_tokenize(struct llm_ctx * ctx, const char * text,
 // `temperature` of 0 selects greedy/argmax (top-k is ignored).
 // `top_k` of 0 or 1 also collapses to greedy; larger values do
 // top-k sampling with the given temperature.
+// `min_new` clamps generation to at least that many tokens by
+// suppressing eos / eot at the sampling step (logit -> -infinity)
+// until the count is reached. 0 disables. Useful for chat where
+// the model occasionally emits `<|im_end|>` as its very first
+// reply token under high-temperature sampling, producing an empty
+// bubble.
 //
 // Returns the number of tokens actually generated.
 int llm_generate(struct llm_ctx * ctx,
                  const int32_t * prompt_ids, int prompt_n,
-                 int max_new, float temperature, int top_k,
+                 int max_new, int min_new,
+                 float temperature, int top_k,
                  llm_token_cb cb, void * user);
 
 // Model metadata accessors. Cheap (O(1)).

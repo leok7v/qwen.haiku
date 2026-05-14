@@ -40,11 +40,13 @@ public final class Qwen: @unchecked Sendable {
         public var temperature: Float
         public var topK:        Int
         public var maxNew:      Int
+        public var minNew:      Int
         public init(temperature: Float = 0.0, topK: Int = 40,
-                    maxNew: Int = 256) {
+                    maxNew: Int = 256, minNew: Int = 0) {
             self.temperature = temperature
             self.topK        = topK
             self.maxNew      = maxNew
+            self.minNew      = minNew
         }
     }
 
@@ -110,6 +112,7 @@ public final class Qwen: @unchecked Sendable {
                 ctx,
                 buf.baseAddress, n,
                 Int32(options.maxNew),
+                Int32(options.minNew),
                 options.temperature,
                 Int32(options.topK),
                 qwenTokenTrampoline,

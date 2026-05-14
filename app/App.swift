@@ -114,8 +114,14 @@ final class QwenViewModel {
         if let dl = self.downloader {
             let path = dl.localURL
             // Chat sampling: Qwen3.5 non-thinking default is T=1.0,
-            // top_k=20. top_p / min_p / penalties land with task #21.
-            let opts = Qwen.Options(temperature: 1.0, topK: 20, maxNew: 512)
+            // top_k=20. minNew=8 suppresses eos / `<|im_end|>` for the
+            // first 8 sampling steps so the model is forced to commit
+            // to actual content instead of emitting an immediate
+            // end-of-turn (an occasional T=1.0 failure mode that
+            // produces an empty assistant bubble). top_p / min_p /
+            // penalties land with task #21.
+            let opts = Qwen.Options(temperature: 1.0, topK: 20,
+                                    maxNew: 512, minNew: 8)
             do {
                 let loaded = try await Task.detached(priority: .userInitiated) {
                     try Qwen(modelPath: path, options: opts)
