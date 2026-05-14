@@ -100,9 +100,16 @@ public enum ChatTemplate {
             out += "<|im_start|>assistant\n"
             if reasoning {
                 out += "<think>\n"
-            } else {
-                out += "<think>\n\n</think>\n\n"
             }
+            // Qwen3.5 operates in non-thinking mode by default
+            // (huggingface.co/Qwen/Qwen3.5-0.8B). The Qwen3 trick of
+            // pre-filling an empty `<think>\n\n</think>\n\n` block here
+            // is counter-productive on Qwen3.5: the model still emits
+            // its own closing `</think>` afterward, leaking the marker
+            // into the visible bubble (and on turn 2 into the framed
+            // history, scrambling the next reply). Let the model decide.
+            // `ChatStreamFilter` strips any leading <think> block the
+            // model emits anyway so the user-visible content stays clean.
         }
         return out
     }
@@ -118,30 +125,49 @@ public enum ChatTemplate {
 }
 
 /// Streaming-side companion to `ChatTemplate`. Accepts UTF-8 pieces
-/// emitted by `llm_generate`'s token callback, strips Qwen3 turn
-/// markers, and signals `done == true` once `<|im_end|>` or
-/// `<|endoftext|>` is seen so the view model can stop generation.
-/// Uses a small holdback buffer (longer than the longest marker) so
-/// markers that arrive split across two pieces are still caught.
+/// emitted by `llm_generate`'s token callback and produces clean
+/// user-visible text:
+///
+/// 1. Skip an optional leading `<think>...</think>` block (Qwen3.5
+///    emits one even in non-thinking mode); discard surrounding
+///    whitespace so content starts at the first real character.
+/// 2. Stream visible content with a 32-byte holdback so an
+///    `<|im_end|>` or `<|endoftext|>` marker split across two pieces
+///    is still caught. When such a marker arrives, flip `done` so
+///    the view model can stop generation.
 public struct ChatStreamFilter {
 
     private static let endMarkers = ["<|im_end|>", "<|endoftext|>"]
-    // Longest marker is "<|endoftext|>" = 13 bytes; round up.
-    private static let holdback = 16
+    // Holdback wide enough for end markers, and for "</think>" to be
+    // detected before any of its bytes leak as visible content.
+    private static let holdback = 32
+    // Give up looking for a leading think block once this many bytes
+    // of non-think content have arrived without a `<` opener.
+    private static let leadingThinkScanLimit = 48
 
-    public private(set) var visible: String = ""
-    public private(set) var done:    Bool   = false
-    private var buf:                 String = ""
+    public private(set) var visible:     String = ""
+    public private(set) var done:        Bool   = false
+    private var buf:                     String = ""
+    private var contentStarted:          Bool   = false
 
     public init() {}
 
     /// Push the next streamed piece and return the slice that is
-    /// safe to display (markers stripped, no partial marker in the
-    /// trailing bytes). When `done` flips to true, the caller should
-    /// cancel the generation; any subsequent `push` calls are no-ops.
+    /// safe to display (turn markers and any leading think block
+    /// stripped, no partial marker in the trailing bytes). When
+    /// `done` flips to true, the caller should cancel the
+    /// generation; any subsequent `push` calls are no-ops.
     public mutating func push(_ piece: String) -> String {
         if done { return "" }
         buf += piece
+        if !contentStarted {
+            if let consumed = consumeLeadingThinkPrefix() {
+                buf = consumed
+                contentStarted = true
+            } else {
+                return ""
+            }
+        }
         for m in Self.endMarkers {
             if let r = buf.range(of: m) {
                 let head = String(buf[..<r.lowerBound])
@@ -169,8 +195,45 @@ public struct ChatStreamFilter {
     public mutating func finish() -> String {
         let tail = buf
         buf = ""
+        if !contentStarted { contentStarted = true }
         visible += tail
         return tail
+    }
+
+    /// Inspect `buf` for the once-per-turn leading think pattern:
+    /// optional whitespace, optional `<think>...</think>` (or just
+    /// `</think>` if our prompt opened one), then content. Returns
+    /// the remaining buffer with the prefix removed once content
+    /// boundary is identified, or nil if more data is needed to
+    /// decide. Switches to "content started" once the boundary is
+    /// crossed; subsequent pushes go through the streaming path.
+    private func consumeLeadingThinkPrefix() -> String? {
+        var s = Substring(buf)
+        while let c = s.first, c == "\n" || c == "\r" || c == " " || c == "\t" {
+            s = s.dropFirst()
+        }
+        if s.hasPrefix("<think>") || s.hasPrefix("</think>") {
+            if let r = s.range(of: "</think>") {
+                var rest = s[r.upperBound...]
+                while let c = rest.first,
+                      c == "\n" || c == "\r" || c == " " || c == "\t" {
+                    rest = rest.dropFirst()
+                }
+                return String(rest)
+            }
+            return nil
+        }
+        // Looks like content but with too few bytes to be sure no
+        // `<think>` opener is on the way; wait for more.
+        if s.hasPrefix("<") && s.count < 8 {
+            return nil
+        }
+        // Buf hasn't started with a think tag and has accumulated
+        // enough bytes to be confident; treat as plain content.
+        if buf.count >= Self.leadingThinkScanLimit || !s.isEmpty {
+            return buf
+        }
+        return nil
     }
 
 }
