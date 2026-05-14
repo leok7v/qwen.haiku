@@ -44,12 +44,25 @@ End-to-end inference path is correct:
 - Resume an interrupted download (URL.swift already supports it via
   the sidecar `.meta` file; needs UI affordance).
 
-### Phase B — Chat template
-- Implement the Qwen3 chat template state machine described in
-  `docs/DESIGN.md` (`<|im_start|>system|user|assistant<|im_end|>`,
-  reasoning on/off, reasoning_effort low/med/high). Currently the
-  `--repl` CLI hard-codes the framing string; the app does no
-  framing yet.
+### Phase B — Chat template (done)
+- Qwen3 chat-template state machine landed Swift-side in
+  `app/Chat.swift`: `ChatMessage` + `ChatTemplate.apply` frame a
+  conversation into `<|im_start|>role\n...<|im_end|>\n` envelopes
+  per `docs/DESIGN.md`, with reasoning on/off and
+  reasoning_effort low/med/high hooks. `ChatStreamFilter` mirrors
+  the unframing side: detects `<|im_end|>` / `<|endoftext|>` in the
+  streamed token output (with a 16-byte holdback for markers split
+  across pieces) and signals end-of-turn so the view model cancels
+  generation cleanly.
+- `app/App.swift` is a chat surface now: editable system prompt
+  header, scrolling message list (user in tinted bubble, assistant
+  full-width), input bar with Send/Stop. Sampling defaults moved to
+  T=1.0 / top_k=20 (Qwen3.5 non-thinking).
+- C `--repl` keeps its minimal hard-coded framing (intentional;
+  it's a single-turn command-line poke, not a chat surface).
+- Follow-ups gated behind their own tasks:
+  - top_p / min_p / presence_penalty / repetition_penalty (#21)
+  - `<think>...</think>` split into a separate reasoning channel (#22)
 
 ### Phase C investigation: interleaved prefetch in matmul inner loops
 
