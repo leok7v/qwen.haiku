@@ -1380,6 +1380,27 @@ static void ssm_cache_free(struct llm_ssm_cache * s) {
     free(s->conv_head);  s->conv_head  = NULL;
 }
 
+// Reset recurrent state to "fresh conversation". The KV cache is
+// overwritten by the next forward pass so it does not need
+// clearing here; only the SSM/conv recurrent buffers do.
+static void ssm_cache_reset(struct llm_ssm_cache * s,
+                            const struct llm_config * cfg) {
+    if (s->conv_state != NULL) {
+        size_t cb = (size_t)s->n_layers * s->conv_kernel *
+                    s->n_channels * sizeof(float);
+        memset(s->conv_state, 0, cb);
+    }
+    if (s->ssm_state != NULL) {
+        size_t sb = (size_t)s->n_layers * cfg->linear_n_heads *
+                    cfg->linear_k_head_dim * cfg->linear_v_head_dim *
+                    sizeof(float);
+        memset(s->ssm_state, 0, sb);
+    }
+    if (s->conv_head != NULL) {
+        memset(s->conv_head, 0, (size_t)s->n_layers * sizeof(int32_t));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Forward pass - single token, with KV cache update.
 //
@@ -2255,6 +2276,12 @@ void llm_destroy(struct llm_ctx * c) {
     }
 }
 
+void llm_reset(struct llm_ctx * c) {
+    if (c != NULL) {
+        ssm_cache_reset(&c->ssm, &c->cfg);
+    }
+}
+
 const char * llm_get_error(const struct llm_ctx * c) {
     return c == NULL ? "no ctx" : c->err;
 }
@@ -2529,6 +2556,162 @@ static int32_t print_cb(const char * s, void * user) {
     return 0;
 }
 
+// Token callback for the chat CLI: capture into `chars` only. The
+// turn is printed in one shot at the end (after strip_leading_think
+// runs on the buffer), so the user sees a clean reply without the
+// leading `</think>` leak that streaming-print would expose. Loses
+// the per-token streaming feel but the chat CLI is for offline
+// testing - the SwiftUI surface still streams via ChatStreamFilter.
+static int32_t capture_cb(const char * s, void * user) {
+    struct chars * out = (struct chars *)user;
+    chars_put(out, s, (int32_t)strlen(s));
+    return 0;
+}
+
+// Strip a leading `<think>...</think>` block + surrounding whitespace
+// from a captured assistant reply so the next turn's history is
+// clean (matches what `ChatStreamFilter` does on the Swift side).
+static void strip_leading_think(struct chars * s) {
+    if (s->data == NULL || s->count == 0) { return; }
+    int32_t start = 0;
+    while (start < s->count &&
+           (s->data[start] == '\n' || s->data[start] == '\r' ||
+            s->data[start] == ' '  || s->data[start] == '\t')) {
+        start++;
+    }
+    // Match either `<think>...</think>` or just `</think>` (the model
+    // sometimes emits the close even when we pre-filled the empty
+    // block).
+    int32_t open_len = 7;   // "<think>"
+    int32_t close_len = 8;  // "</think>"
+    int32_t cursor = start;
+    if (cursor + open_len <= s->count &&
+        memcmp(s->data + cursor, "<think>", open_len) == 0) {
+        cursor += open_len;
+    } else if (cursor + close_len <= s->count &&
+               memcmp(s->data + cursor, "</think>", close_len) == 0) {
+        // Just the closer; jump straight to whitespace stripping.
+        cursor += close_len;
+        goto strip_ws;
+    } else {
+        return;  // No leading think block.
+    }
+    // Find the matching close.
+    int32_t found = -1;
+    for (int32_t i = cursor; i + close_len <= s->count; i++) {
+        if (memcmp(s->data + i, "</think>", close_len) == 0) {
+            found = i + close_len;
+            break;
+        }
+    }
+    if (found < 0) { return; }
+    cursor = found;
+strip_ws:
+    while (cursor < s->count &&
+           (s->data[cursor] == '\n' || s->data[cursor] == '\r' ||
+            s->data[cursor] == ' '  || s->data[cursor] == '\t')) {
+        cursor++;
+    }
+    int32_t kept = s->count - cursor;
+    if (kept > 0) { memmove(s->data, s->data + cursor, (size_t)kept); }
+    s->count = kept;
+    s->data[kept] = '\0';
+}
+
+// Multi-turn chat mode. Each --prompt is one user turn. The runner
+// re-prefills the full conversation each turn (KV cache overwrites,
+// SSM cache cleared via llm_reset() between turns). The optional
+// --system string is prepended to the FIRST user turn's body (no
+// `<|im_start|>system` block), matching im.ai's observed framing.
+static int32_t run_chat(const char ** prompts, int32_t n_prompts,
+                        const char * system_prompt,
+                        const struct llm_sampler * sp, uint64_t seed,
+                        int32_t max_new) {
+    struct llm_ctx * c = llm_create(llm_cli_gguf_path());
+    int32_t r = 0;
+    if (!c->loaded) {
+        fprintf(stderr, "llm: load failed: %s\n", llm_get_error(c));
+        r = 1;
+    } else {
+        struct chars history = {0};
+        int32_t * ids = (int32_t *)llm_oom(calloc(16384, sizeof(int32_t)));
+        for (int32_t t = 0; t < n_prompts && r == 0; t++) {
+            // Build the user turn's body. Only turn 0 carries the
+            // system prefix; subsequent turns are bare questions.
+            chars_put(&history, "<|im_start|>user\n", 17);
+            if (t == 0 && system_prompt != NULL && system_prompt[0] != '\0') {
+                chars_put(&history, system_prompt,
+                          (int32_t)strlen(system_prompt));
+                chars_put(&history, "\n\n", 2);
+            }
+            chars_put(&history, prompts[t],
+                      (int32_t)strlen(prompts[t]));
+            chars_put(&history,
+                      "<|im_end|>\n<|im_start|>assistant\n"
+                      "<think>\n\n</think>\n\n",
+                      52);
+            chars_put(&history, "", 0);  // null-term
+            printf("\n--- turn %d/%d ---\n", (int)(t + 1), (int)n_prompts);
+            if (t == 0 && system_prompt != NULL && system_prompt[0] != '\0') {
+                printf("[system inline] %s\n", system_prompt);
+            }
+            printf("[user] %s\n[assistant] ", prompts[t]);
+            fflush(stdout);
+            int32_t nids = tok_encode(&c->tok, history.data,
+                                      ids, 16384);
+            // Reset recurrent state so each turn's prefill rebuilds
+            // SSM/conv state from zero. KV cache is naturally
+            // overwritten by the next forward pass.
+            llm_reset(c);
+            struct chars reply = {0};
+            llm_generate(c, ids, nids, max_new, g_min_new, sp, seed,
+                         capture_cb, &reply);
+            chars_put(&reply, "", 0);
+            strip_leading_think(&reply);
+            // Also strip a trailing `<|im_end|>` plus its newline if
+            // the model emitted it as raw text (it shouldn't, since
+            // we now stop on the token id, but defensive).
+            const char eot[] = "<|im_end|>";
+            int32_t eot_len = (int32_t)(sizeof(eot) - 1);
+            if (reply.count >= eot_len &&
+                memcmp(reply.data + reply.count - eot_len,
+                       eot, eot_len) == 0) {
+                reply.count -= eot_len;
+                reply.data[reply.count] = '\0';
+            }
+            fwrite(reply.data, 1, (size_t)reply.count, stdout);
+            fflush(stdout);
+            // Replace the trailing assistant-prompt prefix with the
+            // captured reply + `<|im_end|>\n` so the next turn's
+            // tokenize sees a finished assistant block.
+            const char prefix[] = "<|im_start|>assistant\n"
+                                  "<think>\n\n</think>\n\n";
+            int32_t prefix_len = (int32_t)(sizeof(prefix) - 1);
+            // history.count includes the prefix at the tail (and a
+            // trailing NUL); drop the prefix + NUL to splice in the
+            // assistant block.
+            if (history.count >= prefix_len + 1) {
+                history.count -= prefix_len + 1;
+            }
+            chars_put(&history, "<|im_start|>assistant\n",
+                      22);
+            chars_put(&history, reply.data,
+                      reply.count);
+            chars_put(&history, "<|im_end|>\n", 11);
+            printf("\n");
+            fprintf(stderr,
+                    "pp: %.2f tok/s (%d tok)  tg: %.2f tok/s (%d tok)\n",
+                    llm_pp_per_sec(c), (int)llm_n_prefill(c),
+                    llm_tg_per_sec(c), (int)llm_n_generated(c));
+            chars_free(&reply);
+        }
+        free(ids);
+        chars_free(&history);
+    }
+    llm_destroy(c);
+    return r;
+}
+
 static int32_t run_single(const char * prompt, int32_t max_new,
                           const struct llm_sampler * sp, uint64_t seed) {
     struct llm_ctx * c = llm_create(llm_cli_gguf_path());
@@ -2600,9 +2783,14 @@ static int32_t run_repl(const struct llm_sampler * sp,
     return r;
 }
 
+#define LLM_CLI_MAX_TURNS 32
+
 int main(int argc, char ** argv) {
-    int32_t mode = 0;  // 0=help, 1=self-test, 2=single, 3=repl
+    int32_t mode = 0;  // 0=help, 1=self-test, 2=single, 3=repl, 4=chat
     const char * prompt = "Hello, my name is";
+    const char * system_prompt   = NULL;
+    const char * chat_prompts[LLM_CLI_MAX_TURNS];
+    int32_t      chat_n          = 0;
     struct llm_sampler sp = {0};        // greedy by default
     sp.top_k              = 40;
     sp.repetition_penalty = 1.0f;
@@ -2618,6 +2806,20 @@ int main(int argc, char ** argv) {
             if (i + 1 < argc) { prompt = argv[++i]; }
         } else if (strcmp(argv[i], "--repl") == 0) {
             mode = 3;
+        } else if (strcmp(argv[i], "--chat") == 0) {
+            mode = 4;
+        } else if ((strcmp(argv[i], "-p") == 0 ||
+                    strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
+            if (chat_n < LLM_CLI_MAX_TURNS) {
+                chat_prompts[chat_n++] = argv[++i];
+            } else {
+                fprintf(stderr, "llm: too many --prompt turns (max %d)\n",
+                        LLM_CLI_MAX_TURNS);
+                i++;
+            }
+        } else if ((strcmp(argv[i], "-sys") == 0 ||
+                    strcmp(argv[i], "--system") == 0) && i + 1 < argc) {
+            system_prompt = argv[++i];
         } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
             sp.temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
@@ -2650,11 +2852,21 @@ int main(int argc, char ** argv) {
         rc = run_single(prompt, max_new, &sp, seed);
     } else if (mode == 3) {
         rc = run_repl(&sp, seed, max_new);
+    } else if (mode == 4) {
+        if (chat_n == 0) {
+            fprintf(stderr, "llm: --chat needs at least one -p/--prompt\n");
+            rc = 1;
+        } else {
+            rc = run_chat(chat_prompts, chat_n, system_prompt,
+                          &sp, seed, max_new);
+        }
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  llm --self-test\n"
                "  llm --single \"prompt\" [--max-new N] [--temperature T]\n"
-               "  llm --repl [--max-new N] [--temperature T]\n");
+               "  llm --repl [--max-new N] [--temperature T]\n"
+               "  llm --chat -p \"turn1\" [-p \"turn2\" ...] "
+                       "[-sys \"system prompt\"] [sampler flags]\n");
         rc = 0;
     }
     return rc;

@@ -259,19 +259,20 @@ struct ContentView: View {
     // Drawn from common prompt corpora (ShareGPT, Anthropic HH,
     // typical "deep question" lists). Kept under one line each so
     // the row layout stays compact.
+    // The 8-question rolodex from im.ai's haiku-mode session: the
+    // first turn carries the HARD RULE (set in `systemPrompt`),
+    // subsequent turns are unprefixed questions that build on the
+    // previous reply (note "But how..." / "Or how..." follow-ons -
+    // they only make sense in multi-turn context).
     private static let suggestions: [String] = [
-        "What is the meaning of life?",
-        "What is consciousness, really?",
-        "Why do we dream?",
-        "What is love?",
-        "How do we find happiness?",
-        "What makes us human?",
-        "What is time?",
-        "What is the nature of reality?",
-        "Why is there something rather than nothing?",
-        "What is free will?",
-        "How do memories shape who we are?",
-        "Why does my coffee always go cold the moment I look away?",
+        "Why do some obscure ideas go viral instantly?",
+        "What makes constructive criticism easy to absorb?",
+        "But how can one receive criticism easily?",
+        "How do we systematically overcome creative blocks?",
+        "Or how can we stop our own blocks from growing?",
+        "How does remote work alter long-term team culture?",
+        "Or how can we build new teams that thrive online?",
+        "How does rapid failure accelerate technological innovation?",
     ]
 
     var body: some View {

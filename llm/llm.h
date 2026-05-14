@@ -53,6 +53,13 @@ struct llm_ctx * llm_create(const char * path);
 // Free ctx and all owned resources. Safe to call with NULL.
 void llm_destroy(struct llm_ctx * ctx);
 
+// Clear the per-context recurrent state (SSM + conv1d rings) so the
+// next generate() starts as if from a fresh conversation. The KV
+// cache is naturally overwritten by the next forward pass and does
+// not need explicit clearing. Use before re-feeding a cumulative
+// conversation prompt in CLI multi-turn mode.
+void llm_reset(struct llm_ctx * ctx);
+
 // 1 if the GGUF was successfully parsed and weights are usable.
 // 0 if anything during load failed; call llm_get_error() to find
 // out what.
