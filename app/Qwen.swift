@@ -93,6 +93,13 @@ public final class Qwen: @unchecked Sendable {
 
     deinit { llm_destroy(ctx) }
 
+    /// Clear the persistent KV / SSM state. Call when starting a new
+    /// conversation in the chat surface; subsequent `generate(...)`
+    /// calls within the same conversation should NOT reset because
+    /// the C runner keeps the conversation's KV cache populated
+    /// across calls (task #36 - persistent KV chat).
+    public func reset() { llm_reset(ctx) }
+
     /// Blocking: generate a full completion for `prompt` and return
     /// it as a single string.
     public func generate(prompt: String) throws -> String {

@@ -166,22 +166,22 @@ final class QwenViewModel {
         if qwen != nil, state == .ready, !trimmedUser.isEmpty {
             let isFirstTurn = !self.messages.contains(
                 where: { $0.role == .user })
-            let body: String
-            if isFirstTurn && !trimmedSys.isEmpty {
-                body = trimmedSys + "\n\n" + trimmedUser
-            } else {
-                body = trimmedUser
-            }
+            // Persistent KV: send only the DELTA each turn (the new
+            // user envelope + assistant gen header). The Qwen ctx
+            // holds the conversation's KV cache across calls. On the
+            // first turn, the system prompt rides inline with the
+            // user body (matches im.ai's framing - no system block).
             self.messages.append(
-                ChatMessage(role: .user, content: body))
+                ChatMessage(role: .user, content: trimmedUser))
             self.messages.append(
                 ChatMessage(role: .assistant, content: ""))
             let assistantIdx = self.messages.count - 1
-            let framed = Array(self.messages.dropLast())
-            let prompt = ChatTemplate.apply(messages: framed)
+            let delta = ChatTemplate.applyDelta(
+                userMessage: trimmedUser,
+                systemPrefix: isFirstTurn ? trimmedSys : nil)
             self.state         = .generating
             self.stopRequested = false
-            await self.streamAssistant(prompt: prompt, at: assistantIdx)
+            await self.streamAssistant(prompt: delta, at: assistantIdx)
         }
     }
 
@@ -264,8 +264,13 @@ final class QwenViewModel {
     /// callback and tell llm_generate to abort.
     func stopGeneration() { self.stopRequested = true }
 
-    /// Clear the conversation; system prompt is kept.
-    func clearChat() { self.messages.removeAll() }
+    /// Clear the conversation; system prompt is kept. Also resets
+    /// the persistent KV / SSM state so the next `send(...)` starts
+    /// a fresh prefill (matches a "new conversation" semantically).
+    func clearChat() {
+        self.messages.removeAll()
+        self.qwen?.reset()
+    }
 
 }
 

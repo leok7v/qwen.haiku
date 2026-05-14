@@ -116,6 +116,29 @@ public enum ChatTemplate {
         return out
     }
 
+    /// Single-turn delta for persistent-KV chat: the bytes to append
+    /// to an already-warm Qwen ctx so the model sees one new user
+    /// message + the assistant generation header. Pass non-nil
+    /// `systemPrefix` ONLY on the first turn of a conversation; it
+    /// is rendered inline with the user message (no
+    /// `<|im_start|>system` block) matching im.ai's framing.
+    public static func applyDelta(userMessage: String,
+                                  systemPrefix: String? = nil,
+                                  reasoning: Bool = false) -> String {
+        var out  = "<|im_start|>user\n"
+        if let sys = systemPrefix, !sys.isEmpty {
+            out += sys + "\n\n"
+        }
+        out += userMessage
+        out += "<|im_end|>\n<|im_start|>assistant\n"
+        if reasoning {
+            out += "<think>\n"
+        } else {
+            out += "<think>\n\n</think>\n\n"
+        }
+        return out
+    }
+
     private static func effortPrefix(_ e: ReasoningEffort) -> String {
         switch e {
         case .low:    return "(brief: 1-2 sentences)\n\n"
