@@ -523,6 +523,8 @@ struct llm_config {
     int32_t  bos_id;
     int32_t  eos_id;
     int32_t  eot_id;                // see footnote (4)
+    int32_t  stop_ids[8];           // see footnote (5); -1 in unused slots
+    int32_t  n_stop_ids;
     int32_t  attn_output_gate;      // see footnote (2)
     // qwen35 hybrid-only (Gated DeltaNet linear-attention block):
     int32_t  is_hybrid;
@@ -552,6 +554,15 @@ struct llm_config {
 //     `<|im_end|>` and the model otherwise keeps generating into a
 //     hallucinated next role. Looked up by string at load and
 //     defaulted to -1 when absent.
+//
+// (5) stop_ids[]: full set of end-of-generation tokens that
+//     llama.cpp recognizes for qwen35. Populated at tokenizer load
+//     by string lookup. Mirror of llama.cpp's load-time print:
+//     `<|endoftext|>`, `<|im_end|>`, `<|fim_pad|>`, `<|repo_name|>`,
+//     `<|file_sep|>`. Without these we run until max_new on any
+//     completion that wants to emit `<|endoftext|>` (the model card
+//     uses it as the document terminator and emits it readily under
+//     non-chat prompts).
 
 static int32_t llm_load_config(const struct gguf * g, struct llm_config * c) {
     memset(c, 0, sizeof(*c));
@@ -2181,6 +2192,27 @@ struct llm_ctx * llm_create(const char * path) {
     // model isn't a chat-tuned vocab.
     c->cfg.eot_id = s2i_get(&c->tok.vocab_to_id,
                             "<|im_end|>", 10, -1);
+    // Full end-of-generation set: mirrors what llama.cpp prints on
+    // load as "EOG tokens" for qwen35. Generation stops on any of
+    // these. We can fit 8; the model declares 5.
+    static const char * stop_strs[] = {
+        "<|endoftext|>",
+        "<|im_end|>",
+        "<|fim_pad|>",
+        "<|repo_name|>",
+        "<|file_sep|>",
+        NULL,
+    };
+    c->cfg.n_stop_ids = 0;
+    for (int32_t i = 0; stop_strs[i] != NULL; i++) {
+        int32_t id = s2i_get(&c->tok.vocab_to_id,
+                             stop_strs[i],
+                             (int32_t)strlen(stop_strs[i]), -1);
+        if (id >= 0 && c->cfg.n_stop_ids <
+            (int32_t)(sizeof(c->cfg.stop_ids) / sizeof(c->cfg.stop_ids[0]))) {
+            c->cfg.stop_ids[c->cfg.n_stop_ids++] = id;
+        }
+    }
     kv_init(&c->kv, c->cfg.n_layers, c->cfg.n_kv_heads,
             c->cfg.head_dim, c->cfg.max_position);
     ssm_cache_init(&c->ssm, &c->cfg);
@@ -2296,7 +2328,11 @@ int llm_generate(struct llm_ctx * c,
         pos++;
         generated++;
         if (g_trace_tokens) { fprintf(stderr, "[tok] %d\n", (int)next); }
-        if (next == c->cfg.eos_id || next == c->cfg.eot_id) {
+        int32_t is_stop = (next == c->cfg.eos_id || next == c->cfg.eot_id);
+        for (int32_t si = 0; !is_stop && si < c->cfg.n_stop_ids; si++) {
+            if (next == c->cfg.stop_ids[si]) { is_stop = 1; }
+        }
+        if (is_stop) {
             stop = 1;
         } else {
             struct chars piece = {0};

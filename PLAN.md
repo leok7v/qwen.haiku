@@ -135,6 +135,55 @@ revisit once Phase A-C are landed.
   term: ship a known-good SHA256 in code, verify after download,
   refuse to load mismatches.
 
+## Investigation log: greedy parity vs llama.cpp (2026-05-14)
+
+`tools/parity.sh` runs our `./Build/cli/llm --temperature 0` vs
+`llama-completion --temp 0 -ngl 0 -st -no-cnv` on the same four
+prompts. Output diverges on every prompt. Both runners are
+self-deterministic. `tools/rolodex.sh` shows the same Qwen3.5-0.8B
+GGUF produces clean haikus under im.ai's runner but wobbles under
+ours, so the model is not the ceiling.
+
+Layer-by-layer comparison on the single-token prompt "Hello" via
+`llama-eval-callback -ngl 0`:
+
+| tensor | ours | llama.cpp | diff |
+|---|---|---|---|
+| attn_norm-0 (head: 1.7735, -2.8266, -0.8377) | match | match | **bit-identical** |
+| node_18 / attn_qkv-0 (head: -0.2255, -0.7863, 0.3339) | match | match | **bit-identical** |
+| linear_attn_out-0 / ssm_out-0 (head: -0.6552 vs -0.6565) | close | close | ~0.2 % |
+| post_ffn-23 (head: -0.2254 vs -0.1617) | diverged | -- | ~30 % |
+
+So: embeddings, RMS norm, weight-load, and per-layer projections
+match to FP precision. The ~0.2 % first-layer SSM drift compounds
+to ~30 % by layer 23, which is enough to flip argmax on tokens
+with close logits but does not represent a math bug. llama.cpp's
+qwen35 SSM uses a **chunked parallel formulation with SOLVE_TRI**
+(eval-callback shows `NEG -> MUL -> SOLVE_TRI -> ADD`,
+`attn_inter_chunk + v_attn_chunk`); ours is sequential recurrent.
+Mathematically equivalent, numerically different floating-point
+summation order.
+
+Findings:
+- **EOG token set was incomplete.** llama.cpp stops on 5 tokens
+  (`<|endoftext|>`, `<|im_end|>`, `<|fim_pad|>`, `<|repo_name|>`,
+  `<|file_sep|>`); we only stopped on `<|im_end|>` (= eos = eot in
+  this GGUF's KV). Fixed: `struct llm_config` gains `stop_ids[8]`
+  populated at tokenizer load by string lookup; `llm_generate`
+  checks the array.
+- **SSM math is correct but numerically distant from llama.cpp.**
+  Would take a chunked-form rewrite to bit-match. Output quality
+  is mostly satisfactory; the gap is in sampling-margin tokens.
+
+Future investigation:
+- Check whether MRoPE rotation order matches (rope type 40 ==
+  "qwen35 mrope" in llama.cpp's enum; we ported a `tensor_rope_imrope`
+  variant). Diff at the rope output for a known prompt.
+- The `</thrank>` hallucination on "What is love?" persists even
+  with the new sampler; suspect a numerical-edge argmax flip at
+  some specific decode step. Catch with `LLM_TRACE_TOKENS=1` and
+  see whether llama.cpp picks the same token at that position.
+
 ## Things that look like bugs but aren't
 
 A fresh agent (or human) should know about these before reaching for
