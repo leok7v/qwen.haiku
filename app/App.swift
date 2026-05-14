@@ -228,6 +228,9 @@ struct ContentView: View {
         "How does crowd energy physically impact athletic performance?",
         "What makes hosting a large dinner party deeply rewarding?",
         "What hidden patterns reliably emerge in historical cycles?",
+        "What happens to ideas when they are completely forgotten?",
+        "What defines the exact moment a house becomes haunted?",
+        "How does muscle memory actually function biologically?",
     ]
 
     var body: some View {
