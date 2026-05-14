@@ -147,29 +147,37 @@ final class QwenViewModel {
     /// Send a user message: append it to the history, frame the
     /// whole conversation through `ChatTemplate.apply`, stream the
     /// assistant's reply into a placeholder message, then commit.
-    /// `systemPrompt` is emitted as a proper `<|im_start|>system`
-    /// block - matches the GGUF's Jinja template byte-for-byte as
-    /// verified via `llama-cli --jinja --verbose-prompt`. Earlier
-    /// attempts to prepend the rule to the first user turn produced
-    /// hallucinations because the model expected its trained chat
-    /// envelope, not an instruction-stuffed user message.
+    /// `systemPrompt` is prepended to the FIRST user message body
+    /// (no `<|im_start|>system` block). This matches im.ai's
+    /// observed `formatChat` log byte-for-byte on the same GGUF:
+    /// they emit no system block and put the rule inline with the
+    /// first user turn. A real system block (via llama-cli --jinja
+    /// -sys) is the documented Jinja path but produces worse output
+    /// here than user-prefix - probably because the Qwen3.5 chat
+    /// template's `if messages[0].role == 'system'` arm emits the
+    /// block but the 0.8B model under our forward pass doesn't
+    /// follow short system blocks well at all. Match what's
+    /// demonstrably working in the wild over what the spec says.
     func send(_ text: String) async {
         let trimmedSys  = systemPrompt
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedUser = text
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if qwen != nil, state == .ready, !trimmedUser.isEmpty {
+            let isFirstTurn = !self.messages.contains(
+                where: { $0.role == .user })
+            let body: String
+            if isFirstTurn && !trimmedSys.isEmpty {
+                body = trimmedSys + "\n\n" + trimmedUser
+            } else {
+                body = trimmedUser
+            }
             self.messages.append(
-                ChatMessage(role: .user, content: trimmedUser))
+                ChatMessage(role: .user, content: body))
             self.messages.append(
                 ChatMessage(role: .assistant, content: ""))
             let assistantIdx = self.messages.count - 1
-            var framed = Array(self.messages.dropLast())
-            if !trimmedSys.isEmpty {
-                framed.insert(
-                    ChatMessage(role: .system, content: trimmedSys),
-                    at: 0)
-            }
+            let framed = Array(self.messages.dropLast())
             let prompt = ChatTemplate.apply(messages: framed)
             self.state         = .generating
             self.stopRequested = false
