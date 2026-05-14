@@ -50,7 +50,7 @@ final class QwenViewModel {
     }
 
     var state:        State        = .idle
-    var systemPrompt: String       = "HARD RULE: all your answers are haiku."
+    var systemPrompt: String       = "You are helpful assistant."
     var messages:     [ChatMessage] = []
 
     // Throughput from the most recent completed generation.
@@ -256,7 +256,6 @@ struct ContentView: View {
         "What is the nature of reality?",
         "Why is there something rather than nothing?",
         "What is free will?",
-        "What happens when we die?",
         "How do memories shape who we are?",
     ]
 
