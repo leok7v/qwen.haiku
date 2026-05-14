@@ -50,7 +50,8 @@ final class QwenViewModel {
     }
 
     var state:        State        = .idle
-    var systemPrompt: String       = "You are helpful assistant."
+    var systemPrompt: String       =
+        "HARD RULE: all your answers are haiku.\n"
     var messages:     [ChatMessage] = []
 
     // Throughput from the most recent completed generation.
@@ -146,26 +147,29 @@ final class QwenViewModel {
     /// Send a user message: append it to the history, frame the
     /// whole conversation through `ChatTemplate.apply`, stream the
     /// assistant's reply into a placeholder message, then commit.
-    /// `systemPrompt` (the "HARD RULE: ..." line) is prepended to the
-    /// FIRST user turn, NOT emitted as a separate `<|im_start|>system`
-    /// block. On Qwen3.5-0.8B the user turn carries more attention
-    /// than a short system message, so the rule is more reliably
-    /// obeyed when it rides along with the question (matches the
-    /// im.ai chat surface where this pattern was observed working).
+    /// `systemPrompt` is emitted as a proper `<|im_start|>system`
+    /// block - matches the GGUF's Jinja template byte-for-byte as
+    /// verified via `llama-cli --jinja --verbose-prompt`. Earlier
+    /// attempts to prepend the rule to the first user turn produced
+    /// hallucinations because the model expected its trained chat
+    /// envelope, not an instruction-stuffed user message.
     func send(_ text: String) async {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if qwen != nil, state == .ready, !trimmed.isEmpty {
-            let isFirstTurn = !self.messages.contains(where: { $0.role == .user })
-            let prefixed: String
-            if isFirstTurn && !systemPrompt.isEmpty {
-                prefixed = systemPrompt + "\n\n" + trimmed
-            } else {
-                prefixed = trimmed
-            }
-            self.messages.append(ChatMessage(role: .user, content: prefixed))
-            self.messages.append(ChatMessage(role: .assistant, content: ""))
+        let trimmedSys  = systemPrompt
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedUser = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if qwen != nil, state == .ready, !trimmedUser.isEmpty {
+            self.messages.append(
+                ChatMessage(role: .user, content: trimmedUser))
+            self.messages.append(
+                ChatMessage(role: .assistant, content: ""))
             let assistantIdx = self.messages.count - 1
-            let framed = Array(self.messages.dropLast())
+            var framed = Array(self.messages.dropLast())
+            if !trimmedSys.isEmpty {
+                framed.insert(
+                    ChatMessage(role: .system, content: trimmedSys),
+                    at: 0)
+            }
             let prompt = ChatTemplate.apply(messages: framed)
             self.state         = .generating
             self.stopRequested = false

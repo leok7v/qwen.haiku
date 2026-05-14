@@ -26,7 +26,7 @@ export QWEN_GGUF="$GGUF"
 i=0
 for q in "${prompts[@]}"; do
     i=$((i+1))
-    framed="$(printf '<|im_start|>user\n%s\n\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n' "$SYS" "$q")"
+    framed="$(printf '<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n' "$SYS" "$q")"
     echo "=========================="
     echo "[$i/${#prompts[@]}] $q"
     echo "--------------------------"
