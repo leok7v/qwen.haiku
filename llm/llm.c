@@ -1447,6 +1447,12 @@ static int g_min_new      = 0;
     } while (0)
 
 static void llm_dump_row(const char * label, const float * data, int32_t n) {
+    // Mirror llama-eval-callback's format: head + tail + sum. The
+    // sum across the whole tensor is the cheapest single number that
+    // exposes drift in middle elements (head/tail can be identical
+    // while the bulk diverges).
+    double dsum = 0.0;
+    for (int32_t i = 0; i < n; i++) { dsum += data[i]; }
     fprintf(stderr, "[dump] %s: ", label);
     int32_t k_head = n > 4 ? 4 : n;
     for (int32_t i = 0; i < k_head; i++) {
@@ -1465,7 +1471,7 @@ static void llm_dump_row(const char * label, const float * data, int32_t n) {
             fprintf(stderr, "%9.4f ", data[i]);
         }
     }
-    fprintf(stderr, "\n");
+    fprintf(stderr, "  sum=%.6f\n", dsum);
 }
 
 // ---------------------------------------------------------------------------

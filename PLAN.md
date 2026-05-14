@@ -172,8 +172,19 @@ Findings:
   populated at tokenizer load by string lookup; `llm_generate`
   checks the array.
 - **SSM math is correct but numerically distant from llama.cpp.**
-  Would take a chunked-form rewrite to bit-match. Output quality
-  is mostly satisfactory; the gap is in sampling-margin tokens.
+  Sum-level drift after layer 0: conv_silu 0.01 %, y_norm 0.09 %,
+  ssm_out 0.1 %. So drift enters at every intermediate, not just at
+  the Q-quant matmul. Visible head/tail elements were
+  `%9.4f`-printed and looked bit-identical; the actual 5th-6th
+  decimal place differs everywhere. After 24 layers × ~80 ops, the
+  ULP-level drifts compound to the 30-50 % element-wise drift at
+  layer 23.
+- **A "chunked SSM rewrite" or "Q-quant matmul reorder" alone will
+  not close the gap.** Bit-matching llama.cpp would require
+  mirroring their exact FP op order in conv1d, RMS norm, SiLU,
+  l2_norm, the SSM update, the gated norm, AND every matmul -
+  effectively re-using ggml's kernels directly. Not feasible
+  inside the 3 kLOC budget.
 
 Future investigation:
 - Check whether MRoPE rotation order matches (rope type 40 ==
