@@ -202,6 +202,32 @@ public struct ChatStreamFilter {
         return tail
     }
 
+    /// Strip reasoning content for chat-history storage. Mirrors the
+    /// Qwen3 Jinja's
+    ///     content = content.split('</think>')[-1].lstrip('\n')
+    /// rule: past-turn assistant messages in chat history must NOT
+    /// contain `<think>`/`</think>` markers nor any reasoning text
+    /// between them, only the content that comes after the LAST
+    /// `</think>`. The streaming filter swallows a LEADING think
+    /// block as it streams; this static helper handles the (rarer)
+    /// case of a mid-stream block leaking through, plus normalizes
+    /// the committed text so re-feeding history matches what
+    /// `llama_jinja_template` would have produced.
+    public static func contentOnly(_ s: String) -> String {
+        let trim: (Substring) -> Substring = { sub in
+            var out = sub
+            while let c = out.first,
+                  c == "\n" || c == "\r" || c == " " || c == "\t" {
+                out = out.dropFirst()
+            }
+            return out
+        }
+        if let r = s.range(of: "</think>", options: .backwards) {
+            return String(trim(s[r.upperBound...]))
+        }
+        return String(trim(Substring(s)))
+    }
+
     /// Inspect `buf` for the once-per-turn leading think pattern:
     /// optional whitespace, optional `<think>...</think>` (or just
     /// `</think>` if our prompt opened one), then content. Returns

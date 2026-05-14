@@ -2557,7 +2557,7 @@ static int32_t print_cb(const char * s, void * user) {
 }
 
 // Token callback for the chat CLI: capture into `chars` only. The
-// turn is printed in one shot at the end (after strip_leading_think
+// turn is printed in one shot at the end (after strip_reasoning_for_history
 // runs on the buffer), so the user sees a clean reply without the
 // leading `</think>` leak that streaming-print would expose. Loses
 // the per-token streaming feel but the chat CLI is for offline
@@ -2568,45 +2568,26 @@ static int32_t capture_cb(const char * s, void * user) {
     return 0;
 }
 
-// Strip a leading `<think>...</think>` block + surrounding whitespace
-// from a captured assistant reply so the next turn's history is
-// clean (matches what `ChatStreamFilter` does on the Swift side).
-static void strip_leading_think(struct chars * s) {
+// Strip reasoning content from a captured assistant reply before
+// feeding it back into the framed history. Mirrors the Qwen3 Jinja:
+//     content = content.split('</think>')[-1].lstrip('\n')
+// i.e. take everything AFTER THE LAST `</think>`, then strip leading
+// whitespace. When no `</think>` is present, just strip leading
+// whitespace. Past-turn assistant entries in chat history must
+// contain only `content` (no `<think>` tags, no reasoning text);
+// the only place `<think>\n\n</think>\n\n` legitimately appears is
+// in the generation prompt for the NEXT turn.
+static void strip_reasoning_for_history(struct chars * s) {
     if (s->data == NULL || s->count == 0) { return; }
-    int32_t start = 0;
-    while (start < s->count &&
-           (s->data[start] == '\n' || s->data[start] == '\r' ||
-            s->data[start] == ' '  || s->data[start] == '\t')) {
-        start++;
-    }
-    // Match either `<think>...</think>` or just `</think>` (the model
-    // sometimes emits the close even when we pre-filled the empty
-    // block).
-    int32_t open_len = 7;   // "<think>"
-    int32_t close_len = 8;  // "</think>"
-    int32_t cursor = start;
-    if (cursor + open_len <= s->count &&
-        memcmp(s->data + cursor, "<think>", open_len) == 0) {
-        cursor += open_len;
-    } else if (cursor + close_len <= s->count &&
-               memcmp(s->data + cursor, "</think>", close_len) == 0) {
-        // Just the closer; jump straight to whitespace stripping.
-        cursor += close_len;
-        goto strip_ws;
-    } else {
-        return;  // No leading think block.
-    }
-    // Find the matching close.
-    int32_t found = -1;
-    for (int32_t i = cursor; i + close_len <= s->count; i++) {
-        if (memcmp(s->data + i, "</think>", close_len) == 0) {
-            found = i + close_len;
-            break;
+    const char close[] = "</think>";
+    int32_t close_len = (int32_t)(sizeof(close) - 1);
+    int32_t last_close_end = -1;
+    for (int32_t i = 0; i + close_len <= s->count; i++) {
+        if (memcmp(s->data + i, close, (size_t)close_len) == 0) {
+            last_close_end = i + close_len;
         }
     }
-    if (found < 0) { return; }
-    cursor = found;
-strip_ws:
+    int32_t cursor = (last_close_end >= 0) ? last_close_end : 0;
     while (cursor < s->count &&
            (s->data[cursor] == '\n' || s->data[cursor] == '\r' ||
             s->data[cursor] == ' '  || s->data[cursor] == '\t')) {
@@ -2667,7 +2648,7 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
             llm_generate(c, ids, nids, max_new, g_min_new, sp, seed,
                          capture_cb, &reply);
             chars_put(&reply, "", 0);
-            strip_leading_think(&reply);
+            strip_reasoning_for_history(&reply);
             // Also strip a trailing `<|im_end|>` plus its newline if
             // the model emitted it as raw text (it shouldn't, since
             // we now stop on the token id, but defensive).

@@ -213,6 +213,11 @@ final class QwenViewModel {
                     let np = qwen.nPrefill
                     let ng = qwen.nGenerated
                     Task { @MainActor in
+                        // Normalize the committed assistant content to
+                        // history-clean shape (strip any mid-stream
+                        // <think>...</think>) before the next turn's
+                        // `ChatTemplate.apply` re-frames the history.
+                        self?.cleanCommittedAssistant(at: idx)
                         self?.finishTurn(pp: pp, tg: tg, np: np, ng: ng)
                     }
                 } catch {
@@ -227,6 +232,22 @@ final class QwenViewModel {
     private func appendAssistant(_ piece: String, at idx: Int) {
         if idx < self.messages.count {
             self.messages[idx].content += piece
+        }
+    }
+
+    /// Once a turn has finished streaming, scrub the committed text
+    /// so that re-feeding it as history on the next turn matches the
+    /// Qwen3 Jinja's `content.split('</think>')[-1].lstrip('\n')`
+    /// rule. The streaming filter swallows the LEADING think block as
+    /// it arrives; this catches mid-stream blocks the filter doesn't
+    /// touch, so past-turn history never carries reasoning tokens.
+    private func cleanCommittedAssistant(at idx: Int) {
+        if idx < self.messages.count {
+            let raw = self.messages[idx].content
+            let cleaned = ChatStreamFilter.contentOnly(raw)
+            if cleaned != raw {
+                self.messages[idx].content = cleaned
+            }
         }
     }
 
