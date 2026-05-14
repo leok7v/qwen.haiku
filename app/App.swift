@@ -218,6 +218,18 @@ struct ContentView: View {
     @State private var input: String = ""
     @State private var showSystem    = false
 
+    private static let suggestions: [String] = [
+        "How do we balance ambition with daily contentment?",
+        "What psychological triggers create a state of deep flow?",
+        "How does rapid failure accelerate technological innovation?",
+        "Why do some obscure ideas go viral instantly?",
+        "What makes constructive criticism easy to absorb?",
+        "How do we systematically overcome creative blocks?",
+        "How does crowd energy physically impact athletic performance?",
+        "What makes hosting a large dinner party deeply rewarding?",
+        "What hidden patterns reliably emerge in historical cycles?",
+    ]
+
     var body: some View {
         VStack(spacing: 0) {
             statusView
@@ -235,7 +247,11 @@ struct ContentView: View {
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
             }
-            messagesView
+            if vm.messages.isEmpty {
+                suggestionsView
+            } else {
+                messagesView
+            }
             Divider()
             inputBar
                 .padding(.horizontal, 16)
@@ -270,6 +286,34 @@ struct ContentView: View {
             Button(showSystem ? "done" : "edit") { showSystem.toggle() }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+        }
+    }
+
+    @ViewBuilder
+    private var suggestionsView: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 8) {
+                Text("Try one of these")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 4)
+                ForEach(Self.suggestions, id: \.self) { s in
+                    Button {
+                        if vm.state == .ready { Task { await vm.send(s) } }
+                    } label: {
+                        Text(s)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(.background.secondary)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(vm.state != .ready)
+                }
+            }
+            .padding(16)
         }
     }
 
