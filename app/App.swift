@@ -131,17 +131,26 @@ final class QwenViewModel {
     /// Send a user message: append it to the history, frame the
     /// whole conversation through `ChatTemplate.apply`, stream the
     /// assistant's reply into a placeholder message, then commit.
+    /// `systemPrompt` (the "HARD RULE: ..." line) is prepended to the
+    /// FIRST user turn, NOT emitted as a separate `<|im_start|>system`
+    /// block. On Qwen3.5-0.8B the user turn carries more attention
+    /// than a short system message, so the rule is more reliably
+    /// obeyed when it rides along with the question (matches the
+    /// im.ai chat surface where this pattern was observed working).
     func send(_ text: String) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if qwen != nil, state == .ready, !trimmed.isEmpty {
-            self.messages.append(ChatMessage(role: .user, content: trimmed))
+            let isFirstTurn = !self.messages.contains(where: { $0.role == .user })
+            let prefixed: String
+            if isFirstTurn && !systemPrompt.isEmpty {
+                prefixed = systemPrompt + "\n\n" + trimmed
+            } else {
+                prefixed = trimmed
+            }
+            self.messages.append(ChatMessage(role: .user, content: prefixed))
             self.messages.append(ChatMessage(role: .assistant, content: ""))
             let assistantIdx = self.messages.count - 1
-            var framed = Array(self.messages.dropLast())
-            if !systemPrompt.isEmpty {
-                let sys = ChatMessage(role: .system, content: systemPrompt)
-                framed.insert(sys, at: 0)
-            }
+            let framed = Array(self.messages.dropLast())
             let prompt = ChatTemplate.apply(messages: framed)
             self.state         = .generating
             self.stopRequested = false
@@ -218,19 +227,24 @@ struct ContentView: View {
     @State private var input: String = ""
     @State private var showSystem    = false
 
+    // Most-frequently-asked open-ended LLM prompts that tend to
+    // produce profound short answers - good fodder for haiku-mode.
+    // Drawn from common prompt corpora (ShareGPT, Anthropic HH,
+    // typical "deep question" lists). Kept under one line each so
+    // the row layout stays compact.
     private static let suggestions: [String] = [
-        "How do we balance ambition with daily contentment?",
-        "What psychological triggers create a state of deep flow?",
-        "How does rapid failure accelerate technological innovation?",
-        "Why do some obscure ideas go viral instantly?",
-        "What makes constructive criticism easy to absorb?",
-        "How do we systematically overcome creative blocks?",
-        "How does crowd energy physically impact athletic performance?",
-        "What makes hosting a large dinner party deeply rewarding?",
-        "What hidden patterns reliably emerge in historical cycles?",
-        "What happens to ideas when they are completely forgotten?",
-        "What defines the exact moment a house becomes haunted?",
-        "How does muscle memory actually function biologically?",
+        "What is the meaning of life?",
+        "What is consciousness, really?",
+        "Why do we dream?",
+        "What is love?",
+        "How do we find happiness?",
+        "What makes us human?",
+        "What is time?",
+        "What is the nature of reality?",
+        "Why is there something rather than nothing?",
+        "What is free will?",
+        "What happens when we die?",
+        "How do memories shape who we are?",
     ]
 
     var body: some View {
