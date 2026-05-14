@@ -521,6 +521,7 @@ struct llm_config {
     float    norm_eps;
     int32_t  bos_id;
     int32_t  eos_id;
+    int32_t  eot_id;                // see footnote (4)
     int32_t  attn_output_gate;      // see footnote (2)
     // qwen35 hybrid-only (Gated DeltaNet linear-attention block):
     int32_t  is_hybrid;
@@ -544,6 +545,12 @@ struct llm_config {
 //
 // (3) rope_sections: mrope T / H / W / E sections. qwen35 ships
 //     [11, 11, 10, 0]. All zeros falls back to standard NEOX RoPE.
+//
+// (4) eot_id: secondary stop token for chat turns. eos_id is
+//     `<|endoftext|>` (end-of-document); chat turns end with
+//     `<|im_end|>` and the model otherwise keeps generating into a
+//     hallucinated next role. Looked up by string at load and
+//     defaulted to -1 when absent.
 
 static int32_t llm_load_config(const struct gguf * g, struct llm_config * c) {
     memset(c, 0, sizeof(*c));
@@ -629,6 +636,10 @@ static int32_t llm_load_config(const struct gguf * g, struct llm_config * c) {
     }
     c->bos_id = (int32_t)gguf_kv_u32(g, "tokenizer.ggml.bos_token_id", 0);
     c->eos_id = (int32_t)gguf_kv_u32(g, "tokenizer.ggml.eos_token_id", 0);
+    // eot_id is filled in later (after tok_load), when the tokenizer
+    // vocab map is available. Initialize to -1 so the stop check
+    // ignores it on models without an `<|im_end|>` token.
+    c->eot_id = -1;
     return   c->hidden_dim > 0
           && c->n_layers   > 0
           && c->n_heads    > 0
@@ -650,6 +661,20 @@ static int32_t llm_load_config(const struct gguf * g, struct llm_config * c) {
 // per-byte tokens -> greedy merge by lowest rank. Decode: id ->
 // vocab string -> reverse byte map -> raw UTF-8.
 
+// A "special" token that must bypass BPE: when its literal text
+// appears in the input, the encoder emits the vocab id directly
+// instead of running byte-level BPE on its bytes. Without this,
+// markers like `<|im_start|>` get split into 6 byte-level pieces
+// (`<`, `|`, `im`, `_start`, `|`, `>`) and the model sees garbled
+// framing where its training expected a single token. Populated at
+// load time by looking up known marker strings in `vocab_to_id`.
+struct tok_special {
+    const char * str;
+    int32_t      len;
+    int32_t      id;
+};
+#define TOK_MAX_SPECIALS 8
+
 struct tokenizer {
     int32_t         vocab_size;
     struct chars *  vocab_strs;        // [vocab_size]
@@ -661,6 +686,8 @@ struct tokenizer {
     int32_t         uni_to_byte[1024]; // reverse map; sparse, indexed by
                                        // codepoint mod 1024 (the GPT-2
                                        // set is < 1024)
+    int32_t            n_specials;
+    struct tok_special specials[TOK_MAX_SPECIALS];
 };
 
 // GPT-2's bytes_to_unicode table, expressed as direct codepoints.
@@ -807,6 +834,27 @@ static int32_t tok_load(struct tokenizer * t, const struct gguf * g,
         fprintf(stderr, "tok: warning: no tokenizer.ggml.merges (BPE will\n"
                         "     fall back to byte-token-only encoding)\n");
     }
+    // Known chat-framing specials (Qwen3 vocab). Looked up in the
+    // vocab map; populated only when present, so non-chat GGUFs are
+    // unaffected. Listed longest-first so the encoder's greedy match
+    // picks the longest applicable token at each position.
+    static const char * known[] = {
+        "<|endoftext|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        NULL,
+    };
+    t->n_specials = 0;
+    for (int32_t i = 0; known[i] != NULL; i++) {
+        int32_t slen = (int32_t)strlen(known[i]);
+        int32_t id   = s2i_get(&t->vocab_to_id, known[i], slen, -1);
+        if (id >= 0 && t->n_specials < TOK_MAX_SPECIALS) {
+            t->specials[t->n_specials].str = known[i];
+            t->specials[t->n_specials].len = slen;
+            t->specials[t->n_specials].id  = id;
+            t->n_specials++;
+        }
+    }
     return 0;
 }
 
@@ -821,19 +869,35 @@ static void tok_free(struct tokenizer * t) {
     s2i_free(&t->merge_rank);
 }
 
-// Encode: input UTF-8 text -> token ids. Returns count.
-// Greedy lowest-rank-merge BPE on a single whitespace-delimited
-// "word" (Qwen3's pre-tokenizer is roughly GPT-2's regex; we
-// approximate by splitting on byte 0x20 = ' ' boundaries, treating
-// the leading space as part of the next word per GPT-2 convention).
-static int32_t tok_encode(const struct tokenizer * t,
-                          const char * text,
-                          int32_t * out_ids, int32_t max_ids) {
+// Try to match any registered special token at `text[0..tlen)`.
+// Returns the special's index in `t->specials` (>=0) and writes its
+// byte length to `*sp_len`, or -1 if no special matches at position
+// 0. Greedy longest-first match: specials are registered in
+// longest-first order so this just returns the first hit.
+static int32_t tok_match_special(const struct tokenizer * t,
+                                 const char * text, size_t tlen,
+                                 int32_t * sp_len) {
+    int32_t hit = -1;
+    for (int32_t i = 0; i < t->n_specials && hit < 0; i++) {
+        size_t slen = (size_t)t->specials[i].len;
+        if (slen <= tlen && memcmp(text, t->specials[i].str, slen) == 0) {
+            *sp_len = (int32_t)slen;
+            hit     = i;
+        }
+    }
+    return hit;
+}
+
+// BPE-encode a slice of raw text (no special-token recognition).
+// `text[0..tlen)` is split on spaces with the GPT-2 convention that
+// a leading space belongs to the next word, then each word is
+// byte-level-remapped and greedy-BPE-merged. Returns the number of
+// ids written to `out_ids` (bounded by `max_ids`).
+static int32_t tok_encode_bpe(const struct tokenizer * t,
+                              const char * text, size_t tlen,
+                              int32_t * out_ids, int32_t max_ids) {
     int32_t n_out = 0;
-    size_t  tlen  = strlen(text);
     size_t  pos   = 0;
-    // Per-byte working buffer: stores codepoint-as-utf8 of each byte's
-    // remap, indexed 0..nbytes-1. We then BPE-merge in this space.
     while (pos < tlen && n_out < max_ids) {
         // Find next "word" boundary: include leading space (if any).
         size_t word_start = pos;
@@ -901,6 +965,50 @@ static int32_t tok_encode(const struct tokenizer * t,
         }
         for (int32_t i = 0; i < n_toks; i++) { chars_free(&toks[i]); }
         free(toks);
+    }
+    return n_out;
+}
+
+// Encode: input UTF-8 text -> token ids. Returns count.
+//
+// Two-level scan. The outer loop walks the text looking for
+// registered special-token strings (`<|im_start|>` etc.) and emits
+// their vocab IDs directly. The inner spans (text between specials)
+// go through `tok_encode_bpe` for the existing byte-level BPE.
+// Without the outer scan a marker like `<|im_start|>` is split into
+// six byte pieces, the model sees garbled framing instead of its
+// trained chat envelope, and quality collapses.
+static int32_t tok_encode(const struct tokenizer * t,
+                          const char * text,
+                          int32_t * out_ids, int32_t max_ids) {
+    int32_t n_out = 0;
+    size_t  tlen  = strlen(text);
+    size_t  pos   = 0;
+    while (pos < tlen && n_out < max_ids) {
+        // Scan ahead for the next special-token occurrence.
+        size_t  sp_at  = tlen;
+        int32_t sp_idx = -1;
+        int32_t sp_len = 0;
+        for (size_t i = pos; i < tlen && sp_idx < 0; i++) {
+            int32_t mlen = 0;
+            int32_t hit  = tok_match_special(t, text + i, tlen - i, &mlen);
+            if (hit >= 0) {
+                sp_at  = i;
+                sp_idx = hit;
+                sp_len = mlen;
+            }
+        }
+        // BPE-encode the text in front of the special (or all of it).
+        if (sp_at > pos) {
+            n_out += tok_encode_bpe(t, text + pos, sp_at - pos,
+                                    out_ids + n_out, max_ids - n_out);
+        }
+        if (sp_idx >= 0 && n_out < max_ids) {
+            out_ids[n_out++] = t->specials[sp_idx].id;
+            pos = sp_at + (size_t)sp_len;
+        } else {
+            pos = tlen;
+        }
     }
     return n_out;
 }
@@ -1943,6 +2051,11 @@ struct llm_ctx * llm_create(const char * path) {
         snprintf(c->err, sizeof(c->err), "tokenizer load failed");
         return c;
     }
+    // Chat-turn stop token: look up `<|im_end|>` in the vocab now
+    // that the tokenizer's string->id map is built. Stays -1 when the
+    // model isn't a chat-tuned vocab.
+    c->cfg.eot_id = s2i_get(&c->tok.vocab_to_id,
+                            "<|im_end|>", 10, -1);
     kv_init(&c->kv, c->cfg.n_layers, c->cfg.n_kv_heads,
             c->cfg.head_dim, c->cfg.max_position);
     ssm_cache_init(&c->ssm, &c->cfg);
@@ -2018,7 +2131,7 @@ int llm_generate(struct llm_ctx * c,
         pos++;
         generated++;
         if (g_trace_tokens) { fprintf(stderr, "[tok] %d\n", (int)next); }
-        if (next == c->cfg.eos_id) {
+        if (next == c->cfg.eos_id || next == c->cfg.eot_id) {
             stop = 1;
         } else {
             struct chars piece = {0};

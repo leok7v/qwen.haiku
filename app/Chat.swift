@@ -97,19 +97,21 @@ public enum ChatTemplate {
             }
         }
         if addGenerationPrompt {
+            // Matches the GGUF's `tokenizer.chat_template` exactly:
+            //   if enable_thinking: open a <think> block for the
+            //     model to fill in;
+            //   else: pre-fill an empty <think>\n\n</think>\n\n block
+            //     so the model jumps straight to content.
+            // `ChatStreamFilter` defensively strips a leading <think>
+            // block on the way out (so any close tag the model still
+            // emits anyway does not leak into the visible bubble or
+            // contaminate the framed history on the next turn).
             out += "<|im_start|>assistant\n"
             if reasoning {
                 out += "<think>\n"
+            } else {
+                out += "<think>\n\n</think>\n\n"
             }
-            // Qwen3.5 operates in non-thinking mode by default
-            // (huggingface.co/Qwen/Qwen3.5-0.8B). The Qwen3 trick of
-            // pre-filling an empty `<think>\n\n</think>\n\n` block here
-            // is counter-productive on Qwen3.5: the model still emits
-            // its own closing `</think>` afterward, leaking the marker
-            // into the visible bubble (and on turn 2 into the framed
-            // history, scrambling the next reply). Let the model decide.
-            // `ChatStreamFilter` strips any leading <think> block the
-            // model emits anyway so the user-visible content stays clean.
         }
         return out
     }
