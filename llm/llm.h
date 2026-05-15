@@ -167,6 +167,15 @@ struct llm_stream_chunk {
     const char * reasoning;
     const char * tool_call;
     const char * tool_response;
+    // Prefill progress signal. When prefill_total > 0 this chunk
+    // represents prompt-prefill progress and the four string fields
+    // above are NULL. prefill_done is the count of prompt tokens
+    // already in the model's KV; prefill_total is the prompt length.
+    // Fires every ~16 prefill tokens plus once at end. Returning
+    // non-zero from the callback aborts the prefill the same way it
+    // aborts decode (the public llm_generate honours both signals).
+    int prefill_done;
+    int prefill_total;
 };
 
 // Return non-zero to abort generation (same convention as

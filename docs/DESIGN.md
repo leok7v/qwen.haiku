@@ -328,6 +328,44 @@ and intentionally OUT of scope for qwen.haiku — keeps it CPU-only
 and dependency-free. If someone wants a GPU runner they should
 fork.
 
+### Memory footprint (especially iOS)
+
+iOS jetsam kills apps based on **virtual commit**, not just RSS.
+On a 4 GB iPhone, an app that touches no real memory but holds 12
+GB of committed virtual address space will still be killed before
+it runs a single inference step. This bit qwen.haiku once.
+
+Qwen3.5-0.8B's nominal `context_length` KV in the GGUF is
+**262,144**. Sizing the KV cache to that yields:
+
+```
+per_layer = 262144 × 2 (kv_heads) × 256 (head_dim) × 2 (fp16)
+          = 256 MB per layer per (k or v)
+total k+v = 24 layers × 2 × 256 MB
+          = 12 GB committed virtual
+```
+
+That's ~64× the physical memory iOS would actually let us use. The
+fix is in `llm_load_config`: cap `max_position` at **4096** by
+default (~3000 words of context, more than enough for the
+interactive single-prompt use case), with an env-var override
+`QWEN_MAX_POS=N` for power users who need more.
+
+Post-cap footprint via `vmmap --summary`:
+- Physical footprint: **~94 MB**
+- MALLOC_LARGE virtual: **~258 MB** (KV cache + arena + misc)
+- Plus the GGUF mmap (~528 MB, mostly cold, evictable)
+
+If you ever bump the cap, also reconsider only allocating KV cache
+for the 6 attention layers (currently all 24 layers reserve space
+even though SSM layers never use it — another 4× win available
+with some indexing surgery in `kv_init` / `kv_row_k`).
+
+**iOS jetsam tip:** if the app dies on a 4 GB device, the first
+thing to check is `vmmap --summary <pid> | head -20` — the
+`Physical footprint` line is what jetsam reads. Currently <100 MB,
+safe.
+
 ### What NOT to chase
 - **Quantization of attention/SSM intermediates** — already fp32;
   precision was hard-won to make output coherent. Specifically:

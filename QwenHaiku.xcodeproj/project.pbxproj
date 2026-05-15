@@ -14,11 +14,12 @@
 		B3F4AAAA2F904FAC00000017 /* Exceptions for "llm" folder in "QwenHaiku" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
-				Makefile,
 				agent.c,
 				chunked.c,
-				jinja-template.c,
+				"jinja-template.c",
+				Makefile,
 				neon.c,
+				qwen.c,
 				tensor.c,
 				tools.c,
 			);

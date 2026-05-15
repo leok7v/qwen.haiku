@@ -107,6 +107,12 @@ final class QwenViewModel {
     var lastNPrefill:  Int    = 0
     var lastNGen:      Int    = 0
 
+    // Live prefill progress for the in-flight turn. Updated by the
+    // chunk callback; UI shows a progress bar while prefillTotal > 0
+    // and prefillDone < prefillTotal. Reset to 0/0 once decode starts.
+    var prefillDone:   Int = 0
+    var prefillTotal:  Int = 0
+
     @ObservationIgnored private var qwen:       Qwen?
     @ObservationIgnored private var downloader: ModelDownloader?
     // `nonisolated(unsafe)`: read on the C-callback worker, written
@@ -230,6 +236,8 @@ final class QwenViewModel {
                 systemPrefix: isFirstTurn ? trimmedSys : nil)
             self.state         = .generating
             self.stopRequested = false
+            self.prefillDone   = 0
+            self.prefillTotal  = 0
             // Sync per-turn flags onto the live Qwen ctx so the next
             // generate() reads the current Debug toggle state.
             self.qwen?.options.debug = self.debug
@@ -282,6 +290,15 @@ final class QwenViewModel {
                                     self?.appendAssistant(line,
                                                           at: idx)
                                 }
+                            }
+                        case .prefill(let done, let total):
+                            // Mirror to the view model so the UI bar
+                            // tracks live. Clear on completion so the
+                            // bar disappears once decode starts.
+                            let isDone = (done >= total)
+                            Task { @MainActor in
+                                self?.prefillDone  = isDone ? 0 : done
+                                self?.prefillTotal = isDone ? 0 : total
                             }
                         }
                         if keepGoing {
@@ -607,7 +624,14 @@ struct ContentView: View {
                 Text("ready  |  \(rss)")
             }
         case .generating:
-            Text("generating...  |  \(rss)")
+            if vm.prefillTotal > 0 {
+                let pct = Int(Double(vm.prefillDone) /
+                              Double(max(vm.prefillTotal, 1)) * 100.0)
+                Text(String(format: "prefill %d/%d (%d%%)  |  %@",
+                            vm.prefillDone, vm.prefillTotal, pct, rss))
+            } else {
+                Text("generating...  |  \(rss)")
+            }
         case .error(let m):
             Text("error: \(m)").foregroundStyle(.red)
         }

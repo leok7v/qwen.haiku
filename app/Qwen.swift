@@ -77,18 +77,24 @@ public final class Qwen: @unchecked Sendable {
         }
     }
 
-    /// One streamed piece from llm_generate. Exactly one of the four
-    /// associated values is non-empty per emission. UI callers route
-    /// each case to the appropriate render target:
+    /// One streamed piece from llm_generate. Each case corresponds to
+    /// exactly one signal the C runtime can emit:
     ///   .content        — visible chat bubble
     ///   .reasoning      — muted "thinking" panel (when shown)
     ///   .toolCall       — debug-only "tool: …" trace line
     ///   .toolResponse   — debug-only "result: …" trace line
+    ///   .prefill        — prompt prefill progress (done / total
+    ///                     prefilled tokens). Fires periodically
+    ///                     during long prefill so the UI can show a
+    ///                     progress bar. Returning false from the
+    ///                     callback ABORTS prefill (same Stop
+    ///                     semantics as during decode).
     public enum Chunk {
         case content(String)
         case reasoning(String)
         case toolCall(String)
         case toolResponse(String)
+        case prefill(done: Int, total: Int)
     }
 
     public let modelPath: URL
@@ -146,7 +152,12 @@ public final class Qwen: @unchecked Sendable {
                          onToken: @escaping (String) -> Bool) throws {
         try generate(prompt: prompt) { chunk in
             var keepGoing = true
-            if case .content(let s) = chunk { keepGoing = onToken(s) }
+            switch chunk {
+            case .content(let s):
+                keepGoing = onToken(s)
+            case .reasoning, .toolCall, .toolResponse, .prefill:
+                break  // dropped by the content-only convenience
+            }
             return keepGoing
         }
     }
@@ -229,9 +240,13 @@ private func qwenChunkTrampoline(
                        .takeUnretainedValue()
         let c = chunk.pointee
         var keepGoing = true
-        // Exactly one of these four pointers is non-NULL per
-        // emission per llm.h contract. We route accordingly.
-        if let p = c.content {
+        // Exactly one signal is set per emission per llm.h contract.
+        // Prefill progress (prefill_total > 0) is checked first
+        // because the four string fields are NULL in that case.
+        if c.prefill_total > 0 {
+            keepGoing = box.onChunk(.prefill(done:  Int(c.prefill_done),
+                                             total: Int(c.prefill_total)))
+        } else if let p = c.content {
             keepGoing = box.onChunk(.content(String(cString: p)))
         } else if let p = c.reasoning {
             keepGoing = box.onChunk(.reasoning(String(cString: p)))
