@@ -275,6 +275,12 @@ struct tensor * tensor_mul(struct tensor * x, struct tensor * y) {
 }
 
 // SiLU: x * sigmoid(x). Used in SwiGLU FFN.
+// Scalar SiLU - kept for backward compatibility. For bulk SwiGLU /
+// gated paths that need bit-equality with ggml's GGML_OP_SILU,
+// callers should use `neon_silu_vec_f32` from neon.c directly
+// (visible after tensor.c's `#include "neon.c"` near the bottom).
+// The scalar formula matches ggml_silu_f32 in ggml/src/ggml-cpu/vec.h,
+// which is the tail-loop fallback for ggml_vec_silu_f32.
 struct tensor * tensor_silu(struct tensor * x) {
     struct tensor * out = tensor_new_nd(x->arena, x->ndim, x->ne);
     int64_t n = tensor_nelements(x);

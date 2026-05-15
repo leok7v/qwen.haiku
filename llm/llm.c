@@ -2269,7 +2269,11 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
         }
         struct tensor * gate     = matmul_dispatch(&Lw->ffn_gate, h_ffn_norm);
         struct tensor * up       = matmul_dispatch(&Lw->ffn_up,   h_ffn_norm);
-        struct tensor * gate_act = tensor_silu(gate);
+        // FFN SwiGLU uses NEON-poly SiLU (bit-exact with ggml's
+        // GGML_OP_SILU). Scalar libm would drift 1-2 ULP per element.
+        struct tensor * gate_act = tensor_new_nd(a, gate->ndim, gate->ne);
+        neon_silu_vec_f32((int)tensor_nelements(gate),
+                          gate_act->data, gate->data);
         struct tensor * ffn_in   = tensor_mul(gate_act, up);
         struct tensor * ffn_out  = matmul_dispatch(&Lw->ffn_down, ffn_in);
         DUMP("[F]ffn_out ", ffn_out->data, c->cfg.hidden_dim);
