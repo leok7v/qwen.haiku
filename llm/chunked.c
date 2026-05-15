@@ -42,6 +42,24 @@
 // Reference dims for Qwen3.5-0.8B (CHUNK_SIZE = 64):
 //   k_hd = v_hd = 128, n_heads = 16, K_dim = V_dim = 2048
 //
+// Degeneracy check: for n_tokens=1 (chunk padded with 63 zeros on
+// the right of q/k/v/beta and end of g_log), this collapses cleanly
+// to the autoregressive update. With state_init = 0:
+//
+//   attn_inter   = state @ (q * gexp)   = 0
+//   v_eff[0]     = v_beta[0] = V[0] * beta[0]
+//   v_prime[0]   = state @ k_cumdecay   = 0
+//   v_new[0]     = v_eff[0] - 0          = V[0] * beta[0]
+//   attn[0,0]    = 1 (SOLVE_TRI on trivial system + identity)
+//   attn_kq[0,0] = K[0] · Q[0]
+//   v_attn[0]    = attn_kq[0,0] * v_new[0] = (K · Q) · V[0] · beta[0]
+//   out[0]       = attn_inter + v_attn   = (K · Q) · V[0] · beta[0]
+//
+// which is exactly what the autoregressive step produces for the
+// same inputs. So bit-parity-testing this kernel against the
+// existing autoregressive path on a single token is meaningful (the
+// math is identical, only the accumulation order differs).
+//
 // Numerical reference: ggml's compute kernel - the SOLVE_TRI step is
 // a pure forward-substitution on a lower-triangular system, fp32. We
 // match `ggml_compute_forward_solve_tri_f32` (ops.cpp ~line 10293) bit
