@@ -19,6 +19,7 @@
 				jinja-template.c,
 				neon.c,
 				tensor.c,
+				tools.c,
 			);
 			target = B3F4AAAA2F904FAC00000006 /* QwenHaiku */;
 		};

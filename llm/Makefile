@@ -21,6 +21,17 @@ ifeq ($(shell uname -m),arm64)
 CFLAGS += -mcpu=apple-m1
 endif
 
+# Opt-in: build with agent tools (websearch / fetch / distill, see
+# llm/tools.c). Adds a libcurl link dep — the system libcurl on
+# macOS / Linux works out of the box; `curl-config --libs` should
+# print `-lcurl`. Invocation:
+#   LLM_WITH_TOOLS=1 make
+# Off by default so the core inference binary stays dep-free.
+ifeq ($(LLM_WITH_TOOLS),1)
+CFLAGS  += -DLLM_WITH_TOOLS
+LDFLAGS += -lcurl
+endif
+
 BUILD := ../Build/cli
 BIN   := $(BUILD)/llm
 

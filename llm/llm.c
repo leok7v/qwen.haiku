@@ -29,6 +29,9 @@
 #include "tensor.c"
 #include "llm.h"
 #include "jinja-template.c"
+#ifdef LLM_WITH_TOOLS
+#include "tools.c"
+#endif
 
 #ifdef LLM_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>
@@ -4123,6 +4126,8 @@ int main(int argc, char ** argv) {
             mode = 7;
         } else if (strcmp(argv[i], "--jinja-test") == 0) {
             mode = 8;
+        } else if (strcmp(argv[i], "--tools-test") == 0) {
+            mode = 9;
         } else if ((strcmp(argv[i], "-p") == 0 ||
                     strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
             if (chat_n < LLM_CLI_MAX_TURNS) {
@@ -4206,6 +4211,16 @@ int main(int argc, char ** argv) {
         llm_destroy(c);
     } else if (mode == 8) {
         rc = jinja_self_test();
+    } else if (mode == 9) {
+#ifdef LLM_WITH_TOOLS
+        rc = tools_self_test();
+        tools_global_cleanup();
+#else
+        fprintf(stderr,
+            "llm: --tools-test requires LLM_WITH_TOOLS=1 at build time"
+            " (rebuild: cd llm && LLM_WITH_TOOLS=1 make)\n");
+        rc = 1;
+#endif
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  llm --self-test\n"
@@ -4215,6 +4230,7 @@ int main(int argc, char ** argv) {
                        "[-sys \"system prompt\"] [sampler flags]\n"
                "  llm --chat-test [--max-new N]\n"
                "  llm --jinja-test\n"
+               "  llm --tools-test          (requires LLM_WITH_TOOLS=1 at build)\n"
                "  llm --print-chat-template\n"
                "\n"
                "sampler flags:\n"
