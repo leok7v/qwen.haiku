@@ -2180,15 +2180,12 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
         int32_t chunk_start = ck * CHUNK_SIZE;
         int32_t chunk_n     = n - chunk_start;
         if (chunk_n > CHUNK_SIZE) { chunk_n = CHUNK_SIZE; }
+        // Pack each head's chunk_n tokens; no zero-padding needed
+        // because the kernel processes exactly chunk_n tokens this
+        // call (state still carries across chunks).
         for (int32_t h2 = 0; h2 < n_heads; h2++) {
-            // Pack inputs for this (chunk, head), padded to CHUNK_SIZE.
-            memset(q_chunk, 0, CHUNK_SIZE * k_hd * sizeof(float));
-            memset(k_chunk, 0, CHUNK_SIZE * k_hd * sizeof(float));
-            memset(v_chunk, 0, CHUNK_SIZE * v_hd * sizeof(float));
-            memset(g_log_h, 0, CHUNK_SIZE * sizeof(float));
-            memset(beta_h,  0, CHUNK_SIZE * sizeof(float));
             for (int32_t t = 0; t < chunk_n; t++) {
-                int32_t tg = chunk_start + t;  // global token index
+                int32_t tg = chunk_start + t;
                 memcpy(q_chunk + (size_t)t * k_hd,
                        Q_all   + (size_t)tg * K_dim + (size_t)h2 * k_hd,
                        (size_t)k_hd * sizeof(float));
@@ -2202,7 +2199,7 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
                 beta_h [t] = beta_all [tg * n_heads + h2];
             }
             float * state_h = state_base + (size_t)h2 * k_hd * v_hd;
-            chunked_ssm_step_f32(k_hd, v_hd,
+            chunked_ssm_step_f32(chunk_n, k_hd, v_hd,
                                  q_chunk, k_chunk, v_chunk, g_log_h, beta_h,
                                  state_h, out_chunk,
                                  sc_gcs, sc_gexp, sc_decay_mask,
@@ -2211,8 +2208,6 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
                                  sc_attn_kq, sc_q_g_exp, sc_attn_inter,
                                  sc_v_prime, sc_v_new, sc_v_attn,
                                  sc_key_gdiff, sc_kgd_vnew);
-            // Copy the chunk_n real outputs into out_flat at their
-            // global positions.
             for (int32_t t = 0; t < chunk_n; t++) {
                 int32_t tg = chunk_start + t;
                 memcpy(out_flat + (size_t)tg * V_dim + (size_t)h2 * v_hd,
@@ -3023,7 +3018,9 @@ int llm_generate(struct llm_ctx * c,
     if (use_forward_batch < 0) {
         use_forward_batch = (getenv("LLM_USE_FORWARD_BATCH") != NULL) ? 1 : 0;
     }
-    if (use_forward_batch && prompt_n > 1 && prompt_n <= CHUNK_SIZE) {
+    if (use_forward_batch && prompt_n > 1) {
+        // llm_forward_ssm_batch has a multi-chunk loop, so any
+        // prompt_n is allowed (CHUNK_SIZE no longer caps the call).
         struct tensor * logits = llm_forward_batch(c, prompt_ids,
                                                    prompt_n, pos);
         (void)logits;
@@ -3278,7 +3275,10 @@ static int32_t chunked_self_test(void) {
     float * sc_v_attn     = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
     float * sc_key_gdiff  = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
     float * sc_kgd_vnew   = (float *)llm_oom(calloc((size_t)k_hd * v_hd,             sizeof(float)));
-    chunked_ssm_step_f32(k_hd, v_hd,
+    // Run the kernel with the actual N (dynamic chunk size — exercises
+    // the same path that llm_forward_ssm_batch takes for partial tail
+    // chunks).
+    chunked_ssm_step_f32(N, k_hd, v_hd,
                          q_pad, k_pad, v_pad, g_log_p, beta_p,
                          state, out,
                          sc_gcs, sc_gexp, sc_decay_mask,

@@ -145,49 +145,52 @@ static void matmul_f32_ref(int m, int k, int n,
 }
 
 // Chunked Gated DeltaNet SSM step for a single chunk of size
-// CHUNK_SIZE (caller pads/segments multi-chunk prompts).
+// `n` (caller picks n in [1, CHUNK_SIZE]; multi-chunk prompts segment
+// into successive calls, state carries in place).
 //
-// Inputs (single head, single chunk; caller iterates per head):
-//   q[CHUNK_SIZE * k_hd]      - post-L2-norm + temperature-scaled Q
-//   k[CHUNK_SIZE * k_hd]      - post-L2-norm K
-//   v[CHUNK_SIZE * v_hd]      - raw V (post conv1d + silu)
-//   g_log[CHUNK_SIZE]         - pre-exp gate (g_log = ssm_a * softplus(α))
-//   beta[CHUNK_SIZE]          - post-sigmoid β
+// Inputs (single head, single chunk of n tokens; caller iterates per head):
+//   q[n * k_hd]      - post-L2-norm + temperature-scaled Q
+//   k[n * k_hd]      - post-L2-norm K
+//   v[n * v_hd]      - raw V (post conv1d + silu)
+//   g_log[n]         - pre-exp gate (g_log = ssm_a * softplus(α))
+//   beta[n]          - post-sigmoid β
 //
 // In/out:
-//   state[k_hd * v_hd]        - recurrent state (row-major k×v).
-//                               Caller initialises to zeros for a fresh
-//                               conversation, then this function carries
-//                               it across chunks within a batched prefill.
+//   state[k_hd * v_hd]   - recurrent state (row-major k×v).
+//                           Caller initialises to zeros for a fresh
+//                           conversation, then this function carries
+//                           it across chunks within a batched prefill.
 //
 // Output:
-//   out[CHUNK_SIZE * v_hd]    - per-token v outputs (pre-gated-rmsnorm).
+//   out[n * v_hd]    - per-token v outputs (pre-gated-rmsnorm).
 //
-// Scratch (caller-allocated):
-//   gcs        [CHUNK_SIZE]                      g_cumsum
-//   gexp       [CHUNK_SIZE]                      exp(g_cumsum)
-//   decay_mask [CHUNK_SIZE * CHUNK_SIZE]         decay weights, masked
-//   k_beta     [CHUNK_SIZE * k_hd]               K * β (per-token bcast)
-//   v_beta     [CHUNK_SIZE * v_hd]               V * β
-//   kk_dot     [CHUNK_SIZE * CHUNK_SIZE]         K · K_β^T scaled by decay
-//   lhs        [CHUNK_SIZE * CHUNK_SIZE]         (I - attn_lower)
-//   attn       [CHUNK_SIZE * CHUNK_SIZE]         SOLVE_TRI result + I
-//   v_eff      [CHUNK_SIZE * v_hd]               attn^T @ v_beta
-//   kbeta_gexp [CHUNK_SIZE * k_hd]               K_β * gexp
-//   k_cumdecay [CHUNK_SIZE * k_hd]               (attn @ kbeta_gexp^T)^T
-//   attn_kq    [CHUNK_SIZE * CHUNK_SIZE]         intra-chunk attention
-//   q_g_exp    [CHUNK_SIZE * k_hd]               Q * gexp
-//   attn_inter [CHUNK_SIZE * v_hd]               state @ q_g_exp
-//   v_prime    [CHUNK_SIZE * v_hd]               state @ k_cumdecay^T
-//   v_new      [CHUNK_SIZE * v_hd]               V_eff - v_prime
-//   v_attn     [CHUNK_SIZE * v_hd]               attn^T @ v_new
-//   key_gdiff  [CHUNK_SIZE * k_hd]               K * exp(gcs[-1] - gcs)
-//   kgd_vnew   [k_hd * v_hd]                     key_gdiff^T @ v_new
+// Scratch (caller-allocated; leading dim of every n×n matrix is n,
+// so a buffer of CHUNK_SIZE*CHUNK_SIZE floats is enough for any
+// n <= CHUNK_SIZE):
+//   gcs        [n]               g_cumsum
+//   gexp       [n]               exp(g_cumsum)
+//   decay_mask [n * n]           decay weights, masked
+//   k_beta     [n * k_hd]        K * β (per-token bcast)
+//   v_beta     [n * v_hd]        V * β
+//   kk_dot     [n * n]           K · K_β^T scaled by decay
+//   lhs        [n * n]           (I - attn_lower)
+//   attn       [n * n]           SOLVE_TRI result + I
+//   v_eff      [n * v_hd]        attn^T @ v_beta
+//   kbeta_gexp [n * k_hd]        K_β * gexp
+//   k_cumdecay [n * k_hd]        (attn @ kbeta_gexp^T)^T
+//   attn_kq    [n * n]           intra-chunk attention
+//   q_g_exp    [n * k_hd]        Q * gexp
+//   attn_inter [n * v_hd]        state @ q_g_exp
+//   v_prime    [n * v_hd]        state @ k_cumdecay^T
+//   v_new      [n * v_hd]        V_eff - v_prime
+//   v_attn     [n * v_hd]        attn^T @ v_new
+//   key_gdiff  [n * k_hd]        K * exp(gcs[-1] - gcs)
+//   kgd_vnew   [k_hd * v_hd]     key_gdiff^T @ v_new
 //
 // All scratch buffers are stack-allocated when chunk_size and head
 // dims are small enough; the caller passes them in to share across
 // heads / chunks and keep this function arena-free.
-static void chunked_ssm_step_f32(int k_hd, int v_hd,
+static void chunked_ssm_step_f32(int n, int k_hd, int v_hd,
                                  const float * q,
                                  const float * k_in,
                                  const float * v_in,
@@ -215,7 +218,7 @@ static void chunked_ssm_step_f32(int k_hd, int v_hd,
                                  float * v_attn,
                                  float * key_gdiff,
                                  float * kgd_vnew) {
-    const int N = CHUNK_SIZE;
+    const int N = n;
     // 1. g_cumsum
     float acc = 0.0f;
     for (int t = 0; t < N; t++) {
