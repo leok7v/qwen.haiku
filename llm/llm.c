@@ -1616,6 +1616,16 @@ static inline void qh_trace_row(const char * name, const char * op,
     qh_trace_f32(name, op, data, n, 1, 1, 1);
 }
 
+// Convenience: trace a 2D batch tensor of shape (dim, n_tokens).
+// Emits one JSONL line covering all n_tokens; the receiving side
+// (llama.cpp/qwen-haiku reference dumper) uses the same shape when
+// it runs chunked prefill, so byte-comparing the two files works.
+static inline void qh_trace_batch(const char * name, const char * op,
+                                  const float * data,
+                                  int64_t dim, int64_t n_tokens) {
+    qh_trace_f32(name, op, data, dim, n_tokens, 1, 1);
+}
+
 static void llm_dump_row(const char * label, const float * data, int32_t n) {
     // Mirror llama-eval-callback's format: head + tail + sum. The
     // sum across the whole tensor is the cheapest single number that
@@ -2062,11 +2072,26 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
     struct tensor attn_norm_w = weights_as_f32_view(&Lw->attn_norm, a);
     struct tensor * h_norm =
         tensor_rms_norm(h, &attn_norm_w, c->cfg.norm_eps);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
+        qh_trace_batch(nm, "RMS_NORM",
+                       h_norm->data, c->cfg.hidden_dim, n);
+    }
     // 2. In-projections - matmul_dispatch already iterates the n axis.
     struct tensor * qkv_pre = matmul_dispatch(&Lw->attn_qkv,  h_norm);  // [conv_dim, n]
     struct tensor * z       = matmul_dispatch(&Lw->attn_gate, h_norm);  // [V_dim, n]
     struct tensor * b_t     = matmul_dispatch(&Lw->ssm_beta,  h_norm);  // [n_heads, n]
     struct tensor * a_t     = matmul_dispatch(&Lw->ssm_alpha, h_norm);  // [n_heads, n]
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "attn_qkv-%d", (int)L);
+        qh_trace_batch(nm, "MUL_MAT", qkv_pre->data, conv_dim, n);
+        snprintf(nm, sizeof(nm), "alpha-%d", (int)L);
+        qh_trace_batch(nm, "MUL_MAT", a_t->data, n_heads, n);
+        snprintf(nm, sizeof(nm), "beta-%d", (int)L);
+        qh_trace_batch(nm, "MUL_MAT", b_t->data, n_heads, n);
+    }
     // 3. Conv1d step per token (sequential, ring buffer state).
     struct tensor * mixed = tensor_new_2d(a, conv_dim, n);
     const float * conv_w = (const float *)Lw->ssm_conv1d.data;
@@ -2092,8 +2117,18 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
             mixed->data[t * conv_dim + ch] = acc;
         }
     }
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "conv_raw-%d", (int)L);
+        qh_trace_batch(nm, "CONV1D", mixed->data, conv_dim, n);
+    }
     // 4. SiLU on all tokens at once.
     neon_silu_vec_f32(n * conv_dim, mixed->data, mixed->data);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "conv_silu-%d", (int)L);
+        qh_trace_batch(nm, "SILU", mixed->data, conv_dim, n);
+    }
     // 5. Split Q, K, V (per-token contiguous within conv_dim).
     float * Q_all = (float *)arena_alloc(a, (size_t)n * K_dim * sizeof(float));
     float * K_all = (float *)arena_alloc(a, (size_t)n * K_dim * sizeof(float));
@@ -2124,6 +2159,13 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
             }
         }
     }
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "Q_l2norm-%d", (int)L);
+        qh_trace_batch(nm, "L2_NORM_SCALE", Q_all, K_dim, n);
+        snprintf(nm, sizeof(nm), "K_l2norm-%d", (int)L);
+        qh_trace_batch(nm, "L2_NORM", K_all, K_dim, n);
+    }
     // 8. beta, g_log per token per head.
     const float * ssm_a_w   = (const float *)Lw->ssm_a.data;
     const float * dt_bias_w = (const float *)Lw->ssm_dt_bias.data;
@@ -2137,6 +2179,13 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
             float softplus_a = aa > 20.0f ? aa : logf(1.0f + expf(aa));
             g_log_all[t * n_heads + h2] = ssm_a_w[h2] * softplus_a;
         }
+    }
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "beta_in-%d", (int)L);
+        qh_trace_batch(nm, "SIGMOID", beta_all, n_heads, n);
+        snprintf(nm, sizeof(nm), "g_in-%d", (int)L);
+        qh_trace_batch(nm, "MUL", g_log_all, n_heads, n);
     }
     // 9. Chunked SSM per head. Padded chunk buffers, allocated once
     //    and reused per head.
@@ -2244,8 +2293,19 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
             }
         }
     }
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "y_norm-%d", (int)L);
+        qh_trace_batch(nm, "GATED_RMSNORM", y_norm->data, V_dim, n);
+    }
     // 11. Output projection V_dim -> hidden_dim, per token.
     struct tensor * out_t = matmul_dispatch(&Lw->ssm_out, y_norm);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "ssm_out-%d", (int)L);
+        qh_trace_batch(nm, "MUL_MAT",
+                       out_t->data, c->cfg.hidden_dim, n);
+    }
     return out_t;
 }
 
@@ -2479,10 +2539,25 @@ static struct tensor * llm_forward_attn_batch(struct llm_ctx * c,
         weights_as_f32_view(&Lw->attn_norm, a);
     struct tensor * h_norm =
         tensor_rms_norm(h, &attn_norm_w, c->cfg.norm_eps);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
+        qh_trace_batch(nm, "RMS_NORM",
+                       h_norm->data, c->cfg.hidden_dim, n);
+    }
     // Q/K/V projections — matmul_dispatch handles ne[1]=n natively.
     struct tensor * q_raw = matmul_dispatch(&Lw->attn_q, h_norm);
     struct tensor * k     = matmul_dispatch(&Lw->attn_k, h_norm);
     struct tensor * v     = matmul_dispatch(&Lw->attn_v, h_norm);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "Qfull-%d", (int)L);
+        qh_trace_batch(nm, "MUL_MAT", q_raw->data, attn_inner * 2, n);
+        snprintf(nm, sizeof(nm), "Kcur-%d", (int)L);
+        qh_trace_batch(nm, "MUL_MAT", k->data, kv_hidden, n);
+        snprintf(nm, sizeof(nm), "Vcur-%d", (int)L);
+        qh_trace_batch(nm, "MUL_MAT", v->data, kv_hidden, n);
+    }
     // Split q_raw into (q, gate) per token when attn_output_gate=true.
     // q_raw has shape [2*attn_inner, n] in head-interleaved layout.
     struct tensor * q = tensor_new_3d(a, hd, n_h, n);
@@ -2612,6 +2687,12 @@ static struct tensor * llm_forward_attn_batch(struct llm_ctx * c,
     }
     // Output projection [hidden_dim, n].
     struct tensor * attn_out_t = matmul_dispatch(&Lw->attn_out, ctx_t);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "attn_out-%d", (int)L);
+        qh_trace_batch(nm, "MUL_MAT",
+                       attn_out_t->data, c->cfg.hidden_dim, n);
+    }
     return attn_out_t;
 }
 
@@ -2795,6 +2876,7 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
             }
         }
     }
+    qh_trace_batch("inp_embd", "GET_ROWS", h->data, hidden_dim, n);
     // 2. Per-layer.
     for (int32_t L = 0; L < c->cfg.n_layers; L++) {
         struct llm_layer_w * Lw = &c->W.layers[L];
@@ -2810,12 +2892,28 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
             // query t attends only to keys 0..(pos_start+t).
             mix = llm_forward_attn_batch(c, L, pos_start, n, h);
         }
+        {
+            char nm[48];
+            snprintf(nm, sizeof(nm), "mix-%d", (int)L);
+            qh_trace_batch(nm, Lw->is_ssm ? "SSM" : "ATTN",
+                           mix->data, hidden_dim, n);
+        }
         // h = h + mix (per-token elementwise add).
         h = tensor_add(h, mix);
+        {
+            char nm[48];
+            snprintf(nm, sizeof(nm), "mix_residual-%d", (int)L);
+            qh_trace_batch(nm, "ADD", h->data, hidden_dim, n);
+        }
         // FFN: rms_norm + SwiGLU + matmul, all n-axis-aware.
         struct tensor ffn_norm_w = weights_as_f32_view(&Lw->ffn_norm, a);
         struct tensor * h_ffn_norm =
             tensor_rms_norm(h, &ffn_norm_w, c->cfg.norm_eps);
+        {
+            char nm[48];
+            snprintf(nm, sizeof(nm), "ffn_norm-%d", (int)L);
+            qh_trace_batch(nm, "RMS_NORM", h_ffn_norm->data, hidden_dim, n);
+        }
         struct tensor * gate     = matmul_dispatch(&Lw->ffn_gate, h_ffn_norm);
         struct tensor * up       = matmul_dispatch(&Lw->ffn_up,   h_ffn_norm);
         struct tensor * gate_act = tensor_new_2d(a, gate->ne[0], gate->ne[1]);
@@ -2823,7 +2921,17 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
                           gate_act->data, gate->data);
         struct tensor * ffn_in   = tensor_mul(gate_act, up);
         struct tensor * ffn_out  = matmul_dispatch(&Lw->ffn_down, ffn_in);
+        {
+            char nm[48];
+            snprintf(nm, sizeof(nm), "ffn_out-%d", (int)L);
+            qh_trace_batch(nm, "MUL_MAT", ffn_out->data, hidden_dim, n);
+        }
         h = tensor_add(h, ffn_out);
+        {
+            char nm[48];
+            snprintf(nm, sizeof(nm), "l_out-%d", (int)L);
+            qh_trace_batch(nm, "ADD", h->data, hidden_dim, n);
+        }
     }
     // 3. Final RMS-norm + lm_head on the LAST token only.
     //    Earlier tokens' logits aren't needed for prefill.
@@ -2835,7 +2943,10 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
         weights_as_f32_view(&c->W.output_norm, a);
     struct tensor * h_final =
         tensor_rms_norm(h_last, &output_norm_w, c->cfg.norm_eps);
+    qh_trace_row("result_norm", "RMS_NORM", h_final->data, hidden_dim);
     struct tensor * logits = matmul_dispatch(&c->W.output, h_final);
+    qh_trace_row("result_output", "MUL_MAT",
+                 logits->data, c->cfg.vocab_size);
     return logits;
 }
 
