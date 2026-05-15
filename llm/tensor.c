@@ -772,6 +772,13 @@ typedef struct {
 // later), add a sibling file and switch the include with #if.
 #include "neon.c"
 
+// Chunked Gated DeltaNet SSM kernel (qwen3-next batched prefill).
+// Pure scalar fp32 reference port of `build_delta_net_chunking` from
+// llama.cpp src/models/qwen3next.cpp. Not yet wired into the forward
+// path - currently a draft to be exercised against the multi-token
+// reference trace once `llm_forward_batch` lands.
+#include "chunked.c"
+
 // Unpack 8 * (6-bit scale, 6-bit min) from the 12-byte `scales` field.
 // Layout per llama.cpp dequantize_row_q4_K reference:
 //   For sub-block j in [0,4):  sc = scales[j]   & 63
