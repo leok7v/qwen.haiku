@@ -1993,11 +1993,22 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
         for (int32_t v = 0; v < v_hd; v++) {
             ssq += (double)(yh[v] * yh[v]);
         }
-        float rs = 1.0f / sqrtf((float)(ssq / (double)v_hd) + c->cfg.norm_eps);
+        float mean = (float)(ssq / (double)v_hd);
+        float rs = 1.0f / sqrtf(mean + c->cfg.norm_eps);
         const float * sg = z_silu + h2 * v_hd;
         float * yo = y_norm->data + h2 * v_hd;
+        // ggml's RMS_NORM/MUL/MUL pipeline stores each intermediate
+        // to memory, so each fp32 multiply is a separate operation.
+        // Split into 3 distinct write-back stages to prevent clang
+        // from fusing into a single FMA (which would change bits).
         for (int32_t v = 0; v < v_hd; v++) {
-            yo[v] = yh[v] * rs * norm_w[v] * sg[v];
+            yo[v] = yh[v] * rs;            // RMS_NORM scale
+        }
+        for (int32_t v = 0; v < v_hd; v++) {
+            yo[v] = yo[v] * norm_w[v];     // MUL weight
+        }
+        for (int32_t v = 0; v < v_hd; v++) {
+            yo[v] = yo[v] * sg[v];         // MUL silu(z)
         }
     }
     DUMP("conv_silu", mixed->data, conv_dim);
