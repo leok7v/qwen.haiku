@@ -2561,6 +2561,123 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
 }
 
 // ---------------------------------------------------------------------------
+// Batched (multi-token) forward for prefill.
+//
+// Processes `n` tokens at positions [pos_start, pos_start + n) in a
+// single call, returning the logits for the LAST token. Used for
+// prefill of multi-token prompts where the SSM layers benefit from
+// the chunked Gated DeltaNet kernel (~10x throughput vs n calls to
+// the autoregressive `llm_forward_step` for long prompts).
+//
+// Per-layer routing:
+//   - SSM layer: llm_forward_ssm_batch (chunked, all n tokens
+//                in one call; multi-chunk loop here for n > CHUNK_SIZE)
+//   - Attention layer: per-token sequential loop (calls the existing
+//                `llm_forward_attn` n times with positions pos_start+t).
+//                Simple and correct; can be optimised later to a
+//                batched-queries-vs-full-KV-cache kernel.
+//   - FFN: shape [hidden, n] flows through tensor_rms_norm,
+//          matmul_dispatch, tensor_mul, neon_silu_vec_f32 untouched -
+//          all four operate over the `n` axis natively.
+//
+// Caller invariants:
+//   - Caller is responsible for advancing `c->pos` (mirrors
+//     llm_forward_step semantics; we just compute, no state pointer).
+//   - SSM state (`c->ssm.ssm_state`, `c->ssm.conv_state`,
+//     `c->ssm.conv_head`) is updated in place. KV cache rows for
+//     pos_start..pos_start+n-1 are written by the per-token attn calls.
+//
+// Returns logits for the LAST token (shape [vocab_size, 1]). Earlier
+// tokens' logits are discarded (we only need them for prefill
+// state-building; the first sample-able token is pos_start + n - 1).
+static struct tensor * llm_forward_batch(struct llm_ctx * c,
+                                         const int32_t * tok_ids,
+                                         int32_t n,
+                                         int32_t pos_start) {
+    assert(n > 0);
+    struct arena * a = c->arena;
+    arena_reset(a);
+    int32_t hidden_dim = c->cfg.hidden_dim;
+    // 1. Embedding lookup for n tokens. Same Q6_K / F32 split as the
+    //    single-token path; we just stack n rows.
+    struct tensor * h = tensor_new_2d(a, hidden_dim, n);
+    for (int32_t t = 0; t < n; t++) {
+        int32_t tok_id = tok_ids[t];
+        float * dst = h->data + (size_t)t * hidden_dim;
+        if (c->W.tok_embd.type == GGUF_TT_F32) {
+            const float * src = (const float *)c->W.tok_embd.data
+                              + (size_t)tok_id * hidden_dim;
+            memcpy(dst, src, (size_t)hidden_dim * sizeof(float));
+        } else {
+            // Q6_K dequant per row, same as llm_forward_step.
+            assert(hidden_dim % QK_K == 0);
+            int32_t blocks_per_row = hidden_dim / QK_K;
+            const q6k_block * row_blocks =
+                (const q6k_block *)c->W.tok_embd.data
+                + (size_t)tok_id * blocks_per_row;
+            for (int32_t b = 0; b < blocks_per_row; b++) {
+                q6k_dequant_block(row_blocks + b, dst + b * QK_K);
+            }
+        }
+    }
+    // 2. Per-layer.
+    for (int32_t L = 0; L < c->cfg.n_layers; L++) {
+        struct llm_layer_w * Lw = &c->W.layers[L];
+        struct tensor * mix;
+        if (Lw->is_ssm) {
+            // SSM: process all n tokens via chunked kernel. For
+            // n <= CHUNK_SIZE one call; for larger n we'd loop, but
+            // most prompts here are <=64 so single-call for now.
+            assert(n <= CHUNK_SIZE && "multi-chunk SSM not yet supported");
+            mix = llm_forward_ssm_batch(c, L, n, h);
+        } else {
+            // Attention: per-token sequential. Each token attends
+            // against the KV cache built up so far (including the
+            // tokens already written by this loop's earlier iterations).
+            mix = tensor_new_2d(a, hidden_dim, n);
+            struct tensor * h_one = tensor_new_2d(a, hidden_dim, 1);
+            for (int32_t t = 0; t < n; t++) {
+                memcpy(h_one->data,
+                       h->data + (size_t)t * hidden_dim,
+                       (size_t)hidden_dim * sizeof(float));
+                struct tensor * mt = llm_forward_attn(c, L,
+                                                       pos_start + t,
+                                                       h_one);
+                memcpy(mix->data + (size_t)t * hidden_dim,
+                       mt->data,
+                       (size_t)hidden_dim * sizeof(float));
+            }
+        }
+        // h = h + mix (per-token elementwise add).
+        h = tensor_add(h, mix);
+        // FFN: rms_norm + SwiGLU + matmul, all n-axis-aware.
+        struct tensor ffn_norm_w = weights_as_f32_view(&Lw->ffn_norm, a);
+        struct tensor * h_ffn_norm =
+            tensor_rms_norm(h, &ffn_norm_w, c->cfg.norm_eps);
+        struct tensor * gate     = matmul_dispatch(&Lw->ffn_gate, h_ffn_norm);
+        struct tensor * up       = matmul_dispatch(&Lw->ffn_up,   h_ffn_norm);
+        struct tensor * gate_act = tensor_new_2d(a, gate->ne[0], gate->ne[1]);
+        neon_silu_vec_f32((int)tensor_nelements(gate),
+                          gate_act->data, gate->data);
+        struct tensor * ffn_in   = tensor_mul(gate_act, up);
+        struct tensor * ffn_out  = matmul_dispatch(&Lw->ffn_down, ffn_in);
+        h = tensor_add(h, ffn_out);
+    }
+    // 3. Final RMS-norm + lm_head on the LAST token only.
+    //    Earlier tokens' logits aren't needed for prefill.
+    struct tensor * h_last = tensor_new_2d(a, hidden_dim, 1);
+    memcpy(h_last->data,
+           h->data + (size_t)(n - 1) * hidden_dim,
+           (size_t)hidden_dim * sizeof(float));
+    struct tensor output_norm_w =
+        weights_as_f32_view(&c->W.output_norm, a);
+    struct tensor * h_final =
+        tensor_rms_norm(h_last, &output_norm_w, c->cfg.norm_eps);
+    struct tensor * logits = matmul_dispatch(&c->W.output, h_final);
+    return logits;
+}
+
+// ---------------------------------------------------------------------------
 // Sampling
 // ---------------------------------------------------------------------------
 
@@ -2884,18 +3001,32 @@ int llm_generate(struct llm_ctx * c,
         calloc((size_t)(prompt_n + max_new + 1), sizeof(int32_t)));
     int32_t   hist_n  = 0;
     for (int32_t i = 0; i < prompt_n; i++) { history[hist_n++] = prompt_ids[i]; }
-    // Pre-fill prompt.
-    for (int32_t i = 0; i < prompt_n && !stop; i++) {
-        struct tensor * logits = llm_forward_step(c, prompt_ids[i], pos);
-        // Trace facility is for parity diagnostics on the FIRST
-        // forward pass only - one prompt token -> ~1850 JSONL lines
-        // matches the llama-qwen-haiku reference dump shape. Close
-        // after step 0 to keep file size bounded and to avoid noise
-        // from later positions that exercise different KV/SSM
-        // states.
-        if (i == 0) { qh_trace_close(); }
+    // Pre-fill prompt. If LLM_USE_FORWARD_BATCH is set AND the prompt
+    // is multi-token AND fits in one chunk, run the chunked-SSM
+    // batched forward in a single call. Otherwise loop the
+    // autoregressive single-token forward as before. Decode (after
+    // prefill) always uses single-token forward.
+    static int8_t use_forward_batch = -1;
+    if (use_forward_batch < 0) {
+        use_forward_batch = (getenv("LLM_USE_FORWARD_BATCH") != NULL) ? 1 : 0;
+    }
+    if (use_forward_batch && prompt_n > 1 && prompt_n <= CHUNK_SIZE) {
+        struct tensor * logits = llm_forward_batch(c, prompt_ids,
+                                                   prompt_n, pos);
         (void)logits;
-        pos++;
+        pos += prompt_n;
+        qh_trace_close();
+    } else {
+        for (int32_t i = 0; i < prompt_n && !stop; i++) {
+            struct tensor * logits = llm_forward_step(c, prompt_ids[i], pos);
+            // Trace facility is for parity diagnostics on the FIRST
+            // forward pass only - one prompt token -> ~1850 JSONL
+            // lines matches the llama-qwen-haiku reference dump
+            // shape. Close after step 0 to keep file size bounded.
+            if (i == 0) { qh_trace_close(); }
+            (void)logits;
+            pos++;
+        }
     }
     double t1 = llm_monotonic_seconds();
     c->t_prefill_s = t1 - t0;
