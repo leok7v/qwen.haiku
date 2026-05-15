@@ -2057,7 +2057,7 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
     int32_t V_dim    = n_heads * v_hd;
     int32_t kK       = c->cfg.linear_conv_kernel;
     int32_t conv_dim = 2 * K_dim + V_dim;
-    assert(n > 0 && n <= CHUNK_SIZE);
+    assert(n > 0);
     // 1. attn_norm per token (rms_norm handles n via x->ne[1]).
     struct tensor attn_norm_w = weights_as_f32_view(&Lw->attn_norm, a);
     struct tensor * h_norm =
@@ -2169,41 +2169,56 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
     size_t state_off  = (size_t)L * n_heads * k_hd * v_hd;
     float * state_base = c->ssm.ssm_state + state_off;
     float * out_flat = (float *)arena_alloc(a, (size_t)n * V_dim * sizeof(float));
-    for (int32_t h2 = 0; h2 < n_heads; h2++) {
-        // Pack inputs for this head, padded to CHUNK_SIZE.
-        memset(q_chunk, 0, CHUNK_SIZE * k_hd * sizeof(float));
-        memset(k_chunk, 0, CHUNK_SIZE * k_hd * sizeof(float));
-        memset(v_chunk, 0, CHUNK_SIZE * v_hd * sizeof(float));
-        memset(g_log_h, 0, CHUNK_SIZE * sizeof(float));
-        memset(beta_h,  0, CHUNK_SIZE * sizeof(float));
-        for (int32_t t = 0; t < n; t++) {
-            memcpy(q_chunk + (size_t)t * k_hd,
-                   Q_all   + (size_t)t * K_dim + (size_t)h2 * k_hd,
-                   (size_t)k_hd * sizeof(float));
-            memcpy(k_chunk + (size_t)t * k_hd,
-                   K_all   + (size_t)t * K_dim + (size_t)h2 * k_hd,
-                   (size_t)k_hd * sizeof(float));
-            memcpy(v_chunk + (size_t)t * v_hd,
-                   V_all   + (size_t)t * V_dim + (size_t)h2 * v_hd,
-                   (size_t)v_hd * sizeof(float));
-            g_log_h[t] = g_log_all[t * n_heads + h2];
-            beta_h [t] = beta_all [t * n_heads + h2];
-        }
-        float * state_h = state_base + (size_t)h2 * k_hd * v_hd;
-        chunked_ssm_step_f32(k_hd, v_hd,
-                             q_chunk, k_chunk, v_chunk, g_log_h, beta_h,
-                             state_h, out_chunk,
-                             sc_gcs, sc_gexp, sc_decay_mask,
-                             sc_k_beta, sc_v_beta, sc_kk_dot, sc_lhs,
-                             sc_attn, sc_v_eff, sc_kbeta_gexp, sc_k_cumdecay,
-                             sc_attn_kq, sc_q_g_exp, sc_attn_inter,
-                             sc_v_prime, sc_v_new, sc_v_attn,
-                             sc_key_gdiff, sc_kgd_vnew);
-        // Copy the n real outputs into out_flat.
-        for (int32_t t = 0; t < n; t++) {
-            memcpy(out_flat + (size_t)t * V_dim + (size_t)h2 * v_hd,
-                   out_chunk + (size_t)t * v_hd,
-                   (size_t)v_hd * sizeof(float));
+    // Multi-chunk loop: process CHUNK_SIZE tokens at a time, state
+    // carries in place across chunks (chunked_ssm_step_f32 updates
+    // it). The final chunk pads with zeros if n is not a multiple
+    // of CHUNK_SIZE - zero-padded tokens contribute nothing to the
+    // recurrence (K/V/beta = 0 there, g_log = 0 so exp(gcs[t]) is
+    // a constant continuation = no decay change).
+    int32_t n_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    for (int32_t ck = 0; ck < n_chunks; ck++) {
+        int32_t chunk_start = ck * CHUNK_SIZE;
+        int32_t chunk_n     = n - chunk_start;
+        if (chunk_n > CHUNK_SIZE) { chunk_n = CHUNK_SIZE; }
+        for (int32_t h2 = 0; h2 < n_heads; h2++) {
+            // Pack inputs for this (chunk, head), padded to CHUNK_SIZE.
+            memset(q_chunk, 0, CHUNK_SIZE * k_hd * sizeof(float));
+            memset(k_chunk, 0, CHUNK_SIZE * k_hd * sizeof(float));
+            memset(v_chunk, 0, CHUNK_SIZE * v_hd * sizeof(float));
+            memset(g_log_h, 0, CHUNK_SIZE * sizeof(float));
+            memset(beta_h,  0, CHUNK_SIZE * sizeof(float));
+            for (int32_t t = 0; t < chunk_n; t++) {
+                int32_t tg = chunk_start + t;  // global token index
+                memcpy(q_chunk + (size_t)t * k_hd,
+                       Q_all   + (size_t)tg * K_dim + (size_t)h2 * k_hd,
+                       (size_t)k_hd * sizeof(float));
+                memcpy(k_chunk + (size_t)t * k_hd,
+                       K_all   + (size_t)tg * K_dim + (size_t)h2 * k_hd,
+                       (size_t)k_hd * sizeof(float));
+                memcpy(v_chunk + (size_t)t * v_hd,
+                       V_all   + (size_t)tg * V_dim + (size_t)h2 * v_hd,
+                       (size_t)v_hd * sizeof(float));
+                g_log_h[t] = g_log_all[tg * n_heads + h2];
+                beta_h [t] = beta_all [tg * n_heads + h2];
+            }
+            float * state_h = state_base + (size_t)h2 * k_hd * v_hd;
+            chunked_ssm_step_f32(k_hd, v_hd,
+                                 q_chunk, k_chunk, v_chunk, g_log_h, beta_h,
+                                 state_h, out_chunk,
+                                 sc_gcs, sc_gexp, sc_decay_mask,
+                                 sc_k_beta, sc_v_beta, sc_kk_dot, sc_lhs,
+                                 sc_attn, sc_v_eff, sc_kbeta_gexp, sc_k_cumdecay,
+                                 sc_attn_kq, sc_q_g_exp, sc_attn_inter,
+                                 sc_v_prime, sc_v_new, sc_v_attn,
+                                 sc_key_gdiff, sc_kgd_vnew);
+            // Copy the chunk_n real outputs into out_flat at their
+            // global positions.
+            for (int32_t t = 0; t < chunk_n; t++) {
+                int32_t tg = chunk_start + t;
+                memcpy(out_flat + (size_t)tg * V_dim + (size_t)h2 * v_hd,
+                       out_chunk + (size_t)t * v_hd,
+                       (size_t)v_hd * sizeof(float));
+            }
         }
     }
     // 10. Gated RMSNorm + z-SiLU per token. Each token's y_norm
@@ -2625,10 +2640,8 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
         struct llm_layer_w * Lw = &c->W.layers[L];
         struct tensor * mix;
         if (Lw->is_ssm) {
-            // SSM: process all n tokens via chunked kernel. For
-            // n <= CHUNK_SIZE one call; for larger n we'd loop, but
-            // most prompts here are <=64 so single-call for now.
-            assert(n <= CHUNK_SIZE && "multi-chunk SSM not yet supported");
+            // SSM: process all n tokens via chunked kernel. Internal
+            // multi-chunk loop handles n > CHUNK_SIZE.
             mix = llm_forward_ssm_batch(c, L, n, h);
         } else {
             // Attention: per-token sequential. Each token attends
