@@ -2777,6 +2777,120 @@ int  llm_eos_id    (const struct llm_ctx * c) { return c->cfg.eos_id; }
 int  llm_bos_id    (const struct llm_ctx * c) { return c->cfg.bos_id; }
 
 // ---------------------------------------------------------------------------
+// --chunked-test: run the chunked SSM kernel on a 1-real-token chunk
+// (padded with 63 zero-tokens) and compare to the autoregressive
+// math direct evaluation. Per the degeneracy proof in chunked.c,
+// they MUST agree (mathematically identical operations applied to
+// the same fp32 inputs). A 1-2 ULP discrepancy on a handful of
+// elements is acceptable - that is intra-kernel reduction order
+// drift. A larger discrepancy means our chunked port is wrong.
+#define CHUNKED_TEST_KHD 128
+#define CHUNKED_TEST_VHD 128
+
+static int32_t chunked_self_test(void) {
+    enum { k_hd = CHUNKED_TEST_KHD, v_hd = CHUNKED_TEST_VHD };
+    // Deterministic single-head inputs.
+    float Q[k_hd], K[k_hd], V[v_hd];
+    for (int i = 0; i < k_hd; i++) {
+        Q[i] = sinf((float)(i + 1) * 0.0173f);
+        K[i] = cosf((float)(i + 1) * 0.0211f);
+    }
+    for (int i = 0; i < v_hd; i++) {
+        V[i] = sinf((float)(i + 1) * 0.0149f) * 0.5f;
+    }
+    const float beta_v   = 0.6f;
+    const float g_log_v  = -0.25f;
+    // Autoregressive expected output (state init = 0).
+    //   delta[v] = V[v] * beta
+    //   state[k, v] = K[k] * delta[v]
+    //   out[v] = sum_k state[k, v] * Q[k] = (K · Q) * V[v] * beta
+    float auto_out[v_hd];
+    {
+        float kq = 0.0f;
+        for (int i = 0; i < k_hd; i++) { kq += K[i] * Q[i]; }
+        for (int e = 0; e < v_hd; e++) { auto_out[e] = kq * V[e] * beta_v; }
+    }
+    // Chunked path with N=1 real token padded to CHUNK_SIZE.
+    static float q_pad   [CHUNK_SIZE * 128];
+    static float k_pad   [CHUNK_SIZE * 128];
+    static float v_pad   [CHUNK_SIZE * 128];
+    static float g_log   [CHUNK_SIZE];
+    static float beta_arr[CHUNK_SIZE];
+    static float state   [128 * 128];
+    static float out     [CHUNK_SIZE * 128];
+    memset(q_pad,    0, sizeof(q_pad));
+    memset(k_pad,    0, sizeof(k_pad));
+    memset(v_pad,    0, sizeof(v_pad));
+    memset(g_log,    0, sizeof(g_log));
+    memset(beta_arr, 0, sizeof(beta_arr));
+    memset(state,    0, sizeof(state));
+    memset(out,      0, sizeof(out));
+    for (int i = 0; i < k_hd; i++) { q_pad[i] = Q[i]; }
+    for (int i = 0; i < k_hd; i++) { k_pad[i] = K[i]; }
+    for (int i = 0; i < v_hd; i++) { v_pad[i] = V[i]; }
+    g_log   [0] = g_log_v;
+    beta_arr[0] = beta_v;
+    // Scratch (heap; one-shot test, no perf concern).
+    float * sc_gcs        = (float *)llm_oom(calloc(CHUNK_SIZE, sizeof(float)));
+    float * sc_gexp       = (float *)llm_oom(calloc(CHUNK_SIZE, sizeof(float)));
+    float * sc_decay_mask = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_k_beta     = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_v_beta     = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_kk_dot     = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_lhs        = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_attn       = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_v_eff      = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_kbeta_gexp = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_k_cumdecay = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_attn_kq    = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_q_g_exp    = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_attn_inter = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_v_prime    = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_v_new      = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_v_attn     = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_key_gdiff  = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_kgd_vnew   = (float *)llm_oom(calloc((size_t)k_hd * v_hd,             sizeof(float)));
+    chunked_ssm_step_f32(k_hd, v_hd,
+                         q_pad, k_pad, v_pad, g_log, beta_arr,
+                         state, out,
+                         sc_gcs, sc_gexp, sc_decay_mask,
+                         sc_k_beta, sc_v_beta, sc_kk_dot, sc_lhs,
+                         sc_attn, sc_v_eff, sc_kbeta_gexp, sc_k_cumdecay,
+                         sc_attn_kq, sc_q_g_exp, sc_attn_inter,
+                         sc_v_prime, sc_v_new, sc_v_attn,
+                         sc_key_gdiff, sc_kgd_vnew);
+    // Compare auto_out vs out[0, :].
+    float max_abs_diff = 0.0f;
+    float max_rel_diff = 0.0f;
+    int   max_diff_idx = -1;
+    for (int e = 0; e < v_hd; e++) {
+        float ae = auto_out[e];
+        float ce = out[e];
+        float d  = fabsf(ae - ce);
+        float r  = (fabsf(ae) > 1e-6f) ? d / fabsf(ae) : d;
+        if (d > max_abs_diff) {
+            max_abs_diff = d;
+            max_rel_diff = r;
+            max_diff_idx = e;
+        }
+    }
+    printf("chunked-test: auto_out[0..3] = %.7g %.7g %.7g %.7g\n",
+           auto_out[0], auto_out[1], auto_out[2], auto_out[3]);
+    printf("chunked-test: chunked[0..3]  = %.7g %.7g %.7g %.7g\n",
+           out[0], out[1], out[2], out[3]);
+    printf("chunked-test: max |Δ| = %.4g at e=%d (rel %.4g)\n",
+           max_abs_diff, max_diff_idx, max_rel_diff);
+    // Free scratch.
+    free(sc_gcs); free(sc_gexp); free(sc_decay_mask);
+    free(sc_k_beta); free(sc_v_beta); free(sc_kk_dot); free(sc_lhs);
+    free(sc_attn); free(sc_v_eff); free(sc_kbeta_gexp);
+    free(sc_k_cumdecay); free(sc_attn_kq); free(sc_q_g_exp);
+    free(sc_attn_inter); free(sc_v_prime); free(sc_v_new);
+    free(sc_v_attn); free(sc_key_gdiff); free(sc_kgd_vnew);
+    // Pass if rel <= 1e-5 (a few ULPs at fp32 precision).
+    return (max_rel_diff <= 1e-5f) ? 0 : 1;
+}
+
 // --self-test: build a tiny synthetic model with deterministic
 // weights and run one forward step. Validates the data flow without
 // needing the GGUF file present. CLI-only - library callers don't
@@ -3124,6 +3238,8 @@ int main(int argc, char ** argv) {
     for (int32_t i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--self-test") == 0) {
             mode = 1;
+        } else if (strcmp(argv[i], "--chunked-test") == 0) {
+            mode = 5;
         } else if (strcmp(argv[i], "--single") == 0) {
             mode = 2;
             if (i + 1 < argc) { prompt = argv[++i]; }
@@ -3171,6 +3287,8 @@ int main(int argc, char ** argv) {
     int rc = 0;
     if (mode == 1) {
         rc = llm_self_test();
+    } else if (mode == 5) {
+        rc = chunked_self_test();
     } else if (mode == 2) {
         rc = run_single(prompt, max_new, &sp, seed);
     } else if (mode == 3) {
