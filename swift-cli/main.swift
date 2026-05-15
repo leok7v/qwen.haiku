@@ -4,7 +4,7 @@
 // code path the iOS/macOS app uses. Built from `swift-cli/Makefile`
 // with a single swiftc invocation that:
 //
-//   1. Compiles llm/llm.c (which #include-s tensor.c + neon.c +
+//   1. Compiles llm/slm.c (which #include-s tensor.c + neon.c +
 //      chunked.c) as a single C TU without LLM_CLI, producing the
 //      library-half of the bridge.
 //   2. Imports app/bridge.h so every slm_* symbol is visible in Swift.
@@ -32,7 +32,7 @@ let modelPath: URL = {
     return URL(fileURLWithPath: env)
 }()
 
-// im.ai conversational preset (mirrors slm_sampler_defaults() in llm.c).
+// im.ai conversational preset (mirrors slm_sampler_defaults() in slm.c).
 // Kept in sync by hand for now; if these ever drift, --chat-test
 // hashes will diverge between this binary and the C binary.
 let imAi = SLM.Sampler(temperature:       0.7,
@@ -73,7 +73,7 @@ func runSingle(prompt: String) -> Int32 {
     return rc
 }
 
-// Same three turns as run_chat_test in llm.c. Hashes are FNV-1a 64
+// Same three turns as run_chat_test in slm.c. Hashes are FNV-1a 64
 // over the visible (post-filter) UTF-8 stream of each turn. If the
 // Swift filter matches the C output byte-for-byte, hashes equal
 // the C side's at the same seed+preset.

@@ -1,13 +1,13 @@
 # swift-cli Makefile - builds a headless Swift CLI binary that
 # exercises the same Qwen.swift / Chat.swift code path the iOS/macOS
-# Xcode app uses. Single swiftc invocation: the C side (llm/llm.c +
+# Xcode app uses. Single swiftc invocation: the C side (llm/slm.c +
 # its #include-d translation-unit-mates tensor.c, neon.c, chunked.c)
 # is compiled inline via -import-objc-header (Swift's bridging header
 # mechanism). Output: <repo>/Build/cli/qwen-swift-cli.
 
 SWIFTC   = swiftc
 ROOT     = ..
-LLM      = $(ROOT)/llm/llm.c
+LLM      = $(ROOT)/llm/slm.c
 SWIFT_SRCS = main.swift \
              $(ROOT)/app/SLM.swift \
              $(ROOT)/app/Chat.swift

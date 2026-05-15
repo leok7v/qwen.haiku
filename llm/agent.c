@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // agent.c - tool-calling agent loop. Single-file lib `#include`-d
-// from llm.c under `#ifdef LLM_WITH_TOOLS` (same gate as tools.c —
+// from slm.c under `#ifdef LLM_WITH_TOOLS` (same gate as tools.c —
 // the agent loop is only useful if the tool primitives are linked).
 //
 // The pieces this glues together:

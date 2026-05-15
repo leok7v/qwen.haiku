@@ -6,7 +6,7 @@
 # clean - nothing appears or disappears next to the C files. `make
 # clean` removes only Build/cli/.
 #
-# Building defines LLM_CLI so llm.c emits main() and the CLI
+# Building defines LLM_CLI so slm.c emits main() and the CLI
 # helpers. The Xcode build leaves LLM_CLI undefined and treats this
 # directory as the library half of the bridge.
 
@@ -30,16 +30,16 @@ BIN   := $(BUILD)/llm
 
 all: $(BIN)
 
-# Single TU rooted at llm.c, but every `#include`-d single-file
+# Single TU rooted at slm.c, but every `#include`-d single-file
 # library needs to be a prerequisite or edits won't trigger a
-# rebuild (made/llm.c-only deps gave a stale binary against the
+# rebuild (made/slm.c-only deps gave a stale binary against the
 # new qwen.c path on 2026-05-15).
-$(BIN): llm.c llm.h qwen.c gguf.c tokenizer.c sampler.c jinja.c \
+$(BIN): slm.c slm.h qwen.c gguf.c tokenizer.c sampler.c jinja.c \
         tensor.c neon.c chunked.c \
         tools.c agent.c \
         utils/arrays.c utils/chars.c utils/maps.c \
         | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ llm.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ slm.c $(LDFLAGS)
 
 $(BUILD):
 	mkdir -p $@

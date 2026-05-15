@@ -1,6 +1,6 @@
 // sampler.c -- llama.cpp-shaped sampler chain.
 //
-// `#include`-d from llm.c AFTER qwen.c (depends on `struct rng` +
+// `#include`-d from slm.c AFTER qwen.c (depends on `struct rng` +
 // `rng_uniform` + `sample_argmax`, all defined in qwen.c). Holds
 // the `slm_sampler_defaults()` factory plus the sample_with chain:
 //

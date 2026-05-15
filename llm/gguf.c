@@ -3,7 +3,7 @@
 // lookups; broken out into its own single-file lib so other model
 // loaders can share it without dragging in the Qwen-specific layers.
 //
-// `#include`-d once from llm.c (or from any other TU root). Depends
+// `#include`-d once from slm.c (or from any other TU root). Depends
 // on POSIX (open/mmap/fstat) and on utils/chars.c being available
 // (only for the `oom()` wrapper). No allocation outside `kvs` /
 // `tensors` arrays; tensor and KV bodies live inside the mmap, the

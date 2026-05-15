@@ -8,7 +8,7 @@
 // still the only architecture wired up.)
 //
 // Calls slm_* C functions directly through the Xcode bridging header
-// (app/bridge.h -> llm/llm.h), so it works on iOS as well as macOS,
+// (app/bridge.h -> llm/slm.h), so it works on iOS as well as macOS,
 // no spawned binary, no IPC.
 //
 // Lifecycle parallels the C side: instantiate once with a path to a
@@ -117,7 +117,7 @@ public final class SLM: @unchecked Sendable {
     // history; flip debug freely.
     public var ctrl:      Ctrl { didSet { syncCtrl() } }
 
-    // `struct slm_model;` and `struct slm_ctx;` in llm.h are forward-
+    // `struct slm_model;` and `struct slm_ctx;` in slm.h are forward-
     // declared (opaque), so the Clang importer maps the pointers to
     // OpaquePointer here. No wrapping, no UnsafeMutablePointer needed.
     // The model is loaded once; the ctx is replaced on
@@ -315,7 +315,7 @@ private func slmChunkTrampoline(
                        .takeUnretainedValue()
         let c = chunk.pointee
         var keepGoing = true
-        // Exactly one signal is set per emission per llm.h contract.
+        // Exactly one signal is set per emission per slm.h contract.
         // The `prefilled` bool is checked first because the four
         // string fields are NULL on that emission.
         if c.prefilled {

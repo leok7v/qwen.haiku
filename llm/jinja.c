@@ -77,7 +77,7 @@
 //     Jinja's `args_value | tojson | safe` filter is similarly the
 //     caller's job.
 //
-// Distribution: this file is `#include`-d from llm.c (single-file
+// Distribution: this file is `#include`-d from slm.c (single-file
 // lib idiom, matching neon.c / chunked.c). Listed in
 // QwenHaiku.xcodeproj's membershipExceptions so Xcode does not
 // compile it as an independent TU. Functions are static; each

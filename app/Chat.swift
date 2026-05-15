@@ -123,7 +123,7 @@ public enum ChatTemplate {
     /// is rendered inline with the user message (no
     /// `<|im_start|>system` block) matching im.ai's framing.
     ///
-    /// Delegates to the C side (`slm_chat_format_delta` in llm.c,
+    /// Delegates to the C side (`slm_chat_format_delta` in slm.c,
     /// implemented in llm/jinja-template.c). One source of truth for
     /// the framing — when llama.cpp's upstream chat template changes
     /// (and the GGUF's tokenizer.chat_template KV changes), update

@@ -1,4 +1,4 @@
-// llm.c -- single-file CPU runner for Qwen3.5-0.8B-Q4_K_M.gguf.
+// slm.c -- single-file CPU runner for Qwen3.5-0.8B-Q4_K_M.gguf.
 //
 // Reads the upstream Q4_K_M GGUF directly (no offline converter
 // step) and runs forward passes against tensor.c kernels.
@@ -36,7 +36,7 @@
 // lives in qwen.c, `#include`d below.
 
 #include "tensor.c"
-#include "llm.h"
+#include "slm.h"
 
 #ifdef LLM_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>
@@ -268,7 +268,7 @@ char * slm_chat_format(const struct slm_chat_message * messages,
 // UTF-8 piece — possibly a partial Unicode codepoint for byte-level
 // BPE; concatenating successive pieces always yields valid UTF-8.
 // Return non-zero to abort generation. Used by slm_generate_raw
-// internally; public callers go through `slm_stream_cb` in llm.h.
+// internally; public callers go through `slm_stream_cb` in slm.h.
 typedef int (*slm_token_cb)(const char * utf8, void * user);
 
 static int slm_generate_raw(struct slm_ctx * c,
@@ -417,7 +417,7 @@ static int slm_generate_raw(struct slm_ctx * c,
 // Adding a new model is a marker-table edit (see THINK_MARKERS
 // below). The state machine is otherwise marker-agnostic.
 //
-// Public surface (llm.h) is just `slm_generate_split`. The filter
+// Public surface (slm.h) is just `slm_generate_split`. The filter
 // struct + push/finish helpers are file-static here: clients should
 // not need the streaming pieces directly because slm_generate_split
 // already drives one filter end-to-end per generate call.

@@ -8,7 +8,7 @@
 // Conventions:
 //   * arena-allocated tensors, 64-byte aligned data
 //   * eager evaluation, no graph builder
-//   * single-file include from llm.c via `#include "tensor.c"`
+//   * single-file include from slm.c via `#include "tensor.c"`
 //   * single-entry/single-exit functions, no break/continue
 //
 // Activations are fp32 in this first cut. The fp16-storage decision
@@ -411,7 +411,7 @@ struct tensor * tensor_rope_mrope_i(struct tensor * x,
 }
 
 // Legacy single-axis RoPE kept for callers that don't need mrope
-// (none in the current llm.c, but useful for synthetic-test models).
+// (none in the current slm.c, but useful for synthetic-test models).
 struct tensor * tensor_rope(struct tensor * x,
                             int64_t         pos_offset,
                             float           base,
@@ -767,7 +767,7 @@ typedef struct {
 // NEON int8 dot kernels (and ggml-ported elementwise helpers like
 // silu/exp) live in neon.c, included here as a single-file library
 // so all block typedefs above are in scope. neon.c is the ONLY place
-// in this codebase that includes <arm_neon.h>; tensor.c and llm.c
+// in this codebase that includes <arm_neon.h>; tensor.c and slm.c
 // stay scalar / portable. To add another SIMD variant (avx2.c
 // later), add a sibling file and switch the include with #if.
 #include "neon.c"

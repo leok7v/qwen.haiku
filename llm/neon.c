@@ -3,7 +3,7 @@
 // neon.c - single-file NEON kernel pack, included by tensor.c.
 //
 // This file is the ONLY place that includes <arm_neon.h> and emits
-// NEON intrinsics. tensor.c and llm.c stay scalar / portable. Layout
+// NEON intrinsics. tensor.c and slm.c stay scalar / portable. Layout
 // is intentional: future avx2.c slots in as a sibling with the same
 // function names and the dispatch macro selects via #if at the call
 // site (see tensor.c "DOT_*" dispatch).

@@ -20,7 +20,7 @@
 //       the meaningful text content of a page. Composes with fetch
 //       for "fetch this URL and tell me what it says" agent flows.
 //
-// Single-file lib. `#include "tools.c"` from llm.c under
+// Single-file lib. `#include "tools.c"` from slm.c under
 // `#ifdef LLM_WITH_TOOLS` so the libcurl dependency stays optional
 // (the core inference path has zero net deps; tools.c is the only
 // thing in this repo that links libcurl). Listed under

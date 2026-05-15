@@ -11,7 +11,7 @@ static const char * SLM_GGUF_PATH_DEFAULT =
 #endif
 
 // struct arr / chars and their arr_grow / chars_* helpers live in
-// `utils/arrays.c` + `utils/chars.c`, which llm.c #include's BEFORE
+// `utils/arrays.c` + `utils/chars.c`, which slm.c #include's BEFORE
 // this file. Reuse them. The `oom(p)` wrapper there matches the
 // slm_oom semantics qwen used to define inline (warn on stderr,
 // abort on NULL).

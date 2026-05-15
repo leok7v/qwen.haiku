@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// llm.h - public C API for the Qwen3.5-0.8B Q4_K_M GGUF runner.
+// slm.h - public C API for the Qwen3.5-0.8B Q4_K_M GGUF runner.
 //
-// This header is the boundary between the C implementation (llm.c +
+// This header is the boundary between the C implementation (slm.c +
 // tensor.c, ~3200 LOC) and any caller: Swift via the Xcode bridging
 // header (app/bridge.h), Objective-C, Python ctypes, another C
-// program, etc. Everything in llm.c that isn't declared here is
+// program, etc. Everything in slm.c that isn't declared here is
 // internal.
 //
 // Lifecycle (two-level, 2026-05-15):
@@ -55,7 +55,7 @@ struct slm_ctrl;     // defined below — passed by-pointer to
                      // slm_ctx_create.
 
 // (`slm_token_cb`, the raw per-token callback, used to live here
-// but was internal-only. It now lives as a private typedef in llm.c
+// but was internal-only. It now lives as a private typedef in slm.c
 // — every public caller goes through `slm_stream_cb` below.)
 
 // ---------------------------------------------------------------------------

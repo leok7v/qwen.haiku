@@ -74,7 +74,7 @@
 //   v_attn[i, e]     = sum_j attn_kq[i, j] * v_new[j, e]
 //
 // Cross-validated against an autoregressive scalar reference
-// (autoregressive_ref in llm.c) at N=8: sub-1e-5 relative diff.
+// (autoregressive_ref in slm.c) at N=8: sub-1e-5 relative diff.
 //
 // Numerical reference: ggml's compute kernel - the SOLVE_TRI step is
 // a pure forward-substitution on a lower-triangular system, fp32. We
