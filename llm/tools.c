@@ -311,31 +311,35 @@ static void tools_collapse_ws(const struct ts_buf * in,
     }
 }
 
-// A small pool of believable UAs. DDG (and most scrapeable engines)
-// look at UA + Accept-Language to fingerprint, so rotating the UA
-// across requests reduces the rate at which we trip CAPTCHAs. Picked
-// from current Chrome / Safari / Firefox release-channel strings.
-static const char * const TOOLS_UA_POOL[] = {
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
-        " AppleWebKit/537.36 (KHTML, like Gecko)"
-        " Chrome/147.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
-        " AppleWebKit/605.1.15 (KHTML, like Gecko)"
-        " Version/17.6 Safari/605.1.15",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.6; rv:128.0)"
-        " Gecko/20100101 Firefox/128.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        " AppleWebKit/537.36 (KHTML, like Gecko)"
-        " Chrome/147.0.0.0 Safari/537.36",
+// Two Chrome-shaped UA variants the rotation picks between. Kept
+// Chrome-only so the matching Sec-CH-UA / Sec-CH-UA-Platform Client
+// Hints (which only Chromium emits) can be sent unconditionally
+// without fingerprint inconsistency. The two slots differ only in
+// platform (macOS, Windows) — version stays at 148 (matches the
+// example real-request headers Leo captured from his browser).
+struct tools_ua_slot {
+    const char * ua;
+    const char * sec_ch_ua_platform;  // value for Sec-CH-UA-Platform
 };
 
-static const char * tools_pick_ua(void) {
+static const struct tools_ua_slot TOOLS_UA_POOL[] = {
+    { "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+      " AppleWebKit/537.36 (KHTML, like Gecko)"
+      " Chrome/148.0.0.0 Safari/537.36",
+      "\"macOS\"" },
+    { "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+      " AppleWebKit/537.36 (KHTML, like Gecko)"
+      " Chrome/148.0.0.0 Safari/537.36",
+      "\"Windows\"" },
+};
+
+static const struct tools_ua_slot * tools_pick_ua(void) {
     static unsigned int counter = 0;
-    unsigned int n =
-        (unsigned int)(sizeof(TOOLS_UA_POOL) / sizeof(TOOLS_UA_POOL[0]));
-    const char * ua = TOOLS_UA_POOL[counter % n];
+    unsigned int n = (unsigned int)
+        (sizeof(TOOLS_UA_POOL) / sizeof(TOOLS_UA_POOL[0]));
+    const struct tools_ua_slot * slot = &TOOLS_UA_POOL[counter % n];
     counter++;
-    return ua;
+    return slot;
 }
 
 // HTTP GET, body lands in `body`. Sets `*status` to the HTTP code.
@@ -353,25 +357,40 @@ static int tools_http_get(const char * url, long timeout_ms,
     CURL * h = curl_easy_init();
     if (h != NULL) {
         struct curl_slist * hdrs = NULL;
-        const char * ua = tools_pick_ua();
+        const struct tools_ua_slot * slot = tools_pick_ua();
         char ua_header[512];
-        snprintf(ua_header, sizeof(ua_header), "User-Agent: %s", ua);
+        snprintf(ua_header, sizeof(ua_header),
+                 "User-Agent: %s", slot->ua);
         hdrs = curl_slist_append(hdrs, ua_header);
+        // Match real Chrome 148 request header set Leo captured.
+        // Order roughly matches Chrome's emission order, which DDG's
+        // bot-detection has been known to score on.
         hdrs = curl_slist_append(hdrs,
             "Accept: text/html,application/xhtml+xml,application/xml;"
             "q=0.9,image/avif,image/webp,*/*;q=0.8");
         hdrs = curl_slist_append(hdrs,
             "Accept-Language: en-US,en;q=0.9");
-        // Browser-navigation hints (Chromium emits these on top-level
-        // navigations). Static set is fine for HTML scraping — DDG
-        // checks for presence, not for value variety.
+        hdrs = curl_slist_append(hdrs, "Cache-Control: no-cache");
+        hdrs = curl_slist_append(hdrs, "Pragma: no-cache");
+        hdrs = curl_slist_append(hdrs, "Priority: u=0, i");
+        hdrs = curl_slist_append(hdrs, "DNT: 1");
+        // Chromium User-Agent Client Hints — Chrome 148 emits these
+        // on any HTTPS top-level navigation; their absence is itself
+        // a fingerprint signal for "this is not a real browser."
+        hdrs = curl_slist_append(hdrs,
+            "Sec-CH-UA: \"Chromium\";v=\"148\","
+            " \"Google Chrome\";v=\"148\","
+            " \"Not/A)Brand\";v=\"99\"");
+        hdrs = curl_slist_append(hdrs, "Sec-CH-UA-Mobile: ?0");
+        char ch_platform[64];
+        snprintf(ch_platform, sizeof(ch_platform),
+                 "Sec-CH-UA-Platform: %s", slot->sec_ch_ua_platform);
+        hdrs = curl_slist_append(hdrs, ch_platform);
         hdrs = curl_slist_append(hdrs, "Sec-Fetch-Dest: document");
         hdrs = curl_slist_append(hdrs, "Sec-Fetch-Mode: navigate");
         hdrs = curl_slist_append(hdrs, "Sec-Fetch-Site: cross-site");
         hdrs = curl_slist_append(hdrs, "Sec-Fetch-User: ?1");
         hdrs = curl_slist_append(hdrs, "Upgrade-Insecure-Requests: 1");
-        hdrs = curl_slist_append(hdrs, "Cache-Control: max-age=0");
-        hdrs = curl_slist_append(hdrs, "DNT: 1");
         char errbuf[CURL_ERROR_SIZE];
         errbuf[0] = '\0';
         curl_easy_setopt(h, CURLOPT_URL, url);
@@ -391,7 +410,7 @@ static int tools_http_get(const char * url, long timeout_ms,
         // declared algorithms must match what libcurl can decode —
         // libcurl on macOS may or may not have brotli linked.
         curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
-        curl_easy_setopt(h, CURLOPT_USERAGENT, ua);
+        curl_easy_setopt(h, CURLOPT_USERAGENT, slot->ua);
         CURLcode cc = curl_easy_perform(h);
         if (cc == CURLE_OK) {
             rc = 0;
