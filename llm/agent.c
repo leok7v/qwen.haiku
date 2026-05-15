@@ -630,7 +630,7 @@ static char * agent_run(struct slm_ctx * ctx,
             iter = max_iters;   // force loop exit (no progress possible)
         } else {
             int32_t n_ids =
-                tokenizer_encode(&ctx->tok, prompt, ids, 16384);
+                tokenizer_encode(&ctx->model->tok, prompt, ids, 16384);
             // Always reset before each iteration so the cumulative
             // history is re-fed (KV cache rebuilds). Simple and
             // robust; persistent-KV delta mode is a future

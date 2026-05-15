@@ -154,7 +154,8 @@ final class SLMViewModel {
                 userMessage: trimmedUser,
                 systemPrefix: isFirstTurn ? trimmedSys : nil,
                 reasoning: self.think,
-                tools: self.tools)
+                tools: self.tools,
+                effort: "medium")
             self.state         = .generating
             self.stopRequested = false
             self.prefilling    = true
@@ -285,7 +286,7 @@ final class SLMViewModel {
 
     func clearChat() {
         self.messages.removeAll()
-        self.slm?.reset()
+        self.slm?.newConversation(systemPrompt: self.systemPrompt)
     }
 
 }

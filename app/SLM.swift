@@ -117,32 +117,48 @@ public final class SLM: @unchecked Sendable {
     // history; flip debug freely.
     public var ctrl:      Ctrl { didSet { syncCtrl() } }
 
-    // `struct slm_ctx;` in llm.h is forward-declared (opaque), so the
-    // Clang importer maps `struct slm_ctx *` to OpaquePointer here.
-    // No wrapping, no UnsafeMutablePointer<...> needed.
-    private let ctx: OpaquePointer
+    // `struct slm_model;` and `struct slm_ctx;` in llm.h are forward-
+    // declared (opaque), so the Clang importer maps the pointers to
+    // OpaquePointer here. No wrapping, no UnsafeMutablePointer needed.
+    // The model is loaded once; the ctx is replaced on
+    // `newConversation()` (the new-API replacement for the old reset).
+    private let model: OpaquePointer
+    private var ctx:   OpaquePointer
+    private var systemPromptCopy: String?  // remembered for new ctxs
 
-    /// Load the model at `modelPath`. Throws SLMError.loadFailed if
-    /// the GGUF can't be parsed.
-    public init(modelPath: URL,
-                sampler:   Sampler = Sampler(),
-                ctrl:      Ctrl    = Ctrl()) throws {
-        guard let raw = slm_create(modelPath.path) else {
-            throw SLMError.loadFailed("slm_create returned NULL")
+    /// Load the model at `modelPath` and open a first ctx. Throws
+    /// SLMError.loadFailed if the GGUF can't be parsed.
+    public init(modelPath:     URL,
+                systemPrompt:  String? = nil,
+                sampler:       Sampler = Sampler(),
+                ctrl:          Ctrl    = Ctrl()) throws {
+        guard let m = slm_model_load(modelPath.path) else {
+            throw SLMError.loadFailed("slm_model_load returned NULL")
         }
-        if slm_loaded(raw) == 0 {
-            let msg = String(cString: slm_get_error(raw))
-            slm_destroy(raw)
+        if !slm_model_loaded(m) {
+            let msg = String(cString: slm_model_error(m))
+            slm_model_unload(m)
             throw SLMError.loadFailed(msg)
         }
-        self.ctx       = raw
-        self.modelPath = modelPath
-        self.sampler   = sampler
-        self.ctrl      = ctrl
-        syncCtrl()
+        let initialCtx = SLM.makeCtx(model:        m,
+                                     systemPrompt: systemPrompt,
+                                     ctrl:         ctrl)
+        guard let c = initialCtx else {
+            slm_model_unload(m)
+            throw SLMError.loadFailed("slm_ctx_create returned NULL")
+        }
+        self.model            = m
+        self.ctx              = c
+        self.modelPath        = modelPath
+        self.sampler          = sampler
+        self.ctrl             = ctrl
+        self.systemPromptCopy = systemPrompt
     }
 
-    deinit { slm_destroy(ctx) }
+    deinit {
+        slm_ctx_destroy(ctx)
+        slm_model_unload(model)
+    }
 
     /// Push the current Swift-side ctrl values down to the C ctx so
     /// the next slm_generate sees them. Called automatically from
@@ -158,12 +174,45 @@ public final class SLM: @unchecked Sendable {
         }
     }
 
-    /// Clear the persistent KV / SSM state. Call when starting a new
-    /// conversation in the chat surface; subsequent `generate(...)`
-    /// calls within the same conversation should NOT reset because
-    /// the C runner keeps the conversation's KV cache populated
-    /// across calls (task #36 - persistent KV chat).
-    public func reset() { slm_reset(ctx) }
+    /// Start a fresh conversation: destroy the current ctx and open
+    /// a new one against the same model. Replaces the old `reset()`
+    /// — but explicit about WHAT it clears (everything stored on the
+    /// ctx; the model and the loaded weights survive). `systemPrompt
+    /// = nil` reuses whatever system prompt was passed at init time.
+    public func newConversation(systemPrompt: String? = nil) {
+        slm_ctx_destroy(ctx)
+        let nextSys = systemPrompt ?? systemPromptCopy
+        guard let c = SLM.makeCtx(model:        model,
+                                  systemPrompt: nextSys,
+                                  ctrl:         ctrl) else {
+            // ctx_create only fails on unloaded model; the model was
+            // already validated at init time, so this branch is
+            // unreachable. Trap to surface the bug if it ever fires.
+            fatalError("slm_ctx_create returned NULL on loaded model")
+        }
+        ctx               = c
+        systemPromptCopy  = nextSys
+        syncCtrl()
+    }
+
+    /// Build a fresh ctx; helper for init + newConversation so the
+    /// ctrl-bridge dance lives in one place.
+    private static func makeCtx(model:        OpaquePointer,
+                                systemPrompt: String?,
+                                ctrl:         Ctrl) -> OpaquePointer? {
+        ctrl.effort.withCString { effortPtr -> OpaquePointer? in
+            var c = slm_ctrl(tools:  ctrl.tools,
+                             think:  ctrl.think,
+                             effort: effortPtr,
+                             debug:  ctrl.debug)
+            if let sys = systemPrompt {
+                return sys.withCString { sysPtr in
+                    slm_ctx_create(model, sysPtr, &c)
+                }
+            }
+            return slm_ctx_create(model, nil, &c)
+        }
+    }
 
     /// Blocking: generate a full completion for `prompt` and return
     /// it as a single string.

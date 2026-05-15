@@ -77,29 +77,29 @@
 // Public-ish API used by Swift bridge AND by main()
 // ---------------------------------------------------------------------------
 
-struct slm_ctx * slm_create(const char * path) {
-    struct slm_ctx * c =
-        (struct slm_ctx *)oom(calloc(1, sizeof(struct slm_ctx)));
-    if (gguf_open(&c->gguf, path) != 0) {
-        snprintf(c->err, sizeof(c->err), "gguf open failed");
-        return c;
+struct slm_model * slm_model_load(const char * path) {
+    struct slm_model * m =
+        (struct slm_model *)oom(calloc(1, sizeof(struct slm_model)));
+    if (gguf_open(&m->gguf, path) != 0) {
+        snprintf(m->err, sizeof(m->err), "gguf open failed");
+        return m;
     }
-    if (slm_load_config(&c->gguf, &c->cfg) != 0) {
-        snprintf(c->err, sizeof(c->err), "config load failed");
-        return c;
+    if (slm_load_config(&m->gguf, &m->cfg) != 0) {
+        snprintf(m->err, sizeof(m->err), "config load failed");
+        return m;
     }
-    if (slm_load_weights(&c->gguf, &c->cfg, &c->W) != 0) {
-        snprintf(c->err, sizeof(c->err), "weights resolve failed");
-        return c;
+    if (slm_load_weights(&m->gguf, &m->cfg, &m->W) != 0) {
+        snprintf(m->err, sizeof(m->err), "weights resolve failed");
+        return m;
     }
-    if (tokenizer_load(&c->tok, &c->gguf, &c->cfg) != 0) {
-        snprintf(c->err, sizeof(c->err), "tokenizer load failed");
-        return c;
+    if (tokenizer_load(&m->tok, &m->gguf, &m->cfg) != 0) {
+        snprintf(m->err, sizeof(m->err), "tokenizer load failed");
+        return m;
     }
     // Chat-turn stop token: look up `<|im_end|>` in the vocab now
     // that the tokenizer's string->id map is built. Stays -1 when the
     // model isn't a chat-tuned vocab.
-    c->cfg.eot_id = s2i_get(&c->tok.vocab_to_id,
+    m->cfg.eot_id = s2i_get(&m->tok.vocab_to_id,
                             "<|im_end|>", 10, -1);
     // Full end-of-generation set: mirrors what llama.cpp prints on
     // load as "EOG tokens" for qwen35. Generation stops on any of
@@ -112,38 +112,90 @@ struct slm_ctx * slm_create(const char * path) {
         "<|file_sep|>",
         NULL,
     };
-    c->cfg.n_stop_ids = 0;
+    m->cfg.n_stop_ids = 0;
     for (int32_t i = 0; stop_strs[i] != NULL; i++) {
-        int32_t id = s2i_get(&c->tok.vocab_to_id,
+        int32_t id = s2i_get(&m->tok.vocab_to_id,
                              stop_strs[i],
                              (int32_t)strlen(stop_strs[i]), -1);
-        if (id >= 0 && c->cfg.n_stop_ids <
-            (int32_t)(sizeof(c->cfg.stop_ids) / sizeof(c->cfg.stop_ids[0]))) {
-            c->cfg.stop_ids[c->cfg.n_stop_ids++] = id;
+        if (id >= 0 && m->cfg.n_stop_ids <
+            (int32_t)(sizeof(m->cfg.stop_ids) / sizeof(m->cfg.stop_ids[0]))) {
+            m->cfg.stop_ids[m->cfg.n_stop_ids++] = id;
         }
     }
-    kv_init(&c->kv, c->cfg.n_layers, c->cfg.n_kv_heads,
-            c->cfg.head_dim, c->cfg.max_position);
-    ssm_cache_init(&c->ssm, &c->cfg);
-    c->arena = arena_new(64 * 1024 * 1024);
     // Stash the Jinja chat template from `tokenizer.chat_template`
     // as a null-terminated copy. Optional KV - base completion
     // models won't have one; instruct/chat models do.
-    const struct gguf_kv * ct = gguf_find_kv(&c->gguf,
+    const struct gguf_kv * ct = gguf_find_kv(&m->gguf,
                                              "tokenizer.chat_template");
     if (ct != NULL && ct->v.type == GGUF_VT_STR) {
         size_t cc = 0;
         uint64_t n = gr_u64(ct->v.raw, &cc);
-        c->chat_template = (char *)malloc(n + 1);
-        if (c->chat_template != NULL) {
-            memcpy(c->chat_template, ct->v.raw + cc, n);
-            c->chat_template[n] = '\0';
+        m->chat_template = (char *)malloc(n + 1);
+        if (m->chat_template != NULL) {
+            memcpy(m->chat_template, ct->v.raw + cc, n);
+            m->chat_template[n] = '\0';
         }
     }
-    c->loaded = 1;
-    c->dump_layer = g_dump_layer;
-    c->ctrl = slm_ctrl_defaults();
+    m->loaded = 1;
+    return m;
+}
+
+void slm_model_unload(struct slm_model * m) {
+    if (m != NULL) {
+        tokenizer_free(&m->tok);
+        slm_free_weights(&m->W);
+        if (m->chat_template) { free(m->chat_template); }
+        gguf_close(&m->gguf);
+        free(m);
+    }
+}
+
+bool slm_model_loaded(const struct slm_model * m) {
+    return m != NULL && m->loaded != 0;
+}
+
+const char * slm_model_error(const struct slm_model * m) {
+    return m == NULL ? "no model" : m->err;
+}
+
+struct slm_ctx * slm_ctx_create(struct slm_model * m,
+                                 const char * system_prompt,
+                                 const struct slm_ctrl * ctrl) {
+    struct slm_ctx * c = NULL;
+    if (m != NULL && m->loaded) {
+        c = (struct slm_ctx *)oom(calloc(1, sizeof(struct slm_ctx)));
+        c->model = m;
+        c->ctrl  = (ctrl != NULL) ? *ctrl : slm_ctrl_defaults();
+        kv_init(&c->kv, m->cfg.n_layers, m->cfg.n_kv_heads,
+                m->cfg.head_dim, m->cfg.max_position);
+        ssm_cache_init(&c->ssm, &m->cfg);
+        c->arena      = arena_new(64 * 1024 * 1024);
+        c->dump_layer = g_dump_layer;
+        c->pos        = 0;
+        if (system_prompt != NULL && system_prompt[0] != '\0') {
+            // Record the system prompt as the conversation's
+            // identity. We don't auto-prefill it (yet) — the
+            // caller continues to thread it through
+            // slm_chat_format_delta on turn 1 — but holding a
+            // copy here lets future ctx_create wiring shift the
+            // first-turn framing into the C side without changing
+            // the API again.
+            size_t n = strlen(system_prompt);
+            c->system_prompt = (char *)oom(malloc(n + 1));
+            memcpy(c->system_prompt, system_prompt, n + 1);
+        }
+    }
     return c;
+}
+
+void slm_ctx_destroy(struct slm_ctx * c) {
+    if (c != NULL) {
+        ssm_cache_free(&c->ssm);
+        kv_free(&c->kv);
+        if (c->arena)         { arena_free(c->arena); c->arena = NULL; }
+        if (c->system_prompt) { free(c->system_prompt); }
+        free(c);
+    }
 }
 
 void slm_set_ctrl(struct slm_ctx * c, const struct slm_ctrl * ctrl) {
@@ -154,36 +206,21 @@ struct slm_ctrl slm_get_ctrl(const struct slm_ctx * c) {
     return c != NULL ? c->ctrl : slm_ctrl_defaults();
 }
 
-void slm_destroy(struct slm_ctx * c) {
+// slm_reset: file-internal, NOT exported. Drops the per-ctx pos +
+// SSM ring back to a fresh-conversation state WITHOUT reallocating
+// the KV cache or losing the model pointer. Used by agent.c's
+// iteration loop and the CLI chat-test (which verifies reset
+// reproducibility). The public way to start a new conversation is
+// slm_ctx_destroy + slm_ctx_create.
+static void slm_reset(struct slm_ctx * c) {
     if (c != NULL) {
-        ssm_cache_free(&c->ssm);
-        kv_free(&c->kv);
-        tokenizer_free(&c->tok);
-        slm_free_weights(&c->W);
-        if (c->chat_template) { free(c->chat_template); }
-        if (c->arena)         { arena_free(c->arena); c->arena = NULL; }
-        gguf_close(&c->gguf);
-        free(c);
-    }
-}
-
-void slm_reset(struct slm_ctx * c) {
-    if (c != NULL) {
-        ssm_cache_reset(&c->ssm, &c->cfg);
+        ssm_cache_reset(&c->ssm, &c->model->cfg);
         c->pos = 0;
     }
 }
 
-const char * slm_get_error(const struct slm_ctx * c) {
-    return c == NULL ? "no ctx" : c->err;
-}
-
-int slm_loaded(const struct slm_ctx * c) {
-    return (c != NULL && c->loaded) ? 1 : 0;
-}
-
 const char * slm_chat_template(const struct slm_ctx * c) {
-    return (c == NULL) ? NULL : c->chat_template;
+    return (c == NULL) ? NULL : c->model->chat_template;
 }
 
 // Thin wrappers exposing jinja-template.c's chat-formatting through
@@ -300,9 +337,9 @@ static int slm_generate_raw(struct slm_ctx * c,
     double t1 = slm_monotonic_seconds();
     c->t_prefill_s = t1 - t0;
     c->n_prefill   = prompt_n;
-    int32_t last = prompt_n > 0 ? prompt_ids[prompt_n - 1] : c->cfg.bos_id;
+    int32_t last = prompt_n > 0 ? prompt_ids[prompt_n - 1] : c->model->cfg.bos_id;
     // Decode loop.
-    while (!stop && generated < max_new && pos < c->cfg.max_position) {
+    while (!stop && generated < max_new && pos < c->model->cfg.max_position) {
         struct tensor * logits = slm_forward_step(c, last, pos);
         // While below min_new, force the model to keep producing
         // content by zeroing out the eos / eot logits (effectively
@@ -312,37 +349,37 @@ static int slm_generate_raw(struct slm_ctx * c,
         float saved_eot = 0.0f;
         bool  mask      = (generated < min_new);
         if (mask) {
-            if (c->cfg.eos_id >= 0 && c->cfg.eos_id < (int32_t)tensor_nelements(logits)) {
-                saved_eos = logits->data[c->cfg.eos_id];
-                logits->data[c->cfg.eos_id] = -INFINITY;
+            if (c->model->cfg.eos_id >= 0 && c->model->cfg.eos_id < (int32_t)tensor_nelements(logits)) {
+                saved_eos = logits->data[c->model->cfg.eos_id];
+                logits->data[c->model->cfg.eos_id] = -INFINITY;
             }
-            if (c->cfg.eot_id >= 0 && c->cfg.eot_id < (int32_t)tensor_nelements(logits)) {
-                saved_eot = logits->data[c->cfg.eot_id];
-                logits->data[c->cfg.eot_id] = -INFINITY;
+            if (c->model->cfg.eot_id >= 0 && c->model->cfg.eot_id < (int32_t)tensor_nelements(logits)) {
+                saved_eot = logits->data[c->model->cfg.eot_id];
+                logits->data[c->model->cfg.eot_id] = -INFINITY;
             }
         }
         int32_t next = sample_with(logits, &sp, &rng, history, hist_n);
         history[hist_n++] = next;
         if (mask) {
-            if (c->cfg.eos_id >= 0 && c->cfg.eos_id < (int32_t)tensor_nelements(logits)) {
-                logits->data[c->cfg.eos_id] = saved_eos;
+            if (c->model->cfg.eos_id >= 0 && c->model->cfg.eos_id < (int32_t)tensor_nelements(logits)) {
+                logits->data[c->model->cfg.eos_id] = saved_eos;
             }
-            if (c->cfg.eot_id >= 0 && c->cfg.eot_id < (int32_t)tensor_nelements(logits)) {
-                logits->data[c->cfg.eot_id] = saved_eot;
+            if (c->model->cfg.eot_id >= 0 && c->model->cfg.eot_id < (int32_t)tensor_nelements(logits)) {
+                logits->data[c->model->cfg.eot_id] = saved_eot;
             }
         }
         pos++;
         generated++;
         if (g_trace_tokens) { fprintf(stderr, "[tok] %d\n", (int)next); }
-        bool is_stop = (next == c->cfg.eos_id || next == c->cfg.eot_id);
-        for (int32_t si = 0; !is_stop && si < c->cfg.n_stop_ids; si++) {
-            if (next == c->cfg.stop_ids[si]) { is_stop = true; }
+        bool is_stop = (next == c->model->cfg.eos_id || next == c->model->cfg.eot_id);
+        for (int32_t si = 0; !is_stop && si < c->model->cfg.n_stop_ids; si++) {
+            if (next == c->model->cfg.stop_ids[si]) { is_stop = true; }
         }
         if (is_stop) {
             stop = true;
         } else {
             struct chars piece = {0};
-            tokenizer_decode_one(&c->tok, next, &piece);
+            tokenizer_decode_one(&c->model->tok, next, &piece);
             chars_put(&piece, "", 0);  // ensure null-term
             if (cb != NULL && piece.data != NULL) {
                 if (cb(piece.data, user) != 0) { stop = true; }
@@ -973,14 +1010,14 @@ int  slm_tokenize(struct slm_ctx * c, const char * text,
                                       // allocation that the caller
                                       // can free uniformly.
     int32_t * ids = (int32_t *)oom(calloc(cap, sizeof(int32_t)));
-    int n = tokenizer_encode(&c->tok, text, ids, (int)cap);
+    int n = tokenizer_encode(&c->model->tok, text, ids, (int)cap);
     *out_ids = ids;
     return n;
 }
 
-int  slm_vocab_size(const struct slm_ctx * c) { return c->cfg.vocab_size; }
-int  slm_eos_id    (const struct slm_ctx * c) { return c->cfg.eos_id; }
-int  slm_bos_id    (const struct slm_ctx * c) { return c->cfg.bos_id; }
+int  slm_vocab_size(const struct slm_ctx * c) { return c->model->cfg.vocab_size; }
+int  slm_eos_id    (const struct slm_ctx * c) { return c->model->cfg.eos_id; }
+int  slm_bos_id    (const struct slm_ctx * c) { return c->model->cfg.bos_id; }
 
 // ---------------------------------------------------------------------------
 // --chunked-test: run the chunked SSM kernel on a 1-real-token chunk
@@ -1221,16 +1258,36 @@ static int32_t chunked_self_test(void) {
 char * slm_chat_format_delta(const char * user_message,
                              const char * system_prefix,
                              int enable_thinking,
-                             int enable_tools) {
+                             int enable_tools,
+                             const char * effort) {
     char * result = NULL;
     if (user_message != NULL) {
         if (system_prefix != NULL && system_prefix[0] != '\0') {
             // First turn: full frame, with tool advertisements only
-            // when the caller asked for them.
+            // when the caller asked for them. Effort prefix prepended
+            // to the system content per the docstring:
+            //   "low"    → brevity hint
+            //   "high"   → think-step-by-step hint
+            //   "medium" / NULL → no prefix
+            const char * prefix = "";
+            if (effort != NULL) {
+                if (strcmp(effort, "low") == 0) {
+                    prefix = "(brief: 1-2 sentences)\n\n";
+                } else if (strcmp(effort, "high") == 0) {
+                    prefix = "(think carefully step-by-step before "
+                             "answering)\n\n";
+                }
+            }
+            struct chars system_block = {0};
+            chars_put(&system_block, prefix, strlen(prefix));
+            chars_put(&system_block, system_prefix, strlen(system_prefix));
+            chars_put(&system_block, "", 0);
             struct jinja_message msgs[2];
             memset(msgs, 0, sizeof(msgs));
             msgs[0].role    = JINJA_ROLE_SYSTEM;
-            msgs[0].content = system_prefix;
+            msgs[0].content = system_block.data != NULL
+                            ? system_block.data
+                            : system_prefix;
             msgs[1].role    = JINJA_ROLE_USER;
             msgs[1].content = user_message;
             struct jinja_tool tools[3] = {
@@ -1242,9 +1299,13 @@ char * slm_chat_format_delta(const char * user_message,
             result = jinja_apply(msgs, 2, tools, n_tools,
                                  /*add_gen=*/1,
                                  enable_thinking);
+            chars_free(&system_block);
         } else {
             // Subsequent turn: bare delta (KV holds whatever was
             // advertised on turn 1, including no tools at all).
+            // `effort` is ignored here — it lives in the system
+            // block which is committed to KV on turn 1.
+            (void)effort;
             result = jinja_apply_delta(user_message, NULL,
                                        enable_thinking);
         }
@@ -1387,7 +1448,7 @@ int slm_generate(struct slm_ctx * c,
             chars_put(&inject, "", 0);
             int32_t * ids = (int32_t *)oom(
                 calloc(16384, sizeof(int32_t)));
-            int n_ids = tokenizer_encode(&c->tok, inject.data,
+            int n_ids = tokenizer_encode(&c->model->tok, inject.data,
                                    ids, 16384);
             cur_ids = ids;
             cur_n   = n_ids;
@@ -1479,9 +1540,13 @@ static int32_t slm_self_test(void) {
     W.output_norm.shape[2] = 1; W.output_norm.shape[3] = 1;
     W.output = W.tok_embd;  // tied
     W.layers = layers;
+    // Synthetic model + ctx (no GGUF, no mmap — config and weights
+    // are entirely in-memory for this test).
+    struct slm_model m = {0};
+    m.cfg = cfg;
+    m.W   = W;
     struct slm_ctx c = {0};
-    c.cfg = cfg;
-    c.W = W;
+    c.model = &m;
     c.arena = a;
     kv_init(&c.kv, cfg.n_layers, cfg.n_kv_heads,
             cfg.head_dim, cfg.max_position);
@@ -1602,10 +1667,11 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
                         const char * system_prompt,
                         const struct slm_sampler * sp, uint64_t seed,
                         int32_t max_new) {
-    struct slm_ctx * c = slm_create(slm_cli_gguf_path());
+    struct slm_model * m = slm_model_load(slm_cli_gguf_path());
+    struct slm_ctx * c = slm_model_loaded(m) ? slm_ctx_create(m, NULL, NULL) : NULL;
     int32_t r = 0;
-    if (!c->loaded) {
-        fprintf(stderr, "llm: load failed: %s\n", slm_get_error(c));
+    if (!c->model->loaded) {
+        fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
         r = 1;
     } else {
         // Persistent KV: only the DELTA gets tokenized each turn.
@@ -1627,7 +1693,7 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
             }
             printf("[user] %s\n[assistant] ", prompts[t]);
             fflush(stdout);
-            int32_t nids = tokenizer_encode(&c->tok, delta_str, ids, 16384);
+            int32_t nids = tokenizer_encode(&c->model->tok, delta_str, ids, 16384);
             struct chars reply = {0};
             slm_generate(c, ids, nids, max_new, g_min_new, sp, seed,
                          capture_cb, &reply);
@@ -1655,7 +1721,8 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
         }
         free(ids);
     }
-    slm_destroy(c);
+    slm_ctx_destroy(c);
+    slm_model_unload(m);
     return r;
 }
 
@@ -1712,10 +1779,11 @@ static int32_t run_chat_test(int32_t max_new) {
     enum { N_TURNS = 3 };
     struct slm_sampler sp = slm_sampler_defaults();
     uint64_t seed = 42;
-    struct slm_ctx * c = slm_create(slm_cli_gguf_path());
+    struct slm_model * m = slm_model_load(slm_cli_gguf_path());
+    struct slm_ctx * c = slm_model_loaded(m) ? slm_ctx_create(m, NULL, NULL) : NULL;
     int32_t r = 0;
-    if (!c->loaded) {
-        fprintf(stderr, "llm: load failed: %s\n", slm_get_error(c));
+    if (!c->model->loaded) {
+        fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
         r = 1;
     } else {
         struct chat_test_capture caps_a[N_TURNS] = {0};
@@ -1731,7 +1799,7 @@ static int32_t run_chat_test(int32_t max_new) {
                 struct chat_test_capture * cap = &caps[t];
                 cap->hash = 0xcbf29ce484222325ULL;
                 char * delta_str = jinja_apply_delta(turns[t], NULL, 0);
-                int32_t nids = tokenizer_encode(&c->tok, delta_str,
+                int32_t nids = tokenizer_encode(&c->model->tok, delta_str,
                                           ids, 16384);
                 int32_t gen = slm_generate(c, ids, nids, max_new,
                                            g_min_new, &sp, seed,
@@ -1766,7 +1834,8 @@ static int32_t run_chat_test(int32_t max_new) {
             chars_free(&caps_b[t].text);
         }
     }
-    slm_destroy(c);
+    slm_ctx_destroy(c);
+    slm_model_unload(m);
     return r;
 }
 
@@ -1778,10 +1847,11 @@ static int32_t run_ask(const char * question,
                        const struct slm_sampler * sp, uint64_t seed,
                        int32_t max_iters, int32_t max_new,
                        int32_t trace) {
-    struct slm_ctx * c = slm_create(slm_cli_gguf_path());
+    struct slm_model * m = slm_model_load(slm_cli_gguf_path());
+    struct slm_ctx * c = slm_model_loaded(m) ? slm_ctx_create(m, NULL, NULL) : NULL;
     int32_t rc = 0;
-    if (!c->loaded) {
-        fprintf(stderr, "llm: load failed: %s\n", slm_get_error(c));
+    if (!c->model->loaded) {
+        fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
         rc = 1;
     } else {
         printf("[user] %s\n", question);
@@ -1791,31 +1861,33 @@ static int32_t run_ask(const char * question,
         printf("\n[assistant] %s\n", answer != NULL ? answer : "");
         free(answer);
     }
-    slm_destroy(c);
+    slm_ctx_destroy(c);
+    slm_model_unload(m);
     tools_global_cleanup();
     return rc;
 }
 
 static int32_t run_single(const char * prompt, int32_t max_new,
                           const struct slm_sampler * sp, uint64_t seed) {
-    struct slm_ctx * c = slm_create(slm_cli_gguf_path());
+    struct slm_model * m = slm_model_load(slm_cli_gguf_path());
+    struct slm_ctx * c = slm_model_loaded(m) ? slm_ctx_create(m, NULL, NULL) : NULL;
     int32_t r = 0;
-    if (!c->loaded) {
-        fprintf(stderr, "llm: load failed: %s\n", slm_get_error(c));
+    if (!c->model->loaded) {
+        fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
         r = 1;
     } else {
         printf("model: %d layers, %d heads (%d kv), head_dim=%d, "
                "hidden=%d, ffn=%d, vocab=%d\n",
-               (int)c->cfg.n_layers, (int)c->cfg.n_heads,
-               (int)c->cfg.n_kv_heads, (int)c->cfg.head_dim,
-               (int)c->cfg.hidden_dim, (int)c->cfg.ffn_dim,
-               (int)c->cfg.vocab_size);
+               (int)c->model->cfg.n_layers, (int)c->model->cfg.n_heads,
+               (int)c->model->cfg.n_kv_heads, (int)c->model->cfg.head_dim,
+               (int)c->model->cfg.hidden_dim, (int)c->model->cfg.ffn_dim,
+               (int)c->model->cfg.vocab_size);
         printf("rope: dim=%d base=%.1f sections=[%d,%d,%d,%d]\n",
-               (int)c->cfg.rope_dim, c->cfg.rope_theta,
-               (int)c->cfg.rope_sections[0], (int)c->cfg.rope_sections[1],
-               (int)c->cfg.rope_sections[2], (int)c->cfg.rope_sections[3]);
+               (int)c->model->cfg.rope_dim, c->model->cfg.rope_theta,
+               (int)c->model->cfg.rope_sections[0], (int)c->model->cfg.rope_sections[1],
+               (int)c->model->cfg.rope_sections[2], (int)c->model->cfg.rope_sections[3]);
         int32_t ids[2048];
-        int32_t n = tokenizer_encode(&c->tok, prompt, ids, 2048);
+        int32_t n = tokenizer_encode(&c->model->tok, prompt, ids, 2048);
         printf("prompt tokens (%d): ", (int)n);
         for (int32_t i = 0; i < n; i++) printf("%d ", (int)ids[i]);
         printf("\n---\n%s", prompt);
@@ -1828,16 +1900,18 @@ static int32_t run_single(const char * prompt, int32_t max_new,
                 slm_pp_per_sec(c), (int)slm_n_prefill(c),
                 slm_tg_per_sec(c), (int)slm_n_generated(c));
     }
-    slm_destroy(c);
+    slm_ctx_destroy(c);
+    slm_model_unload(m);
     return r;
 }
 
 static int32_t run_repl(const struct slm_sampler * sp,
                         uint64_t seed, int32_t max_new) {
-    struct slm_ctx * c = slm_create(slm_cli_gguf_path());
+    struct slm_model * m = slm_model_load(slm_cli_gguf_path());
+    struct slm_ctx * c = slm_model_loaded(m) ? slm_ctx_create(m, NULL, NULL) : NULL;
     int32_t r = 0;
-    if (!c->loaded) {
-        fprintf(stderr, "llm: load failed: %s\n", slm_get_error(c));
+    if (!c->model->loaded) {
+        fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
         r = 1;
     } else {
         char line[4096];
@@ -1853,7 +1927,7 @@ static int32_t run_repl(const struct slm_sampler * sp,
                          "<|im_start|>user\n%s<|im_end|>\n"
                          "<|im_start|>assistant\n", line);
                 int32_t ids[2048];
-                int32_t nids = tokenizer_encode(&c->tok, framed, ids, 2048);
+                int32_t nids = tokenizer_encode(&c->model->tok, framed, ids, 2048);
                 printf("\nassistant: ");
                 fflush(stdout);
                 slm_generate(c, ids, nids, max_new, g_min_new, sp, seed,
@@ -1863,7 +1937,8 @@ static int32_t run_repl(const struct slm_sampler * sp,
             }
         }
     }
-    slm_destroy(c);
+    slm_ctx_destroy(c);
+    slm_model_unload(m);
     return r;
 }
 
@@ -1988,15 +2063,17 @@ int main(int argc, char ** argv) {
     } else if (mode == CLI_CHAT_TEST) {
         rc = run_chat_test(max_new);
     } else if (mode == CLI_PRINT_TEMPLATE) {
-        struct slm_ctx * c = slm_create(slm_cli_gguf_path());
-        if (!c->loaded) {
-            fprintf(stderr, "llm: load failed: %s\n", slm_get_error(c));
+        struct slm_model * m = slm_model_load(slm_cli_gguf_path());
+    struct slm_ctx * c = slm_model_loaded(m) ? slm_ctx_create(m, NULL, NULL) : NULL;
+        if (!c->model->loaded) {
+            fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
             rc = 1;
         } else {
             const char * tpl = slm_chat_template(c);
             if (tpl != NULL) { fputs(tpl, stdout); }
         }
-        slm_destroy(c);
+        slm_ctx_destroy(c);
+    slm_model_unload(m);
     } else if (mode == CLI_JINJA_TEST) {
         rc = jinja_self_test();
     } else if (mode == CLI_TOOLS_TEST) {

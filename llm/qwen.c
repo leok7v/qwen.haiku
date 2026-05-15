@@ -550,17 +550,38 @@ static void ssm_cache_reset(struct slm_ssm_cache * s,
 // by feeding tokens through this same function in sequence.
 // ---------------------------------------------------------------------------
 
-struct slm_ctx {
+// Two-level lifecycle (2026-05-15 split):
+//
+//   struct slm_model — the GGUF mmap + parsed config + weights +
+//     tokenizer. Immutable post-load. Sharable across many ctxs
+//     in principle (one model, multiple concurrent conversations).
+//     Created/destroyed by slm_model_load / slm_model_unload.
+//
+//   struct slm_ctx — per-conversation mutable state: KV cache, SSM
+//     ring, write position, sampler arena, ctrl knobs, stats.
+//     References the model by borrowed pointer (lifetime is the
+//     caller's responsibility: don't unload a model while any ctx
+//     still points at it). Created/destroyed by slm_ctx_create /
+//     slm_ctx_destroy.
+//
+// `slm_reset` is gone: drop the old ctx and create a fresh one for
+// a new conversation. The model survives unchanged so the GGUF
+// doesn't need to be re-mmapped.
+struct slm_model {
     struct gguf            gguf;
     struct slm_config      cfg;
     struct slm_weights     W;
     struct tokenizer       tok;
-    struct slm_kv          kv;
-    struct slm_ssm_cache   ssm;
-    struct arena *         arena;
     int32_t                loaded;
     char                   err[256];
     char *                 chat_template;   // see footnote (1)
+};
+
+struct slm_ctx {
+    struct slm_model *     model;           // borrowed; NOT owned
+    struct slm_kv          kv;
+    struct slm_ssm_cache   ssm;
+    struct arena *         arena;
     int32_t                dump_layer;      // see footnote (2)
     double                 t_prefill_s;     // see footnote (3)
     double                 t_gen_s;
@@ -568,14 +589,15 @@ struct slm_ctx {
     int32_t                n_generated;
     int32_t                pos;             // see footnote (4)
     struct slm_ctrl        ctrl;            // see footnote (5)
+    char *                 system_prompt;   // see footnote (6)
 };
 
-// slm_ctx footnotes:
+// slm_model / slm_ctx footnotes:
 //
 // (1) chat_template: Jinja string from GGUF KV
 //     `tokenizer.chat_template`, copied as a NUL-terminated heap
 //     string (GGUF stores it length-prefixed). NULL if the GGUF lacks
-//     the KV (base completion models). Freed in slm_destroy.
+//     the KV (base completion models). Freed in slm_model_unload.
 //
 // (2) dump_layer: --dump-layer L diagnostic. When >= 0, the forward
 //     path prints the first 8 values of selected intermediate
@@ -590,18 +612,27 @@ struct slm_ctx {
 //
 // (4) pos: next free position in the KV cache. Carries across
 //     consecutive slm_generate calls so multi-turn chat does not
-//     need to reformat and re-prefill prior turns - tokenize only
+//     need to reformat and re-prefill prior turns — tokenize only
 //     the new delta (e.g. `<|im_start|>user\nQ<|im_end|>\n` +
-//     gen header) and call slm_generate again. slm_reset() zeroes
-//     this back to 0 along with the SSM/conv recurrent state.
+//     gen header) and call slm_generate again. A fresh ctx_create
+//     starts pos = 0.
 //
 // (5) ctrl: per-conversation behavior knobs (tools / think / effort
-//     / debug). Initialized to slm_ctrl_defaults() in slm_create;
-//     callers can override via slm_set_ctrl(). slm_generate reads
-//     tools and debug from here on every call. think + effort feed
-//     into slm_chat_format_delta on the first turn; once committed
-//     to KV they are locked in for the rest of the conversation
-//     (changing them mid-stream produces a mixed history).
+//     / debug). Initialized by slm_ctx_create from its `ctrl`
+//     argument (or defaults if NULL); callers can override via
+//     slm_set_ctrl(). slm_generate reads tools and debug from here
+//     on every call. think + effort feed into slm_chat_format_delta
+//     on the first turn; once committed to KV they are locked in
+//     for the rest of the conversation (changing them mid-stream
+//     produces a mixed history — that's why ctx is the granularity
+//     of "switch these settings").
+//
+// (6) system_prompt: a heap-owned copy of the system prompt passed
+//     to slm_ctx_create. Stored for record / future use (eventual
+//     auto-prefill at ctx_create time). Today the caller still
+//     passes it explicitly via slm_chat_format_delta on the first
+//     turn — the ctx field is informational. NULL if no system
+//     prompt was specified. Freed in slm_ctx_destroy.
 
 static int g_dump_layer = -1;
 int g_no_q8k_rt = 0;
@@ -849,24 +880,24 @@ static struct tensor * slm_forward_ssm(struct slm_ctx * c,
                                        int32_t L,
                                        struct tensor * h) {
     struct arena * a = c->arena;
-    struct slm_layer_w * Lw = &c->W.layers[L];
-    int32_t n_heads  = c->cfg.linear_n_heads;     // 16
-    int32_t k_hd     = c->cfg.linear_k_head_dim;  // 128
-    int32_t v_hd     = c->cfg.linear_v_head_dim;  // 128
+    struct slm_layer_w * Lw = &c->model->W.layers[L];
+    int32_t n_heads  = c->model->cfg.linear_n_heads;     // 16
+    int32_t k_hd     = c->model->cfg.linear_k_head_dim;  // 128
+    int32_t v_hd     = c->model->cfg.linear_v_head_dim;  // 128
     int32_t K_dim    = n_heads * k_hd;            // 2048
     int32_t V_dim    = n_heads * v_hd;            // 2048
-    int32_t kK       = c->cfg.linear_conv_kernel; //    4
+    int32_t kK       = c->model->cfg.linear_conv_kernel; //    4
     int32_t conv_dim = 2 * K_dim + V_dim;         // 6144
     assert(Lw->ssm_conv1d.shape[1] == conv_dim);
     // 1. RMSNorm.
     struct tensor attn_norm_w = weights_as_f32_view(&Lw->attn_norm, a);
     struct tensor * h_norm =
-        tensor_rms_norm(h, &attn_norm_w, c->cfg.norm_eps);
-    DUMP("attn_norm", h_norm->data, c->cfg.hidden_dim);
+        tensor_rms_norm(h, &attn_norm_w, c->model->cfg.norm_eps);
+    DUMP("attn_norm", h_norm->data, c->model->cfg.hidden_dim);
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
-        qwen_trace_row(nm, "RMS_NORM", h_norm->data, c->cfg.hidden_dim);
+        qwen_trace_row(nm, "RMS_NORM", h_norm->data, c->model->cfg.hidden_dim);
     }
     // 2. In-projections.
     struct tensor * qkv_pre = matmul_dispatch(&Lw->attn_qkv,  h_norm);
@@ -1141,7 +1172,7 @@ static struct tensor * slm_forward_ssm(struct slm_ctx * c,
             ssq += (double)(yh[v] * yh[v]);
         }
         float mean = (float)(ssq / (double)v_hd);
-        float rs = 1.0f / sqrtf(mean + c->cfg.norm_eps);
+        float rs = 1.0f / sqrtf(mean + c->model->cfg.norm_eps);
         const float * sg = z_silu + h2 * v_hd;
         float * yo = y_norm->data + h2 * v_hd;
         // ggml's RMS_NORM/MUL/MUL pipeline stores each intermediate
@@ -1169,11 +1200,11 @@ static struct tensor * slm_forward_ssm(struct slm_ctx * c,
     }
     // 11. Output projection V_dim -> hidden.
     struct tensor * out_t = matmul_dispatch(&Lw->ssm_out, y_norm);
-    DUMP("ssm_out  ", out_t->data, c->cfg.hidden_dim);
+    DUMP("ssm_out  ", out_t->data, c->model->cfg.hidden_dim);
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "ssm_out-%d", (int)L);
-        qwen_trace_row(nm, "MUL_MAT", out_t->data, c->cfg.hidden_dim);
+        qwen_trace_row(nm, "MUL_MAT", out_t->data, c->model->cfg.hidden_dim);
     }
     return out_t;
 }
@@ -1196,24 +1227,24 @@ static struct tensor * slm_forward_ssm_batch(struct slm_ctx * c,
                                               int32_t L, int32_t n,
                                               struct tensor * h) {
     struct arena * a = c->arena;
-    struct slm_layer_w * Lw = &c->W.layers[L];
-    int32_t n_heads  = c->cfg.linear_n_heads;
-    int32_t k_hd     = c->cfg.linear_k_head_dim;
-    int32_t v_hd     = c->cfg.linear_v_head_dim;
+    struct slm_layer_w * Lw = &c->model->W.layers[L];
+    int32_t n_heads  = c->model->cfg.linear_n_heads;
+    int32_t k_hd     = c->model->cfg.linear_k_head_dim;
+    int32_t v_hd     = c->model->cfg.linear_v_head_dim;
     int32_t K_dim    = n_heads * k_hd;
     int32_t V_dim    = n_heads * v_hd;
-    int32_t kK       = c->cfg.linear_conv_kernel;
+    int32_t kK       = c->model->cfg.linear_conv_kernel;
     int32_t conv_dim = 2 * K_dim + V_dim;
     assert(n > 0);
     // 1. attn_norm per token (rms_norm handles n via x->ne[1]).
     struct tensor attn_norm_w = weights_as_f32_view(&Lw->attn_norm, a);
     struct tensor * h_norm =
-        tensor_rms_norm(h, &attn_norm_w, c->cfg.norm_eps);
+        tensor_rms_norm(h, &attn_norm_w, c->model->cfg.norm_eps);
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
         qwen_trace_batch(nm, "RMS_NORM",
-                       h_norm->data, c->cfg.hidden_dim, n);
+                       h_norm->data, c->model->cfg.hidden_dim, n);
     }
     // 2. In-projections - matmul_dispatch already iterates the n axis.
     struct tensor * qkv_pre = matmul_dispatch(&Lw->attn_qkv,  h_norm);  // [conv_dim, n]
@@ -1416,7 +1447,7 @@ static struct tensor * slm_forward_ssm_batch(struct slm_ctx * c,
                 ssq += (double)(yh[v] * yh[v]);
             }
             float mean = (float)(ssq / (double)v_hd);
-            float rs   = 1.0f / sqrtf(mean + c->cfg.norm_eps);
+            float rs   = 1.0f / sqrtf(mean + c->model->cfg.norm_eps);
             const float * sg = z_silu_buf + (size_t)h2 * v_hd;
             float * yo = y_norm->data + (size_t)t * V_dim + (size_t)h2 * v_hd;
             for (int32_t v = 0; v < v_hd; v++) {
@@ -1441,7 +1472,7 @@ static struct tensor * slm_forward_ssm_batch(struct slm_ctx * c,
         char nm[48];
         snprintf(nm, sizeof(nm), "ssm_out-%d", (int)L);
         qwen_trace_batch(nm, "MUL_MAT",
-                       out_t->data, c->cfg.hidden_dim, n);
+                       out_t->data, c->model->cfg.hidden_dim, n);
     }
     return out_t;
 }
@@ -1453,10 +1484,10 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
                                         int32_t L, int32_t pos,
                                         struct tensor * h) {
     struct arena * a = c->arena;
-    struct slm_layer_w * Lw = &c->W.layers[L];
-    int32_t hd         = c->cfg.head_dim;
-    int32_t n_h        = c->cfg.n_heads;
-    int32_t n_kvh      = c->cfg.n_kv_heads;
+    struct slm_layer_w * Lw = &c->model->W.layers[L];
+    int32_t hd         = c->model->cfg.head_dim;
+    int32_t n_h        = c->model->cfg.n_heads;
+    int32_t n_kvh      = c->model->cfg.n_kv_heads;
     // attn_inner is the attention output width before attn_output.
     // For pure Qwen3 it equals hidden_dim, for qwen35 it does not
     // (head_dim=256 * n_heads=8 = 2048, hidden=1024).
@@ -1466,12 +1497,12 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
     struct tensor attn_norm_w =
         weights_as_f32_view(&Lw->attn_norm, a);
     struct tensor * h_norm =
-        tensor_rms_norm(h, &attn_norm_w, c->cfg.norm_eps);
-    DUMP("[A]attn_nm", h_norm->data, c->cfg.hidden_dim);
+        tensor_rms_norm(h, &attn_norm_w, c->model->cfg.norm_eps);
+    DUMP("[A]attn_nm", h_norm->data, c->model->cfg.hidden_dim);
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
-        qwen_trace_row(nm, "RMS_NORM", h_norm->data, c->cfg.hidden_dim);
+        qwen_trace_row(nm, "RMS_NORM", h_norm->data, c->model->cfg.hidden_dim);
     }
     // Q / K / V projections. Qwen3.5 has attn_output_gate=true: the
     // Q projection emits n_heads*head_dim*2, split into (Q, gate).
@@ -1526,7 +1557,7 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
     // 2*hd block holds Q[hd] then gate[hd].
     struct tensor * q = tensor_new_3d(a, hd, n_h, 1);
     struct tensor * attn_gate_v = NULL;
-    if (c->cfg.attn_output_gate) {
+    if (c->model->cfg.attn_output_gate) {
         attn_gate_v = tensor_new_2d(a, attn_inner, 1);
         for (int32_t h2 = 0; h2 < n_h; h2++) {
             const float * src = q_raw->data + h2 * (2 * hd);
@@ -1555,7 +1586,7 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
         for (int32_t i = 2; i < TENSOR_MAX_DIMS; i++) q2.ne[i] = 1;
         tensor_set_packed_strides(&q2);
         struct tensor * qnorm =
-            tensor_rms_norm(&q2, &qn_w, c->cfg.norm_eps);
+            tensor_rms_norm(&q2, &qn_w, c->model->cfg.norm_eps);
         qnorm->ndim = 3;
         qnorm->ne[0] = hd; qnorm->ne[1] = n_h; qnorm->ne[2] = 1;
         tensor_set_packed_strides(qnorm);
@@ -1569,7 +1600,7 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
         for (int32_t i = 2; i < TENSOR_MAX_DIMS; i++) k2.ne[i] = 1;
         tensor_set_packed_strides(&k2);
         struct tensor * knorm =
-            tensor_rms_norm(&k2, &kn_w, c->cfg.norm_eps);
+            tensor_rms_norm(&k2, &kn_w, c->model->cfg.norm_eps);
         knorm->ndim = 3;
         knorm->ne[0] = hd; knorm->ne[1] = n_kvh; knorm->ne[2] = 1;
         tensor_set_packed_strides(knorm);
@@ -1579,21 +1610,21 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
     // mrope variant ported from ggml-cpu/ops.cpp. For plain Qwen3
     // it falls back to standard NEOX-style RoPE when sections are
     // all zero.
-    int32_t rotary_dim = c->cfg.rope_dim > 0 ? c->cfg.rope_dim : hd;
-    int32_t use_imrope = c->cfg.rope_sections[0] ||
-                         c->cfg.rope_sections[1] ||
-                         c->cfg.rope_sections[2] ||
-                         c->cfg.rope_sections[3];
+    int32_t rotary_dim = c->model->cfg.rope_dim > 0 ? c->model->cfg.rope_dim : hd;
+    int32_t use_imrope = c->model->cfg.rope_sections[0] ||
+                         c->model->cfg.rope_sections[1] ||
+                         c->model->cfg.rope_sections[2] ||
+                         c->model->cfg.rope_sections[3];
     struct tensor * q_rope;
     struct tensor * k_rope;
     if (use_imrope) {
-        q_rope = tensor_rope_mrope_i(q, pos, c->cfg.rope_theta,
-                                     rotary_dim, c->cfg.rope_sections);
-        k_rope = tensor_rope_mrope_i(k, pos, c->cfg.rope_theta,
-                                     rotary_dim, c->cfg.rope_sections);
+        q_rope = tensor_rope_mrope_i(q, pos, c->model->cfg.rope_theta,
+                                     rotary_dim, c->model->cfg.rope_sections);
+        k_rope = tensor_rope_mrope_i(k, pos, c->model->cfg.rope_theta,
+                                     rotary_dim, c->model->cfg.rope_sections);
     } else {
-        q_rope = tensor_rope(q, pos, c->cfg.rope_theta, rotary_dim);
-        k_rope = tensor_rope(k, pos, c->cfg.rope_theta, rotary_dim);
+        q_rope = tensor_rope(q, pos, c->model->cfg.rope_theta, rotary_dim);
+        k_rope = tensor_rope(k, pos, c->model->cfg.rope_theta, rotary_dim);
     }
     // Write new K/V row into KV cache (cast to fp16).
     _Float16 * kdst = kv_row_k(&c->kv, L, pos);
@@ -1628,7 +1659,7 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
     DUMP("[A]Krope  ", k_rope->data, n_kvh * hd);
     DUMP("[A]attn   ", ctx_t->data, attn_inner);
     // Output gate: attn_output *= sigmoid(gate). qwen35 only.
-    if (c->cfg.attn_output_gate && attn_gate_v != NULL) {
+    if (c->model->cfg.attn_output_gate && attn_gate_v != NULL) {
         for (int32_t i = 0; i < attn_inner; i++) {
             float g_v = attn_gate_v->data[i];
             float sig = 1.0f / (1.0f + expf(-g_v));
@@ -1642,7 +1673,7 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_out-%d", (int)L);
         qwen_trace_row(nm, "MUL_MAT",
-                     attn_out_t->data, c->cfg.hidden_dim);
+                     attn_out_t->data, c->model->cfg.hidden_dim);
     }
     return attn_out_t;
 }
@@ -1665,22 +1696,22 @@ static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
                                               int32_t n,
                                               struct tensor * h) {
     struct arena * a = c->arena;
-    struct slm_layer_w * Lw = &c->W.layers[L];
-    int32_t hd         = c->cfg.head_dim;
-    int32_t n_h        = c->cfg.n_heads;
-    int32_t n_kvh      = c->cfg.n_kv_heads;
+    struct slm_layer_w * Lw = &c->model->W.layers[L];
+    int32_t hd         = c->model->cfg.head_dim;
+    int32_t n_h        = c->model->cfg.n_heads;
+    int32_t n_kvh      = c->model->cfg.n_kv_heads;
     int32_t attn_inner = n_h * hd;
     int32_t kv_hidden  = n_kvh * hd;
     // RMSNorm over the n tokens. tensor_rms_norm iterates ne[1] = n.
     struct tensor attn_norm_w =
         weights_as_f32_view(&Lw->attn_norm, a);
     struct tensor * h_norm =
-        tensor_rms_norm(h, &attn_norm_w, c->cfg.norm_eps);
+        tensor_rms_norm(h, &attn_norm_w, c->model->cfg.norm_eps);
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
         qwen_trace_batch(nm, "RMS_NORM",
-                       h_norm->data, c->cfg.hidden_dim, n);
+                       h_norm->data, c->model->cfg.hidden_dim, n);
     }
     // Q/K/V projections — matmul_dispatch handles ne[1]=n natively.
     struct tensor * q_raw = matmul_dispatch(&Lw->attn_q, h_norm);
@@ -1699,7 +1730,7 @@ static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
     // q_raw has shape [2*attn_inner, n] in head-interleaved layout.
     struct tensor * q = tensor_new_3d(a, hd, n_h, n);
     struct tensor * attn_gate_v = NULL;
-    if (c->cfg.attn_output_gate) {
+    if (c->model->cfg.attn_output_gate) {
         attn_gate_v = tensor_new_2d(a, attn_inner, n);
         for (int32_t t = 0; t < n; t++) {
             const float * src = q_raw->data + (size_t)t * (2 * attn_inner);
@@ -1736,7 +1767,7 @@ static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
         for (int32_t i = 2; i < TENSOR_MAX_DIMS; i++) q2.ne[i] = 1;
         tensor_set_packed_strides(&q2);
         struct tensor * qnorm =
-            tensor_rms_norm(&q2, &qn_w, c->cfg.norm_eps);
+            tensor_rms_norm(&q2, &qn_w, c->model->cfg.norm_eps);
         qnorm->ndim = 3;
         qnorm->ne[0] = hd; qnorm->ne[1] = n_h; qnorm->ne[2] = n;
         tensor_set_packed_strides(qnorm);
@@ -1750,7 +1781,7 @@ static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
         for (int32_t i = 2; i < TENSOR_MAX_DIMS; i++) k2.ne[i] = 1;
         tensor_set_packed_strides(&k2);
         struct tensor * knorm =
-            tensor_rms_norm(&k2, &kn_w, c->cfg.norm_eps);
+            tensor_rms_norm(&k2, &kn_w, c->model->cfg.norm_eps);
         knorm->ndim = 3;
         knorm->ne[0] = hd; knorm->ne[1] = n_kvh; knorm->ne[2] = n;
         tensor_set_packed_strides(knorm);
@@ -1759,21 +1790,21 @@ static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
     // RoPE on q [hd, n_h, n] and k [hd, n_kvh, n] starting at pos_start.
     // tensor_rope* already iterate seq axis (ne[2]) and apply
     // pos_t = pos_offset + s.
-    int32_t rotary_dim = c->cfg.rope_dim > 0 ? c->cfg.rope_dim : hd;
-    int32_t use_imrope = c->cfg.rope_sections[0] ||
-                         c->cfg.rope_sections[1] ||
-                         c->cfg.rope_sections[2] ||
-                         c->cfg.rope_sections[3];
+    int32_t rotary_dim = c->model->cfg.rope_dim > 0 ? c->model->cfg.rope_dim : hd;
+    int32_t use_imrope = c->model->cfg.rope_sections[0] ||
+                         c->model->cfg.rope_sections[1] ||
+                         c->model->cfg.rope_sections[2] ||
+                         c->model->cfg.rope_sections[3];
     struct tensor * q_rope;
     struct tensor * k_rope;
     if (use_imrope) {
-        q_rope = tensor_rope_mrope_i(q, pos_start, c->cfg.rope_theta,
-                                     rotary_dim, c->cfg.rope_sections);
-        k_rope = tensor_rope_mrope_i(k, pos_start, c->cfg.rope_theta,
-                                     rotary_dim, c->cfg.rope_sections);
+        q_rope = tensor_rope_mrope_i(q, pos_start, c->model->cfg.rope_theta,
+                                     rotary_dim, c->model->cfg.rope_sections);
+        k_rope = tensor_rope_mrope_i(k, pos_start, c->model->cfg.rope_theta,
+                                     rotary_dim, c->model->cfg.rope_sections);
     } else {
-        q_rope = tensor_rope(q, pos_start, c->cfg.rope_theta, rotary_dim);
-        k_rope = tensor_rope(k, pos_start, c->cfg.rope_theta, rotary_dim);
+        q_rope = tensor_rope(q, pos_start, c->model->cfg.rope_theta, rotary_dim);
+        k_rope = tensor_rope(k, pos_start, c->model->cfg.rope_theta, rotary_dim);
     }
     // Write the n new (K, V) rows into the KV cache.
     for (int32_t t = 0; t < n; t++) {
@@ -1812,7 +1843,7 @@ static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
     for (int32_t i = 2; i < TENSOR_MAX_DIMS; i++) ctx_t->ne[i] = 1;
     tensor_set_packed_strides(ctx_t);
     // Output gate (per token): ctx *= sigmoid(gate).
-    if (c->cfg.attn_output_gate && attn_gate_v != NULL) {
+    if (c->model->cfg.attn_output_gate && attn_gate_v != NULL) {
         for (int32_t t = 0; t < n; t++) {
             float * out_row = ctx_t->data       + (size_t)t * attn_inner;
             float * gat_row = attn_gate_v->data + (size_t)t * attn_inner;
@@ -1828,7 +1859,7 @@ static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_out-%d", (int)L);
         qwen_trace_batch(nm, "MUL_MAT",
-                       attn_out_t->data, c->cfg.hidden_dim, n);
+                       attn_out_t->data, c->model->cfg.hidden_dim, n);
     }
     return attn_out_t;
 }
@@ -1842,12 +1873,12 @@ static struct tensor * slm_forward_step(struct slm_ctx * c,
     //    (not fp32), so we can't view it as a plain fp32 row table.
     //    Dequantise the single row we need by routing through
     //    matmul_dispatch with a one-hot activation.
-    int32_t hidden_dim = c->cfg.hidden_dim;
+    int32_t hidden_dim = c->model->cfg.hidden_dim;
     struct tensor * h;
-    if (c->W.tok_embd.type == GGUF_TT_F32) {
+    if (c->model->W.tok_embd.type == GGUF_TT_F32) {
         struct tensor * ids = tensor_new_1d(a, 1);
         ids->data[0] = (float)tok_id;
-        struct tensor tev = weights_as_f32_view(&c->W.tok_embd, a);
+        struct tensor tev = weights_as_f32_view(&c->model->W.tok_embd, a);
         h = tensor_get_rows(&tev, ids);
     } else {
         // tok_embd shape in GGUF is (hidden_dim, vocab_size). Rather
@@ -1861,21 +1892,21 @@ static struct tensor * slm_forward_step(struct slm_ctx * c,
         assert(hidden_dim % QK_K == 0);
         int32_t blocks_per_row = hidden_dim / QK_K;
         const q6k_block * row_blocks =
-            (const q6k_block *)c->W.tok_embd.data
+            (const q6k_block *)c->model->W.tok_embd.data
             + (size_t)tok_id * blocks_per_row;
         for (int32_t b = 0; b < blocks_per_row; b++) {
             q6k_dequant_block(row_blocks + b, h->data + b * QK_K);
         }
     }
     // h shape: (hidden_dim, 1)
-    qwen_trace_row("inp_embd", "GET_ROWS", h->data, c->cfg.hidden_dim);
+    qwen_trace_row("inp_embd", "GET_ROWS", h->data, c->model->cfg.hidden_dim);
 
     static int8_t use_ssm_batch = -1;
     if (use_ssm_batch < 0) {
         use_ssm_batch = (getenv("LLM_USE_SSM_BATCH") != NULL) ? 1 : 0;
     }
-    for (int32_t L = 0; L < c->cfg.n_layers; L++) {
-        struct slm_layer_w * Lw = &c->W.layers[L];
+    for (int32_t L = 0; L < c->model->cfg.n_layers; L++) {
+        struct slm_layer_w * Lw = &c->model->W.layers[L];
         struct tensor * mix;
         if (Lw->is_ssm) {
             // Single-token forward: route to the chunked-SSM batched
@@ -1893,27 +1924,27 @@ static struct tensor * slm_forward_step(struct slm_ctx * c,
             char nm[48];
             snprintf(nm, sizeof(nm), "mix-%d", (int)L);
             qwen_trace_row(nm, Lw->is_ssm ? "SSM" : "ATTN",
-                         mix->data, c->cfg.hidden_dim);
+                         mix->data, c->model->cfg.hidden_dim);
         }
         h = tensor_add(h, mix);
 
         // FFN: SwiGLU (shared by attention and SSM layers).
-        DUMP("[F]residual", h->data, c->cfg.hidden_dim);
+        DUMP("[F]residual", h->data, c->model->cfg.hidden_dim);
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "mix_residual-%d", (int)L);
-            qwen_trace_row(nm, "ADD", h->data, c->cfg.hidden_dim);
+            qwen_trace_row(nm, "ADD", h->data, c->model->cfg.hidden_dim);
         }
         struct tensor ffn_norm_w =
             weights_as_f32_view(&Lw->ffn_norm, a);
         struct tensor * h_ffn_norm =
-            tensor_rms_norm(h, &ffn_norm_w, c->cfg.norm_eps);
-        DUMP("[F]post_atn", h_ffn_norm->data, c->cfg.hidden_dim);
+            tensor_rms_norm(h, &ffn_norm_w, c->model->cfg.norm_eps);
+        DUMP("[F]post_atn", h_ffn_norm->data, c->model->cfg.hidden_dim);
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "ffn_norm-%d", (int)L);
             qwen_trace_row(nm, "RMS_NORM",
-                         h_ffn_norm->data, c->cfg.hidden_dim);
+                         h_ffn_norm->data, c->model->cfg.hidden_dim);
         }
         struct tensor * gate     = matmul_dispatch(&Lw->ffn_gate, h_ffn_norm);
         struct tensor * up       = matmul_dispatch(&Lw->ffn_up,   h_ffn_norm);
@@ -1924,30 +1955,30 @@ static struct tensor * slm_forward_step(struct slm_ctx * c,
                           gate_act->data, gate->data);
         struct tensor * ffn_in   = tensor_mul(gate_act, up);
         struct tensor * ffn_out  = matmul_dispatch(&Lw->ffn_down, ffn_in);
-        DUMP("[F]ffn_out ", ffn_out->data, c->cfg.hidden_dim);
+        DUMP("[F]ffn_out ", ffn_out->data, c->model->cfg.hidden_dim);
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "ffn_out-%d", (int)L);
             qwen_trace_row(nm, "MUL_MAT",
-                         ffn_out->data, c->cfg.hidden_dim);
+                         ffn_out->data, c->model->cfg.hidden_dim);
         }
         h = tensor_add(h, ffn_out);
-        DUMP("[F]post_ffn", h->data, c->cfg.hidden_dim);
+        DUMP("[F]post_ffn", h->data, c->model->cfg.hidden_dim);
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "l_out-%d", (int)L);
-            qwen_trace_row(nm, "ADD", h->data, c->cfg.hidden_dim);
+            qwen_trace_row(nm, "ADD", h->data, c->model->cfg.hidden_dim);
         }
     }
 
     // 12. Final RMSNorm + lm_head.
     struct tensor output_norm_w =
-        weights_as_f32_view(&c->W.output_norm, a);
+        weights_as_f32_view(&c->model->W.output_norm, a);
     struct tensor * h_final =
-        tensor_rms_norm(h, &output_norm_w, c->cfg.norm_eps);
+        tensor_rms_norm(h, &output_norm_w, c->model->cfg.norm_eps);
     qwen_trace_row("result_norm", "RMS_NORM",
-                 h_final->data, c->cfg.hidden_dim);
-    struct tensor * logits = matmul_dispatch(&c->W.output, h_final);
+                 h_final->data, c->model->cfg.hidden_dim);
+    struct tensor * logits = matmul_dispatch(&c->model->W.output, h_final);
     qwen_trace_row("result_output", "MUL_MAT",
                  logits->data, (int64_t)tensor_nelements(logits));
     return logits;
@@ -1990,15 +2021,15 @@ static struct tensor * slm_forward_batch(struct slm_ctx * c,
     assert(n > 0);
     struct arena * a = c->arena;
     arena_reset(a);
-    int32_t hidden_dim = c->cfg.hidden_dim;
+    int32_t hidden_dim = c->model->cfg.hidden_dim;
     // 1. Embedding lookup for n tokens. Same Q6_K / F32 split as the
     //    single-token path; we just stack n rows.
     struct tensor * h = tensor_new_2d(a, hidden_dim, n);
     for (int32_t t = 0; t < n; t++) {
         int32_t tok_id = tok_ids[t];
         float * dst = h->data + (size_t)t * hidden_dim;
-        if (c->W.tok_embd.type == GGUF_TT_F32) {
-            const float * src = (const float *)c->W.tok_embd.data
+        if (c->model->W.tok_embd.type == GGUF_TT_F32) {
+            const float * src = (const float *)c->model->W.tok_embd.data
                               + (size_t)tok_id * hidden_dim;
             memcpy(dst, src, (size_t)hidden_dim * sizeof(float));
         } else {
@@ -2006,7 +2037,7 @@ static struct tensor * slm_forward_batch(struct slm_ctx * c,
             assert(hidden_dim % QK_K == 0);
             int32_t blocks_per_row = hidden_dim / QK_K;
             const q6k_block * row_blocks =
-                (const q6k_block *)c->W.tok_embd.data
+                (const q6k_block *)c->model->W.tok_embd.data
                 + (size_t)tok_id * blocks_per_row;
             for (int32_t b = 0; b < blocks_per_row; b++) {
                 q6k_dequant_block(row_blocks + b, dst + b * QK_K);
@@ -2015,8 +2046,8 @@ static struct tensor * slm_forward_batch(struct slm_ctx * c,
     }
     qwen_trace_batch("inp_embd", "GET_ROWS", h->data, hidden_dim, n);
     // 2. Per-layer.
-    for (int32_t L = 0; L < c->cfg.n_layers; L++) {
-        struct slm_layer_w * Lw = &c->W.layers[L];
+    for (int32_t L = 0; L < c->model->cfg.n_layers; L++) {
+        struct slm_layer_w * Lw = &c->model->W.layers[L];
         struct tensor * mix;
         if (Lw->is_ssm) {
             // SSM: process all n tokens via chunked kernel. Internal
@@ -2045,7 +2076,7 @@ static struct tensor * slm_forward_batch(struct slm_ctx * c,
         // FFN: rms_norm + SwiGLU + matmul, all n-axis-aware.
         struct tensor ffn_norm_w = weights_as_f32_view(&Lw->ffn_norm, a);
         struct tensor * h_ffn_norm =
-            tensor_rms_norm(h, &ffn_norm_w, c->cfg.norm_eps);
+            tensor_rms_norm(h, &ffn_norm_w, c->model->cfg.norm_eps);
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "ffn_norm-%d", (int)L);
@@ -2077,13 +2108,13 @@ static struct tensor * slm_forward_batch(struct slm_ctx * c,
            h->data + (size_t)(n - 1) * hidden_dim,
            (size_t)hidden_dim * sizeof(float));
     struct tensor output_norm_w =
-        weights_as_f32_view(&c->W.output_norm, a);
+        weights_as_f32_view(&c->model->W.output_norm, a);
     struct tensor * h_final =
-        tensor_rms_norm(h_last, &output_norm_w, c->cfg.norm_eps);
+        tensor_rms_norm(h_last, &output_norm_w, c->model->cfg.norm_eps);
     qwen_trace_row("result_norm", "RMS_NORM", h_final->data, hidden_dim);
-    struct tensor * logits = matmul_dispatch(&c->W.output, h_final);
+    struct tensor * logits = matmul_dispatch(&c->model->W.output, h_final);
     qwen_trace_row("result_output", "MUL_MAT",
-                 logits->data, c->cfg.vocab_size);
+                 logits->data, c->model->cfg.vocab_size);
     return logits;
 }
 

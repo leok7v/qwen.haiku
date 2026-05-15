@@ -8,34 +8,33 @@
 // program, etc. Everything in llm.c that isn't declared here is
 // internal.
 //
-// Lifecycle:
-//   1. slm_create(path)         - mmap the GGUF, allocate all KV/SSM
-//                                 caches, parse weights. Returns NULL
-//                                 only on out-of-memory; check
-//                                 slm_loaded(ctx) for parse success.
-//   2. slm_tokenize(...)        - byte-level BPE encode UTF-8 text
-//                                 into token IDs.
-//   3. slm_generate(...)        - streaming generation. The callback
-//                                 fires once per generated token with
-//                                 the decoded UTF-8 piece.
-//   4. slm_destroy(ctx)         - free everything; safe on NULL.
+// Lifecycle (two-level, 2026-05-15):
+//
+//   1. slm_model_load(path)      - mmap the GGUF and parse weights +
+//                                  tokenizer. Returns a model handle.
+//                                  Check slm_model_loaded() for parse
+//                                  success.
+//   2. slm_ctx_create(model,
+//                     system_prompt,
+//                     ctrl)      - allocate a per-conversation ctx
+//                                  (KV / SSM / pos / ctrl). Multiple
+//                                  ctxs can share one model.
+//   3. slm_tokenize(ctx, ...)    - byte-level BPE encode UTF-8 text
+//                                  into token IDs.
+//   4. slm_generate(ctx, ...)    - streaming generation. The callback
+//                                  fires once per generated piece.
+//   5. slm_ctx_destroy(ctx)      - free per-ctx state. Model survives.
+//   6. slm_model_unload(model)   - munmap + free weights when no ctx
+//                                  still references the model.
+//
+// A "new conversation" is `slm_ctx_destroy` + `slm_ctx_create` (no
+// separate slm_reset — the old API conflated the two layers).
 //
 // Thread-safety: a single slm_ctx is NOT thread-safe. It holds a
 // streaming KV cache and per-layer SSM state that mutates on every
-// forward pass. Use one ctx per concurrent inference stream.
-
-// Roadmap (still TODO):
-//   1. Split `struct slm_ctx` into `slm_model` (mmap + weights +
-//      tokenizer, immutable post-load, shareable across ctxs) and
-//      `slm_ctx` (KV / SSM / pos / ctrl, one per conversation).
-//   2. Replace slm_create / slm_destroy / slm_reset with
-//      `slm_model_load / _unload` + `slm_ctx_create / _destroy`.
-//      slm_ctx_create takes (model, system_prompt, slm_ctrl *).
-//
-// Done in the current pass: `struct slm_ctrl` exists (tools / think
-// / effort / debug); the latter three pieces are stored on the ctx
-// and consulted by slm_generate, so the API change above is purely
-// a lifecycle refactor — the data is already in place.
+// forward pass. Use one ctx per concurrent inference stream. The
+// model is read-only after load and CAN be shared by multiple ctxs
+// (though there's no in-tree consumer that does this yet).
 
 #ifndef SLM_H
 #define SLM_H
@@ -48,39 +47,39 @@
 extern "C" {
 #endif
 
-// Opaque handle. Callers should never dereference; treat it as
-// `void *` with type safety.
+// Opaque handles. Callers should never dereference these; treat
+// them as `void *` with type safety.
+struct slm_model;
 struct slm_ctx;
+struct slm_ctrl;     // defined below — passed by-pointer to
+                     // slm_ctx_create.
 
 // (`slm_token_cb`, the raw per-token callback, used to live here
 // but was internal-only. It now lives as a private typedef in llm.c
 // — every public caller goes through `slm_stream_cb` below.)
 
-// Open a GGUF and prepare the context. `path` is a filesystem path
-// to a qwen35 architecture Q4_K_M GGUF (e.g. unsloth's release).
-// On failure to parse, returns a non-NULL ctx with slm_loaded() == 0
-// and an error string available via slm_get_error().
-struct slm_ctx * slm_create(const char * path);
+// ---------------------------------------------------------------------------
+// Model: load a GGUF once, share across many ctxs.
+// ---------------------------------------------------------------------------
 
-// Free ctx and all owned resources. Safe to call with NULL.
-void slm_destroy(struct slm_ctx * ctx);
+// Open a GGUF, mmap weights, parse the tokenizer. `path` is a
+// filesystem path to a qwen35 architecture Q4_K_M GGUF (e.g.
+// unsloth's release). Returns a non-NULL handle even on parse
+// failure; check `slm_model_loaded()` and `slm_model_error()` to
+// distinguish success from failure.
+struct slm_model * slm_model_load(const char * path);
 
-// Clear the per-context recurrent state (SSM + conv1d rings) so the
-// next generate() starts as if from a fresh conversation. The KV
-// cache is naturally overwritten by the next forward pass and does
-// not need explicit clearing. Use before re-feeding a cumulative
-// conversation prompt in CLI multi-turn mode.
-void slm_reset(struct slm_ctx * ctx);
+// Release the mmap + parsed weights. Safe on NULL. The caller MUST
+// destroy every slm_ctx that still references this model first —
+// the ctx-to-model pointer is borrowed, not refcounted.
+void               slm_model_unload(struct slm_model * model);
 
-// 1 if the GGUF was successfully parsed and weights are usable.
-// 0 if anything during load failed; call slm_get_error() to find
-// out what.
-int slm_loaded(const struct slm_ctx * ctx);
+// true if the model loaded successfully and is usable.
+bool               slm_model_loaded(const struct slm_model * model);
 
-// Returns a NUL-terminated error message describing why load or a
-// previous call failed. Empty string if no error. Lifetime is tied
-// to the ctx; do not free.
-const char * slm_get_error(const struct slm_ctx * ctx);
+// NUL-terminated error message describing why load failed. Empty
+// string when there's no error. Lifetime tied to the model handle.
+const char *       slm_model_error(const struct slm_model * model);
 
 // Encode `text` into token IDs. Allocates an int32_t array sized to
 // the worst-case bound (strlen(text), since byte-level BPE never
@@ -160,11 +159,27 @@ struct slm_ctrl {
 // debug = 1 (visibility chunks on).
 struct slm_ctrl slm_ctrl_defaults(void);
 
+// ---------------------------------------------------------------------------
+// Per-conversation context: one per chat thread / agent run.
+// ---------------------------------------------------------------------------
+
+// Allocate a fresh ctx referencing `model`. `system_prompt` is
+// stored on the ctx (a copy — the caller's storage may go out of
+// scope immediately); pass NULL when there is no system prompt.
+// `ctrl` is copied (NULL → slm_ctrl_defaults()). Returns NULL if
+// the model isn't loaded.
+struct slm_ctx * slm_ctx_create(struct slm_model *      model,
+                                const char *            system_prompt,
+                                const struct slm_ctrl * ctrl);
+
+// Free the per-ctx state. Safe on NULL. Does NOT touch the model.
+void             slm_ctx_destroy(struct slm_ctx * ctx);
+
 // Set / get the ctrl currently stored on `ctx`. `set` copies the
 // struct; the caller's storage can go out of scope immediately.
-void            slm_set_ctrl(struct slm_ctx * ctx,
-                             const struct slm_ctrl * ctrl);
-struct slm_ctrl slm_get_ctrl(const struct slm_ctx * ctx);
+void             slm_set_ctrl(struct slm_ctx * ctx,
+                              const struct slm_ctrl * ctrl);
+struct slm_ctrl  slm_get_ctrl(const struct slm_ctx * ctx);
 
 // Default chat sampler: T=0.7, top_k=40, top_p=0.9, min_p=0.05,
 // rep=1.25, win=64, tools=true, think=false, debug=true. Lifted
@@ -339,14 +354,21 @@ char * slm_chat_format(const struct slm_chat_message * messages,
 // frame advertises the websearch / fetch / distill tools to the
 // model (the Jinja `# Tools` system block). With 0, no tools are
 // listed and the model produces plain content; pairs with
-// `slm_sampler.tools = false` so the runtime's embedded agent loop
-// is also dormant. Subsequent turns (system_prefix NULL) carry no
-// tool advertisement either way — KV holds whatever was advertised
-// on turn 1. Returns NULL if `user_message` is NULL.
+// `slm_ctrl.tools = false` so the runtime's embedded agent loop
+// is also dormant. `effort` ("low" / "medium" / "high" / NULL) is
+// prepended to the FIRST-turn system block as a hint:
+//   "low"    → "(brief: 1-2 sentences)\n\n"
+//   "medium" → no prefix
+//   "high"   → "(think carefully step-by-step before answering)\n\n"
+//   NULL     → same as "medium" (no prefix)
+// Subsequent turns (system_prefix NULL) carry neither tool
+// advertisement nor effort prefix either way — KV holds whatever
+// was advertised on turn 1. Returns NULL if `user_message` is NULL.
 char * slm_chat_format_delta(const char * user_message,
                              const char * system_prefix,
                              int enable_thinking, // bool think
-                             int enable_tools); // bool tools
+                             int enable_tools,    // bool tools
+                             const char * effort);
 
 #ifdef __cplusplus
 }

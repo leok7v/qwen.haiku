@@ -101,7 +101,7 @@ func runChatTest() -> Int32 {
         var textsA = [String](repeating: "", count: chatTestTurns.count)
         var textsB = [String](repeating: "", count: chatTestTurns.count)
         for pass in 0...1 {
-            if pass == 1 { q.reset() }
+            if pass == 1 { q.newConversation() }
             for (t, turn) in chatTestTurns.enumerated() {
                 let framed = ChatTemplate.applyDelta(userMessage: turn)
                 var filter = ChatStreamFilter()
