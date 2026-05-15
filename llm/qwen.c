@@ -2172,3 +2172,126 @@ static inline float rng_uniform(struct rng * r) {
     // 24-bit mantissa, divided to [0, 1).
     return (float)(rng_next(r) >> 40) / (float)(1u << 24);
 }
+
+// ---------------------------------------------------------------------------
+// --self-test: build a tiny synthetic Qwen3.5 model with deterministic
+// weights and run one forward step. Validates the data flow (config →
+// weights → KV cache → forward step → logits) without needing the
+// GGUF file present. CLI-only — library callers don't need it.
+//
+// Lives here next to the forward pass it exercises; `#include`-d into
+// slm.c as part of the single-TU build, and invoked from slm.c's CLI
+// dispatch via `--self-test`.
+__attribute__((unused))
+static int32_t qwen_self_test(void) {
+    // Tiny config: 2 layers, hidden=64, heads=4, head_dim=16, ffn=128,
+    // vocab=256. Just enough to exercise every kernel.
+    struct slm_config cfg = {
+        .n_layers = 2, .n_heads = 4, .n_kv_heads = 2,
+        .head_dim = 16, .hidden_dim = 64,
+        .ffn_dim = 128, .vocab_size = 256,
+        .max_position = 64,
+        .rope_theta = 10000.0f, .norm_eps = 1e-5f,
+        .bos_id = 0, .eos_id = 1,
+    };
+    struct arena * a = arena_new(8 * 1024 * 1024);
+    // Deterministic rng for synth weights.
+    uint32_t s = 1u;
+    #define RNDF() ({ s = s * 1103515245u + 12345u; \
+                      ((float)((s >> 16) & 0x7fff) / 16383.5f - 1.0f) * 0.05f; })
+    // Allocate synthetic fp32 weights (no Q4_K to keep --self-test simple).
+    int32_t hidden = cfg.hidden_dim;
+    int32_t hd     = cfg.head_dim;
+    int32_t nkvh   = cfg.n_kv_heads;
+    int32_t kvh    = nkvh * hd;
+    int32_t ffn    = cfg.ffn_dim;
+    // token_embd: (hidden, vocab)
+    float * tok_embd = (float *)arena_alloc(
+        a, (size_t)hidden * cfg.vocab_size * sizeof(float));
+    for (int32_t i = 0; i < hidden * cfg.vocab_size; i++) tok_embd[i] = RNDF();
+    // output_norm: (hidden,)
+    float * out_norm = (float *)arena_alloc(a, (size_t)hidden * sizeof(float));
+    for (int32_t i = 0; i < hidden; i++) out_norm[i] = 1.0f + RNDF();
+    // Per-layer weights:
+    struct slm_layer_w * layers = (struct slm_layer_w *)oom(
+        calloc(cfg.n_layers, sizeof(struct slm_layer_w)));
+    #define ALLOC_F32(dst, n0, n1) do {                                 \
+        size_t _bytes = (size_t)(n0) * (n1) * sizeof(float);           \
+        float * _p = (float *)arena_alloc(a, _bytes);                   \
+        for (size_t _i = 0; _i < (size_t)(n0)*(n1); _i++) _p[_i] = RNDF(); \
+        (dst).data    = _p;                                             \
+        (dst).type    = GGUF_TT_F32;                                    \
+        (dst).n_dims  = ((n1)==1 ? 1 : 2);                              \
+        (dst).shape[0] = (n0);                                          \
+        (dst).shape[1] = (n1);                                          \
+        (dst).shape[2] = 1;                                             \
+        (dst).shape[3] = 1;                                             \
+    } while (0)
+
+    for (int32_t L = 0; L < cfg.n_layers; L++) {
+        ALLOC_F32(layers[L].attn_norm,  hidden, 1);
+        ALLOC_F32(layers[L].attn_q,     hidden, hidden);
+        ALLOC_F32(layers[L].attn_k,     hidden, kvh);
+        ALLOC_F32(layers[L].attn_v,     hidden, kvh);
+        ALLOC_F32(layers[L].attn_out,   hidden, hidden);
+        ALLOC_F32(layers[L].ffn_norm,   hidden, 1);
+        ALLOC_F32(layers[L].ffn_gate,   hidden, ffn);
+        ALLOC_F32(layers[L].ffn_up,     hidden, ffn);
+        ALLOC_F32(layers[L].ffn_down,   ffn,    hidden);
+    }
+    struct slm_weights W = {0};
+    W.tok_embd.data = tok_embd; W.tok_embd.type = GGUF_TT_F32;
+    W.tok_embd.n_dims = 2; W.tok_embd.shape[0] = hidden;
+    W.tok_embd.shape[1] = cfg.vocab_size;
+    W.tok_embd.shape[2] = 1; W.tok_embd.shape[3] = 1;
+    W.output_norm.data = out_norm; W.output_norm.type = GGUF_TT_F32;
+    W.output_norm.n_dims = 1; W.output_norm.shape[0] = hidden;
+    W.output_norm.shape[1] = 1;
+    W.output_norm.shape[2] = 1; W.output_norm.shape[3] = 1;
+    W.output = W.tok_embd;  // tied
+    W.layers = layers;
+    // Synthetic model + ctx (no GGUF, no mmap — config and weights
+    // are entirely in-memory for this test).
+    struct slm_model m = {0};
+    m.cfg = cfg;
+    m.W   = W;
+    struct slm_ctx c = {0};
+    c.model = &m;
+    c.arena = a;
+    kv_init(&c.kv, cfg.n_layers, cfg.n_kv_heads,
+            cfg.head_dim, cfg.max_position);
+    // Run forward on 3 dummy tokens.
+    int32_t prompt[] = {7, 13, 42};
+    printf("self-test: forward pass for %zu tokens...\n",
+           sizeof(prompt) / sizeof(prompt[0]));
+    int32_t ok = 1;
+    for (size_t i = 0; i < sizeof(prompt) / sizeof(prompt[0]); i++) {
+        struct tensor * logits = slm_forward_step(&c, prompt[i], (int32_t)i);
+        int64_t n = tensor_nelements(logits);
+        if (n != cfg.vocab_size) {
+            fprintf(stderr, "self-test: logits size mismatch: %lld != %d\n",
+                    (long long)n, cfg.vocab_size);
+            ok = 0;
+        }
+        // Check no NaN/Inf.
+        int32_t bad = 0;
+        for (int64_t k = 0; k < n; k++) {
+            float v = logits->data[k];
+            if (!(v == v) || v > 1e30f || v < -1e30f) { bad++; }
+        }
+        if (bad > 0) {
+            fprintf(stderr, "self-test: %d non-finite logits at pos %zu\n",
+                    (int)bad, i);
+            ok = 0;
+        } else {
+            int32_t am = sample_argmax(logits);
+            printf("  pos=%zu tok=%d argmax=%d logit=%.4f\n",
+                   i, prompt[i], (int)am, logits->data[am]);
+        }
+    }
+
+    kv_free(&c.kv);
+    free(layers);
+    arena_free(a);
+    return ok ? 0 : 1;
+}
