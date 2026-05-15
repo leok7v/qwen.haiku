@@ -13,9 +13,9 @@
 CC      = clang
 CFLAGS  = -O3 -std=c17 -Wall -Wextra \
           -Wno-unused-parameter -Wno-missing-braces \
-          -DLLM_CLI -DLLM_USE_ACCELERATE \
+          -DLLM_CLI \
           -fvectorize -fslp-vectorize
-LDFLAGS = -lm -framework Accelerate
+LDFLAGS = -lm
 
 ifeq ($(shell uname -m),arm64)
 CFLAGS += -mcpu=apple-m1

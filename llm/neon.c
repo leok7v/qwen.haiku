@@ -655,6 +655,35 @@ static inline float32x4_t ggml_v_silu(float32x4_t x) {
     return vdivq_f32(x, denom);
 }
 
+// vDSP_sve replacement: sum `n` consecutive fp32 values from `src`,
+// returning the sum as a single fp32. Mirrors the most likely
+// 4-lane-parallel-then-horizontal implementation that Apple's
+// vDSP_sve uses on Apple Silicon: accumulate into a 4-lane register
+// across the contiguous bulk, horizontal-sum at the end, then add a
+// scalar tail for n%4. Verified bit-equal to vDSP_sve(stride=1) on
+// our SSM recurrent state inputs (n=128, multiple-of-4 tail).
+static inline float neon_sum_f32(int n, const float * src) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        acc = vaddq_f32(acc, vld1q_f32(src + i));
+    }
+    float s = vaddvq_f32(acc);
+    for (; i < n; i++) { s += src[i]; }
+    return s;
+}
+
+// vDSP_vmul replacement for fp32 element-wise multiply with strides.
+// Same shape as `vDSP_vmul(A, IA, B, IB, C, IC, N)`. Pure fp32 *,
+// identical bits to scalar `C[i*IC] = A[i*IA] * B[i*IB]`.
+static inline void neon_vmul_strided_f32(const float * a, int sa,
+                                         const float * b, int sb,
+                                         float * c, int sc, int n) {
+    for (int i = 0; i < n; i++) {
+        c[i * sc] = a[i * sa] * b[i * sb];
+    }
+}
+
 // Mirrors ggml_vec_silu_f32: 4-lane SiLU over `n` consecutive floats
 // from `src` into `dst`. Tail (n mod 4) falls back to the same scalar
 // formula libm/ggml use, so the output is bit-identical to ggml's

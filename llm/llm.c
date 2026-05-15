@@ -1920,12 +1920,13 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
         for (int32_t kv = 0; kv < k_hd * v_hd; kv++) { st[kv] *= gh; }
         // 9.2 kv_mem[v] = Σ_k state[k, v] * K[k]
         float kv_mem[128];
-        float prod[128];
+#ifdef LLM_USE_ACCELERATE
+        float prod[128];  // k-contiguous products for vDSP_sve
+#endif
         assert(v_hd <= 128);
         assert(k_hd <= 128);
         for (int32_t v = 0; v < v_hd; v++) {
 #ifdef LLM_USE_ACCELERATE
-            // products into k-contiguous buffer, then vDSP_sve
             vDSP_vmul(st + v, v_hd, K_h, 1, prod, 1, (vDSP_Length)k_hd);
             float r;
             vDSP_sve(prod, 1, &r, (vDSP_Length)k_hd);
