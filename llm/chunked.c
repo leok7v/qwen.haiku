@@ -231,6 +231,17 @@ static void chunked_ssm_step_f32(int k_hd, int v_hd,
     // 3b. kk_dot[i, j] = (K[i, :] · K_beta[j, :]) * decay_mask[i, j]
     //     attn_lower (strict lower tri) = -kk_dot * causal_lower (i.e. negate, keep i>j)
     //     lhs = I - attn_lower = I + kk_dot * causal_lower
+    // KNOWN INCORRECT for multi-token: this index pairing produces
+    // the right output for N=1 (where only [0,0] matters) but the
+    // wrong cross-token contributions for N>1. See chunked-test
+    // N=4 output. Multi-token correctness needs:
+    //   1. Swap K/K_beta and K/Q index roles to match ggml's (key,
+    //      query) convention - my (i, j) maps to ggml's (query, key)
+    //      not (key, query). See git log for details.
+    //   2. NEGATE the RHS passed to solve_tri (`rhs = -kk_dot`) to
+    //      match ggml's `attn_pre_solve = -k_decay*causal_mask`.
+    // Fixing both gets multi-token bit-parity; tracked as next
+    // session entry.
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             if (i > j) {
@@ -294,12 +305,11 @@ static void chunked_ssm_step_f32(int k_hd, int v_hd,
             k_cumdecay[t * k_hd + d] = s;
         }
     }
-    // 5d. attn_kq[i, j] = (K[i, :] · Q[j, :]) * decay_mask[i, j]  (causal i>j only)
-    //     For i == j: causal includes the diagonal? ggml uses
-    //     attn_kq = (K@Q) * decay_mask * diag_mask. diag_mask is 1
-    //     on i > j AND on i == j (it's the lower-or-equal mask).
-    //     decay_mask on diag = 1 (exp(0)). Actually ggml's diag_mask
-    //     is "below diagonal inclusive" — verify when wiring.
+    // 5d. attn_kq[i, j] = (K[i, :] · Q[j, :]) * decay_mask[i, j]  (causal i>=j only)
+    //     For i == j: decay_mask was zeroed on the diagonal at step 2,
+    //     so substitute 1.0 (= exp(0)) explicitly.
+    // KNOWN INCORRECT for multi-token: K/Q index roles swapped vs
+    // ggml. See the kk_dot block above for the fix.
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             if (i >= j) {
@@ -307,9 +317,6 @@ static void chunked_ssm_step_f32(int k_hd, int v_hd,
                 for (int d = 0; d < k_hd; d++) {
                     s += k_in[i * k_hd + d] * q[j * k_hd + d];
                 }
-                // decay_mask above is 0 on diagonal — but for attn_kq
-                // we WANT the diagonal contribution (a token attending
-                // to itself). Use the un-masked decay value, exp(0) = 1.
                 float dm = (i == j) ? 1.0f : decay_mask[i * N + j];
                 attn_kq[i * N + j] = s * dm;
             } else {

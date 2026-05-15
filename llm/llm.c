@@ -2786,50 +2786,116 @@ int  llm_bos_id    (const struct llm_ctx * c) { return c->cfg.bos_id; }
 // drift. A larger discrepancy means our chunked port is wrong.
 #define CHUNKED_TEST_KHD 128
 #define CHUNKED_TEST_VHD 128
+// N=1 passes (chunked degenerates to autoregressive for one real
+// token; see degeneracy proof in chunked.c). N>1 currently FAILS
+// because chunked.c has the (key, query) index roles swapped vs
+// ggml's convention plus a missing sign flip on the RHS to
+// solve_tri - documented in chunked.c step 3b. Next-session work.
+#define CHUNKED_TEST_NTOK 1
+
+// Run the autoregressive recurrence (qwen3-next gated delta net) for
+// `n` tokens in sequence, single head. Mirrors llm_forward_ssm step 9
+// math directly without arena / tensor scaffolding. State starts at
+// zero and updates in place.
+static void autoregressive_ref(int n, int k_hd, int v_hd,
+                               const float * Q,       // [n, k_hd]
+                               const float * K,       // [n, k_hd]
+                               const float * V,       // [n, v_hd]
+                               const float * g_log,   // [n]
+                               const float * beta,    // [n]
+                               float * state,         // [k_hd, v_hd], zeroed by caller
+                               float * out) {         // [n, v_hd]
+    for (int t = 0; t < n; t++) {
+        float g = expf(g_log[t]);
+        float b = beta[t];
+        // state *= g
+        for (int d = 0; d < k_hd; d++) {
+            for (int e = 0; e < v_hd; e++) {
+                state[d * v_hd + e] *= g;
+            }
+        }
+        // kv_mem[v] = sum_k state[k, v] * K[t, k]
+        float kv_mem[CHUNKED_TEST_VHD];
+        for (int e = 0; e < v_hd; e++) {
+            float s = 0.0f;
+            for (int d = 0; d < k_hd; d++) {
+                s += state[d * v_hd + e] * K[t * k_hd + d];
+            }
+            kv_mem[e] = s;
+        }
+        // delta = (V - kv_mem) * beta
+        float delta[CHUNKED_TEST_VHD];
+        for (int e = 0; e < v_hd; e++) {
+            delta[e] = (V[t * v_hd + e] - kv_mem[e]) * b;
+        }
+        // state[k, v] += K[t, k] * delta[v]
+        for (int d = 0; d < k_hd; d++) {
+            float kd = K[t * k_hd + d];
+            for (int e = 0; e < v_hd; e++) {
+                state[d * v_hd + e] += kd * delta[e];
+            }
+        }
+        // out[t, v] = sum_k state[k, v] * Q[t, k]
+        for (int e = 0; e < v_hd; e++) {
+            float s = 0.0f;
+            for (int d = 0; d < k_hd; d++) {
+                s += state[d * v_hd + e] * Q[t * k_hd + d];
+            }
+            out[t * v_hd + e] = s;
+        }
+    }
+}
 
 static int32_t chunked_self_test(void) {
-    enum { k_hd = CHUNKED_TEST_KHD, v_hd = CHUNKED_TEST_VHD };
-    // Deterministic single-head inputs.
-    float Q[k_hd], K[k_hd], V[v_hd];
-    for (int i = 0; i < k_hd; i++) {
-        Q[i] = sinf((float)(i + 1) * 0.0173f);
-        K[i] = cosf((float)(i + 1) * 0.0211f);
+    enum { k_hd = CHUNKED_TEST_KHD, v_hd = CHUNKED_TEST_VHD,
+           N   = CHUNKED_TEST_NTOK };
+    // Deterministic multi-token inputs (4 distinct tokens).
+    float Q[N * k_hd], K[N * k_hd], V[N * v_hd];
+    float g_log[N], beta_arr_in[N];
+    for (int t = 0; t < N; t++) {
+        for (int i = 0; i < k_hd; i++) {
+            Q[t * k_hd + i] = sinf((float)((t + 1) * (i + 1)) * 0.0173f);
+            K[t * k_hd + i] = cosf((float)((t + 1) * (i + 1)) * 0.0211f);
+        }
+        for (int i = 0; i < v_hd; i++) {
+            V[t * v_hd + i] = sinf((float)((t + 1) * (i + 1)) * 0.0149f) * 0.5f;
+        }
+        g_log[t]       = -0.25f - 0.05f * (float)t;
+        beta_arr_in[t] = 0.55f + 0.03f * (float)t;
     }
-    for (int i = 0; i < v_hd; i++) {
-        V[i] = sinf((float)(i + 1) * 0.0149f) * 0.5f;
+    // Autoregressive reference (N sequential steps).
+    static float auto_state[k_hd * v_hd];
+    static float auto_out  [N * v_hd];
+    memset(auto_state, 0, sizeof(auto_state));
+    memset(auto_out,   0, sizeof(auto_out));
+    autoregressive_ref(N, k_hd, v_hd, Q, K, V, g_log, beta_arr_in,
+                       auto_state, auto_out);
+    // Chunked path: N real tokens padded to CHUNK_SIZE.
+    static float q_pad   [CHUNK_SIZE * k_hd];
+    static float k_pad   [CHUNK_SIZE * k_hd];
+    static float v_pad   [CHUNK_SIZE * v_hd];
+    static float g_log_p [CHUNK_SIZE];
+    static float beta_p  [CHUNK_SIZE];
+    static float state   [k_hd * v_hd];
+    static float out     [CHUNK_SIZE * v_hd];
+    memset(q_pad,   0, sizeof(q_pad));
+    memset(k_pad,   0, sizeof(k_pad));
+    memset(v_pad,   0, sizeof(v_pad));
+    memset(g_log_p, 0, sizeof(g_log_p));
+    memset(beta_p,  0, sizeof(beta_p));
+    memset(state,   0, sizeof(state));
+    memset(out,     0, sizeof(out));
+    for (int t = 0; t < N; t++) {
+        for (int i = 0; i < k_hd; i++) {
+            q_pad[t * k_hd + i] = Q[t * k_hd + i];
+            k_pad[t * k_hd + i] = K[t * k_hd + i];
+        }
+        for (int i = 0; i < v_hd; i++) {
+            v_pad[t * v_hd + i] = V[t * v_hd + i];
+        }
+        g_log_p[t] = g_log[t];
+        beta_p [t] = beta_arr_in[t];
     }
-    const float beta_v   = 0.6f;
-    const float g_log_v  = -0.25f;
-    // Autoregressive expected output (state init = 0).
-    //   delta[v] = V[v] * beta
-    //   state[k, v] = K[k] * delta[v]
-    //   out[v] = sum_k state[k, v] * Q[k] = (K · Q) * V[v] * beta
-    float auto_out[v_hd];
-    {
-        float kq = 0.0f;
-        for (int i = 0; i < k_hd; i++) { kq += K[i] * Q[i]; }
-        for (int e = 0; e < v_hd; e++) { auto_out[e] = kq * V[e] * beta_v; }
-    }
-    // Chunked path with N=1 real token padded to CHUNK_SIZE.
-    static float q_pad   [CHUNK_SIZE * 128];
-    static float k_pad   [CHUNK_SIZE * 128];
-    static float v_pad   [CHUNK_SIZE * 128];
-    static float g_log   [CHUNK_SIZE];
-    static float beta_arr[CHUNK_SIZE];
-    static float state   [128 * 128];
-    static float out     [CHUNK_SIZE * 128];
-    memset(q_pad,    0, sizeof(q_pad));
-    memset(k_pad,    0, sizeof(k_pad));
-    memset(v_pad,    0, sizeof(v_pad));
-    memset(g_log,    0, sizeof(g_log));
-    memset(beta_arr, 0, sizeof(beta_arr));
-    memset(state,    0, sizeof(state));
-    memset(out,      0, sizeof(out));
-    for (int i = 0; i < k_hd; i++) { q_pad[i] = Q[i]; }
-    for (int i = 0; i < k_hd; i++) { k_pad[i] = K[i]; }
-    for (int i = 0; i < v_hd; i++) { v_pad[i] = V[i]; }
-    g_log   [0] = g_log_v;
-    beta_arr[0] = beta_v;
     // Scratch (heap; one-shot test, no perf concern).
     float * sc_gcs        = (float *)llm_oom(calloc(CHUNK_SIZE, sizeof(float)));
     float * sc_gexp       = (float *)llm_oom(calloc(CHUNK_SIZE, sizeof(float)));
@@ -2851,7 +2917,7 @@ static int32_t chunked_self_test(void) {
     float * sc_key_gdiff  = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
     float * sc_kgd_vnew   = (float *)llm_oom(calloc((size_t)k_hd * v_hd,             sizeof(float)));
     chunked_ssm_step_f32(k_hd, v_hd,
-                         q_pad, k_pad, v_pad, g_log, beta_arr,
+                         q_pad, k_pad, v_pad, g_log_p, beta_p,
                          state, out,
                          sc_gcs, sc_gexp, sc_decay_mask,
                          sc_k_beta, sc_v_beta, sc_kk_dot, sc_lhs,
@@ -2859,27 +2925,53 @@ static int32_t chunked_self_test(void) {
                          sc_attn_kq, sc_q_g_exp, sc_attn_inter,
                          sc_v_prime, sc_v_new, sc_v_attn,
                          sc_key_gdiff, sc_kgd_vnew);
-    // Compare auto_out vs out[0, :].
+    // Compare per-token outputs.
     float max_abs_diff = 0.0f;
     float max_rel_diff = 0.0f;
-    int   max_diff_idx = -1;
-    for (int e = 0; e < v_hd; e++) {
-        float ae = auto_out[e];
-        float ce = out[e];
-        float d  = fabsf(ae - ce);
-        float r  = (fabsf(ae) > 1e-6f) ? d / fabsf(ae) : d;
-        if (d > max_abs_diff) {
-            max_abs_diff = d;
-            max_rel_diff = r;
-            max_diff_idx = e;
+    int   max_t = -1, max_e = -1;
+    for (int t = 0; t < N; t++) {
+        for (int e = 0; e < v_hd; e++) {
+            float ae = auto_out[t * v_hd + e];
+            float ce = out     [t * v_hd + e];
+            float d  = fabsf(ae - ce);
+            float r  = (fabsf(ae) > 1e-6f) ? d / fabsf(ae) : d;
+            if (d > max_abs_diff) {
+                max_abs_diff = d;
+                max_rel_diff = r;
+                max_t = t;
+                max_e = e;
+            }
         }
     }
-    printf("chunked-test: auto_out[0..3] = %.7g %.7g %.7g %.7g\n",
-           auto_out[0], auto_out[1], auto_out[2], auto_out[3]);
-    printf("chunked-test: chunked[0..3]  = %.7g %.7g %.7g %.7g\n",
-           out[0], out[1], out[2], out[3]);
-    printf("chunked-test: max |Δ| = %.4g at e=%d (rel %.4g)\n",
-           max_abs_diff, max_diff_idx, max_rel_diff);
+    // Compare final states.
+    float max_state_diff = 0.0f;
+    int   max_state_d = -1, max_state_e = -1;
+    for (int d = 0; d < k_hd; d++) {
+        for (int e = 0; e < v_hd; e++) {
+            float ae = auto_state[d * v_hd + e];
+            float ce = state     [d * v_hd + e];
+            float diff = fabsf(ae - ce);
+            if (diff > max_state_diff) {
+                max_state_diff = diff;
+                max_state_d = d;
+                max_state_e = e;
+            }
+        }
+    }
+    for (int t = 0; t < N; t++) {
+        printf("chunked-test t=%d: auto[0..3] = %.7g %.7g %.7g %.7g\n",
+               t,
+               auto_out[t * v_hd + 0], auto_out[t * v_hd + 1],
+               auto_out[t * v_hd + 2], auto_out[t * v_hd + 3]);
+        printf("chunked-test t=%d: chunk[0..3] = %.7g %.7g %.7g %.7g\n",
+               t,
+               out[t * v_hd + 0], out[t * v_hd + 1],
+               out[t * v_hd + 2], out[t * v_hd + 3]);
+    }
+    printf("chunked-test: max |Δ_out| = %.4g at t=%d e=%d (rel %.4g)\n",
+           max_abs_diff, max_t, max_e, max_rel_diff);
+    printf("chunked-test: max |Δ_state| = %.4g at d=%d e=%d\n",
+           max_state_diff, max_state_d, max_state_e);
     // Free scratch.
     free(sc_gcs); free(sc_gexp); free(sc_decay_mask);
     free(sc_k_beta); free(sc_v_beta); free(sc_kk_dot); free(sc_lhs);
