@@ -82,7 +82,7 @@ int llm_tokenize(struct llm_ctx * ctx, const char * text,
 // control llm_generate's behaviour (tool dispatch / reasoning /
 // debug visibility chunks). Zero-initialized struct = greedy
 // (argmax) + tools off + no reasoning + no debug. Prefer
-// llm_sampler() below for the chat-tuned defaults.
+// llm_sampler_defaults() below for the chat-tuned defaults.
 struct llm_sampler {
     float    temperature;        // 0 = greedy; >0 = softmax temperature
     int      top_k;              // 0 or 1 = greedy; >1 = keep top k
@@ -97,7 +97,7 @@ struct llm_sampler {
                                  // emitted in this generate() call so
                                  // far; >0 = only the last N.
     // Feature toggles (additional controls, default true / false /
-    // true via llm_sampler()):
+    // true via llm_sampler_defaults()):
     bool     tools;              // enable embedded agent dispatch in
                                  // llm_generate. With false, the
                                  // <tool_call> / </tool_call> markers
@@ -124,7 +124,15 @@ struct llm_sampler {
 // from im.ai's Sampler.swift defaults — empirically the best fit
 // for Qwen3.5-0.8B in chat + tools mode. The CLI hardcodes this;
 // callers can override individual fields.
-struct llm_sampler llm_sampler(void);
+//
+// Function name intentionally differs from the struct tag: when
+// the C struct and a function share a name, Clang imports BOTH
+// into Swift under the same identifier, and `llm_sampler(field:
+// value, ...)` at a Swift call site silently resolves to the C
+// function (which takes no args and returns hard-coded defaults
+// — including `tools = true`) instead of the struct's memberwise
+// init. The defaults then overrode whatever the caller passed.
+struct llm_sampler llm_sampler_defaults(void);
 
 // ---------------------------------------------------------------------------
 // <think>...</think> stream filter (C side, server-side state machine)

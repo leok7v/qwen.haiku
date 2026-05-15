@@ -1,32 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-//
-// ModelDownloader.swift - fetch the Qwen3.5-0.8B Q4_K_M GGUF into a
-// per-app sandbox Application-Support directory, resumable across
-// launches AND not purgeable by macOS.
-//
-// Storage location:
-//   * macOS sandboxed:   ~/Library/Containers/<bundle>/Data/Library/
-//                         Application Support/Qwen/
-//   * macOS unsandboxed: ~/Library/Application Support/Qwen/
-//   * iOS:               <app sandbox>/Library/Application Support/Qwen/
-// We use `FileManager.urls(for: .applicationSupportDirectory, ...)`,
-// same code path on both platforms; the OS picks the right container.
-//
-// History: this used to be `.cachesDirectory`, which IS sandboxed but
-// is also explicitly eviction-eligible — macOS purges it under disk
-// pressure and the user has to re-download 508 MB. The motivating
-// rationale ("OS evicts; we re-download") proved hostile in practice.
-// We now use `.applicationSupportDirectory` (not purgeable) AND set
-// `isExcludedFromBackupKey` on the file so Time Machine / iCloud
-// doesn't haul the GGUF around either. A one-shot migration moves
-// any leftover GGUF out of the old Caches location on first launch
-// so existing users don't re-download.
-//
-// Resumability: the URL.swift extension writes a sidecar `.<name>.meta`
-// file holding the expected size; subsequent calls notice the partial
-// file matches that size and skip re-download. The download itself is
-// a single URLSession download task, no chunking yet.
-
 import Foundation
 
 public struct QwenModel: Sendable {
@@ -49,7 +20,7 @@ public struct QwenModel: Sendable {
         name: "Qwen3.5-0.8B-Q4_K_M.gguf",
         remoteURL: URL(string:
             "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/" +
-            "Qwen3.5-0.8B-Q4_K_M.gguf?download=true")!,
+            "Qwen3.5-0.8B-Q4_K_M.gguf")!,
         expectedSize: 532_517_120  // ~508 MiB
     )
 
@@ -61,7 +32,7 @@ public struct QwenModel: Sendable {
 
 }
 
-public enum ModelDownloaderError: Error, CustomStringConvertible {
+public enum DownloaderError: Error, CustomStringConvertible {
 
     case cacheDirectoryUnavailable
     case downloadFailed(Error)
@@ -77,7 +48,7 @@ public enum ModelDownloaderError: Error, CustomStringConvertible {
 
 }
 
-public final class ModelDownloader {
+public final class Downloader {
 
     public typealias Progress = @Sendable (_ done: Int64, _ total: Int64) -> Bool
 
@@ -92,38 +63,13 @@ public final class ModelDownloader {
         let fm = FileManager.default
         guard let base = fm.urls(for: .applicationSupportDirectory,
                                  in: .userDomainMask).first else {
-            throw ModelDownloaderError.cacheDirectoryUnavailable
+            throw DownloaderError.cacheDirectoryUnavailable
         }
         let dir = base.appendingPathComponent("Qwen", isDirectory: true)
         if !dir.exist() {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         self.folder = dir
-        ModelDownloader.migrateFromCaches(model: model,
-                                          destFolder: dir,
-                                          fm: fm)
-    }
-
-    /// One-shot migration: if a fully-downloaded GGUF still exists in
-    /// the old `.cachesDirectory/Qwen/` location, move it into the
-    /// new Application-Support folder so the user doesn't have to
-    /// re-download. Silent best-effort; failures fall through and
-    /// the normal download path kicks in. Does nothing once the new
-    /// folder already holds the file.
-    private static func migrateFromCaches(model:      QwenModel,
-                                          destFolder: URL,
-                                          fm:         FileManager) {
-        let dest = destFolder.appendingPathComponent(model.name)
-        if dest.exist() { return }
-        guard let cachesBase = fm.urls(for: .cachesDirectory,
-                                       in: .userDomainMask).first
-        else { return }
-        let src = cachesBase
-            .appendingPathComponent("Qwen", isDirectory: true)
-            .appendingPathComponent(model.name)
-        if src.exist() && src.fileSize() == model.expectedSize {
-            try? fm.moveItem(at: src, to: dest)
-        }
     }
 
     /// Local URL where the GGUF will be (or already is) stored.
@@ -148,7 +94,7 @@ public final class ModelDownloader {
                 try await model.remoteURL.download(
                     folder, model.name, model.expectedSize, progress)
             } catch {
-                throw ModelDownloaderError.downloadFailed(error)
+                throw DownloaderError.downloadFailed(error)
             }
         }
         // Mark the GGUF as not-for-backup so Time Machine and iCloud

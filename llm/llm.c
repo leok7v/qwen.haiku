@@ -67,7 +67,7 @@
 // before top-K filtering, while we normalize over the top-K survivors
 // (which represent ~99% of probability mass for typical Qwen logits,
 // so the top-P cutoff shifts by <1% in practice).
-struct llm_sampler llm_sampler(void) {
+struct llm_sampler llm_sampler_defaults(void) {
     struct llm_sampler s;
     s.temperature        = 0.7f;
     s.top_k              = 40;
@@ -1818,7 +1818,7 @@ static int32_t run_chat_test(int32_t max_new) {
         "Thanks!"
     };
     enum { N_TURNS = 3 };
-    struct llm_sampler sp = llm_sampler();
+    struct llm_sampler sp = llm_sampler_defaults();
     uint64_t seed = 42;
     struct llm_ctx * c = llm_create(llm_cli_gguf_path());
     int32_t r = 0;
@@ -2002,7 +2002,7 @@ int main(int argc, char ** argv) {
     // (temp 0.7, top_k 40, top_p 0.9, min_p 0.05, rep 1.25, win 64).
     // Empirically the best fit for Qwen3.5-0.8B in chat + tools mode.
     // Individual flags below can override any field.
-    struct llm_sampler sp = llm_sampler();
+    struct llm_sampler sp = llm_sampler_defaults();
     uint64_t seed         = 0;          // 0 = derive from wall clock
     int32_t  max_new      = 64;
     int32_t  max_iters    = 4;          // agent-loop cap (--ask)

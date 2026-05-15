@@ -1448,7 +1448,7 @@ int g_no_q8k_rt = 0;
 // token-level parity mode, which survives ULP drift across
 // perf rewrites that change the underlying logits but keep the
 // argmax stable.
-static int g_trace_tokens = 0;
+static int g_trace_tokens = 1;
 __attribute__((unused)) static int g_min_new = 0;
 
 // DUMP(label, data, n) - one-line dump-when-this-layer-is-selected.
