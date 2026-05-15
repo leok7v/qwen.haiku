@@ -28,6 +28,7 @@
 
 #include "tensor.c"
 #include "llm.h"
+#include "jinja-template.c"
 
 #ifdef LLM_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>
@@ -3832,31 +3833,20 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
         // tokenize a bare `<|im_start|>user\n{Q}<|im_end|>\n` +
         // assistant gen header. llm_generate advances c->pos so the
         // next call's prefill writes into KV at the correct offset.
-        struct chars delta = {0};
         int32_t * ids = (int32_t *)llm_oom(calloc(16384, sizeof(int32_t)));
         for (int32_t t = 0; t < n_prompts && r == 0; t++) {
-            delta.count = 0;
-            if (delta.data != NULL) { delta.data[0] = '\0'; }
-            chars_put(&delta, "<|im_start|>user\n", 17);
-            if (t == 0 && system_prompt != NULL && system_prompt[0] != '\0') {
-                chars_put(&delta, system_prompt,
-                          (int32_t)strlen(system_prompt));
-                chars_put(&delta, "\n\n", 2);
-            }
-            chars_put(&delta, prompts[t],
-                      (int32_t)strlen(prompts[t]));
-            chars_put(&delta,
-                      "<|im_end|>\n<|im_start|>assistant\n"
-                      "<think>\n\n</think>\n\n",
-                      52);
-            chars_put(&delta, "", 0);  // null-term
+            // Build this turn's delta via jinja-template.c. On turn 0
+            // we pass system_prompt as the inline prefix; subsequent
+            // turns get NULL so the prefix block isn't repeated.
+            const char * sys = (t == 0) ? system_prompt : NULL;
+            char * delta_str = jinja_apply_delta(prompts[t], sys, 0);
             printf("\n--- turn %d/%d ---\n", (int)(t + 1), (int)n_prompts);
             if (t == 0 && system_prompt != NULL && system_prompt[0] != '\0') {
                 printf("[system inline] %s\n", system_prompt);
             }
             printf("[user] %s\n[assistant] ", prompts[t]);
             fflush(stdout);
-            int32_t nids = tok_encode(&c->tok, delta.data, ids, 16384);
+            int32_t nids = tok_encode(&c->tok, delta_str, ids, 16384);
             struct chars reply = {0};
             llm_generate(c, ids, nids, max_new, g_min_new, sp, seed,
                          capture_cb, &reply);
@@ -3880,9 +3870,9 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
                     llm_tg_per_sec(c), (int)llm_n_generated(c),
                     (int)c->pos);
             chars_free(&reply);
+            free(delta_str);
         }
         free(ids);
-        chars_free(&delta);
     }
     llm_destroy(c);
     return r;
@@ -3947,21 +3937,11 @@ static int32_t run_chat_test(int32_t max_new) {
             // Reset before pass 1; pass 0 starts from a fresh ctx so
             // the SSM state and pos are already zeroed by llm_create.
             if (pass == 1) { llm_reset(c); }
-            struct chars delta = {0};
             for (int32_t t = 0; t < N_TURNS && r == 0; t++) {
                 struct chat_test_capture * cap = &caps[t];
                 cap->hash = 0xcbf29ce484222325ULL;
-                delta.count = 0;
-                if (delta.data != NULL) { delta.data[0] = '\0'; }
-                chars_put(&delta, "<|im_start|>user\n", 17);
-                chars_put(&delta, turns[t],
-                          (int32_t)strlen(turns[t]));
-                chars_put(&delta,
-                          "<|im_end|>\n<|im_start|>assistant\n"
-                          "<think>\n\n</think>\n\n",
-                          52);
-                chars_put(&delta, "", 0);
-                int32_t nids = tok_encode(&c->tok, delta.data,
+                char * delta_str = jinja_apply_delta(turns[t], NULL, 0);
+                int32_t nids = tok_encode(&c->tok, delta_str,
                                           ids, 16384);
                 int32_t gen = llm_generate(c, ids, nids, max_new,
                                            g_min_new, &sp, seed,
@@ -3973,8 +3953,8 @@ static int32_t run_chat_test(int32_t max_new) {
                         (int)pass, (int)(t + 1), (int)gen,
                         (unsigned long long)cap->hash,
                         (int)c->pos);
+                free(delta_str);
             }
-            chars_free(&delta);
         }
         free(ids);
         int32_t mismatch = -1;
@@ -4100,6 +4080,10 @@ int main(int argc, char ** argv) {
             mode = 4;
         } else if (strcmp(argv[i], "--chat-test") == 0) {
             mode = 6;
+        } else if (strcmp(argv[i], "--print-chat-template") == 0) {
+            mode = 7;
+        } else if (strcmp(argv[i], "--jinja-test") == 0) {
+            mode = 8;
         } else if ((strcmp(argv[i], "-p") == 0 ||
                     strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
             if (chat_n < LLM_CLI_MAX_TURNS) {
@@ -4171,6 +4155,18 @@ int main(int argc, char ** argv) {
         }
     } else if (mode == 6) {
         rc = run_chat_test(max_new);
+    } else if (mode == 7) {
+        struct llm_ctx * c = llm_create(llm_cli_gguf_path());
+        if (!c->loaded) {
+            fprintf(stderr, "llm: load failed: %s\n", llm_get_error(c));
+            rc = 1;
+        } else {
+            const char * tpl = llm_chat_template(c);
+            if (tpl != NULL) { fputs(tpl, stdout); }
+        }
+        llm_destroy(c);
+    } else if (mode == 8) {
+        rc = jinja_self_test();
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  llm --self-test\n"
@@ -4179,6 +4175,8 @@ int main(int argc, char ** argv) {
                "  llm --chat -p \"turn1\" [-p \"turn2\" ...] "
                        "[-sys \"system prompt\"] [sampler flags]\n"
                "  llm --chat-test [--max-new N]\n"
+               "  llm --jinja-test\n"
+               "  llm --print-chat-template\n"
                "\n"
                "sampler flags:\n"
                "  --preset {default|im_ai|greedy}   load named preset\n"

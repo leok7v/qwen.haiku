@@ -16,6 +16,7 @@
 			membershipExceptions = (
 				Makefile,
 				chunked.c,
+				jinja-template.c,
 				neon.c,
 				tensor.c,
 			);
