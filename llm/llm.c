@@ -3017,6 +3017,25 @@ struct llm_sampler llm_sampler_default(void) {
     return s;
 }
 
+// Sampler chain order (sample_with below): penalties -> temperature
+// (softmax-with-T on top-K logits) -> top-P -> min-P -> distribution.
+// Matches im.ai's `Sampler.swift` ordering (see comment block at
+// im.ai/src/model/Sampler.swift:19-32 for the rationale). One subtle
+// difference: im.ai normalizes the softmax over the FULL vocabulary
+// before top-K filtering, while we normalize over the top-K survivors
+// (which represent ~99% of probability mass for typical Qwen logits,
+// so the top-P cutoff shifts by <1% in practice).
+struct llm_sampler llm_sampler_im_ai(void) {
+    struct llm_sampler s;
+    s.temperature        = 0.7f;
+    s.top_k              = 40;
+    s.top_p              = 0.9f;
+    s.min_p              = 0.05f;
+    s.repetition_penalty = 1.25f;
+    s.repetition_window  = 64;
+    return s;
+}
+
 // Apply repetition penalty in-place to `logits`: any token id that
 // appears in the recent-history window is scaled by /penalty
 // (positive logits become less likely) or *penalty (negative logits
@@ -3979,6 +3998,21 @@ int main(int argc, char ** argv) {
         } else if ((strcmp(argv[i], "-sys") == 0 ||
                     strcmp(argv[i], "--system") == 0) && i + 1 < argc) {
             system_prompt = argv[++i];
+        } else if (strcmp(argv[i], "--preset") == 0 && i + 1 < argc) {
+            const char * pn = argv[++i];
+            if (strcmp(pn, "default") == 0) {
+                sp = llm_sampler_default();
+            } else if (strcmp(pn, "im_ai") == 0 || strcmp(pn, "im-ai") == 0) {
+                sp = llm_sampler_im_ai();
+            } else if (strcmp(pn, "greedy") == 0) {
+                memset(&sp, 0, sizeof(sp));
+                sp.repetition_penalty = 1.0f;
+                sp.repetition_window  = 64;
+            } else {
+                fprintf(stderr,
+                        "llm: unknown --preset '%s'"
+                        " (default|im_ai|greedy)\n", pn);
+            }
         } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
             sp.temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
@@ -4024,10 +4058,20 @@ int main(int argc, char ** argv) {
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  llm --self-test\n"
-               "  llm --single \"prompt\" [--max-new N] [--temperature T]\n"
-               "  llm --repl [--max-new N] [--temperature T]\n"
+               "  llm --single \"prompt\" [--max-new N] [sampler flags]\n"
+               "  llm --repl [--max-new N] [sampler flags]\n"
                "  llm --chat -p \"turn1\" [-p \"turn2\" ...] "
-                       "[-sys \"system prompt\"] [sampler flags]\n");
+                       "[-sys \"system prompt\"] [sampler flags]\n"
+               "\n"
+               "sampler flags:\n"
+               "  --preset {default|im_ai|greedy}   load named preset\n"
+               "  --temperature T                   0 = greedy, >0 = softmax T\n"
+               "  --top-k K                         keep K best logits\n"
+               "  --top-p P                         nucleus cutoff in (0,1)\n"
+               "  --min-p P                         keep prob >= P * top_prob\n"
+               "  --rep-penalty F                   1.0 = off, 1.05-1.3 typical\n"
+               "  --rep-window N                    history window for rep penalty\n"
+               "  --seed S                          0 = wall-clock derived\n");
         rc = 0;
     }
     return rc;

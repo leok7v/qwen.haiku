@@ -99,6 +99,12 @@ struct llm_sampler {
 // Roughly matches Qwen3.5 non-thinking recommended sampling.
 struct llm_sampler llm_sampler_default(void);
 
+// im.ai conversational preset: T=0.7, top_k=40, top_p=0.9, min_p=0.05,
+// rep=1.25, win=64. Values lifted from im.ai's Sampler.swift defaults
+// (well-tuned for back-and-forth chat — tighter filters and stronger
+// repetition penalty than the Qwen3.5 card's recommendation).
+struct llm_sampler llm_sampler_im_ai(void);
+
 // Run inference: prefill the prompt token ids, then sample up to
 // `max_new` tokens, calling `cb(decoded_piece, user)` once per
 // generated token. Stops early on EOS or when `cb` returns non-zero.
