@@ -54,6 +54,12 @@
 #include <time.h>
 #include <unistd.h>
 
+// Small dependency-free utilities shared with the rest of the
+// project (struct arr / chars + arr_grow / oom / chars_put / ...).
+// Brought in here so qwen.c below can use them; the duplicates that
+// used to live at the top of qwen.c are gone.
+#include "utils/chars.c"      // transitively pulls in utils/arrays.c
+
 #include "qwen.c"
 #include "jinja-template.c"
 #include "tools.c"
@@ -218,7 +224,7 @@ static int32_t sample_with(struct tensor * logits,
 
 struct llm_ctx * llm_create(const char * path) {
     struct llm_ctx * c =
-        (struct llm_ctx *)llm_oom(calloc(1, sizeof(struct llm_ctx)));
+        (struct llm_ctx *)oom(calloc(1, sizeof(struct llm_ctx)));
     if (gguf_open(&c->gguf, path) != 0) {
         snprintf(c->err, sizeof(c->err), "gguf open failed");
         return c;
@@ -385,7 +391,7 @@ static int llm_generate_raw(struct llm_ctx * c,
     // model is discouraged from immediately echoing the input back,
     // plus everything it generates in this call. Capacity grows on
     // demand (single realloc up front sized for the worst case).
-    int32_t * history = (int32_t *)llm_oom(
+    int32_t * history = (int32_t *)oom(
         calloc((size_t)(prompt_n + max_new + 1), sizeof(int32_t)));
     int32_t   hist_n  = 0;
     for (int32_t i = 0; i < prompt_n; i++) { history[hist_n++] = prompt_ids[i]; }
@@ -1220,25 +1226,25 @@ static int32_t chunked_self_test(void) {
         beta_p [t] = beta_arr_in[t];
     }
     // Scratch (heap; one-shot test, no perf concern).
-    float * sc_gcs        = (float *)llm_oom(calloc(CHUNK_SIZE, sizeof(float)));
-    float * sc_gexp       = (float *)llm_oom(calloc(CHUNK_SIZE, sizeof(float)));
-    float * sc_decay_mask = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
-    float * sc_k_beta     = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
-    float * sc_v_beta     = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
-    float * sc_kk_dot     = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
-    float * sc_lhs        = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
-    float * sc_attn       = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
-    float * sc_v_eff      = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
-    float * sc_kbeta_gexp = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
-    float * sc_k_cumdecay = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
-    float * sc_attn_kq    = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
-    float * sc_q_g_exp    = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
-    float * sc_attn_inter = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
-    float * sc_v_prime    = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
-    float * sc_v_new      = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
-    float * sc_v_attn     = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
-    float * sc_key_gdiff  = (float *)llm_oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
-    float * sc_kgd_vnew   = (float *)llm_oom(calloc((size_t)k_hd * v_hd,             sizeof(float)));
+    float * sc_gcs        = (float *)oom(calloc(CHUNK_SIZE, sizeof(float)));
+    float * sc_gexp       = (float *)oom(calloc(CHUNK_SIZE, sizeof(float)));
+    float * sc_decay_mask = (float *)oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_k_beta     = (float *)oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_v_beta     = (float *)oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_kk_dot     = (float *)oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_lhs        = (float *)oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_attn       = (float *)oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_v_eff      = (float *)oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_kbeta_gexp = (float *)oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_k_cumdecay = (float *)oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_attn_kq    = (float *)oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_q_g_exp    = (float *)oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_attn_inter = (float *)oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_v_prime    = (float *)oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_v_new      = (float *)oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_v_attn     = (float *)oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_key_gdiff  = (float *)oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_kgd_vnew   = (float *)oom(calloc((size_t)k_hd * v_hd,             sizeof(float)));
     // Run the kernel with the actual N (dynamic chunk size — exercises
     // the same path that llm_forward_ssm_batch takes for partial tail
     // chunks).
@@ -1404,7 +1410,7 @@ int llm_generate(struct llm_ctx * c,
     int total_gen = 0;
     int done      = 0;
     int32_t * cur_ids =
-        (int32_t *)llm_oom(calloc((size_t)(prompt_n > 0 ? prompt_n : 1),
+        (int32_t *)oom(calloc((size_t)(prompt_n > 0 ? prompt_n : 1),
                                   sizeof(int32_t)));
     if (prompt_n > 0) {
         memcpy(cur_ids, prompt_ids,
@@ -1496,7 +1502,7 @@ int llm_generate(struct llm_ctx * c,
                 "<|im_start|>assistant\n<think>\n\n</think>\n\n";
             chars_put(&inject, tail, strlen(tail));
             chars_put(&inject, "", 0);
-            int32_t * ids = (int32_t *)llm_oom(
+            int32_t * ids = (int32_t *)oom(
                 calloc(16384, sizeof(int32_t)));
             int n_ids = tok_encode(&c->tok, inject.data,
                                    ids, 16384);
@@ -1550,7 +1556,7 @@ static int32_t llm_self_test(void) {
     float * out_norm = (float *)arena_alloc(a, (size_t)hidden * sizeof(float));
     for (int32_t i = 0; i < hidden; i++) out_norm[i] = 1.0f + RNDF();
     // Per-layer weights:
-    struct llm_layer_w * layers = (struct llm_layer_w *)llm_oom(
+    struct llm_layer_w * layers = (struct llm_layer_w *)oom(
         calloc(cfg.n_layers, sizeof(struct llm_layer_w)));
     #define ALLOC_F32(dst, n0, n1) do {                                 \
         size_t _bytes = (size_t)(n0) * (n1) * sizeof(float);           \
@@ -1722,7 +1728,7 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
         // tokenize a bare `<|im_start|>user\n{Q}<|im_end|>\n` +
         // assistant gen header. llm_generate advances c->pos so the
         // next call's prefill writes into KV at the correct offset.
-        int32_t * ids = (int32_t *)llm_oom(calloc(16384, sizeof(int32_t)));
+        int32_t * ids = (int32_t *)oom(calloc(16384, sizeof(int32_t)));
         for (int32_t t = 0; t < n_prompts && r == 0; t++) {
             // Build this turn's delta via jinja-template.c. On turn 0
             // we pass system_prompt as the inline prefix; subsequent
@@ -1828,7 +1834,7 @@ static int32_t run_chat_test(int32_t max_new) {
     } else {
         struct chat_test_capture caps_a[N_TURNS] = {0};
         struct chat_test_capture caps_b[N_TURNS] = {0};
-        int32_t * ids = (int32_t *)llm_oom(calloc(16384,
+        int32_t * ids = (int32_t *)oom(calloc(16384,
                                                   sizeof(int32_t)));
         for (int32_t pass = 0; pass < 2 && r == 0; pass++) {
             struct chat_test_capture * caps = (pass == 0) ? caps_a : caps_b;

@@ -27,69 +27,27 @@ static double llm_monotonic_seconds(void) {
 
 // CLI-only fallback path. Library callers (Swift, Obj-C, etc.) pass
 // their own path to llm_create(). The CLI reads QWEN_GGUF env var
-// first and falls back to this constant if unset. The default points
-// at the macOS sandbox cache the app uses, so a one-off CLI run on
-// the dev machine works without exporting the env var. Override with
-// QWEN_GGUF when running elsewhere.
+// first and falls back to this constant if unset. Points at the
+// macOS sandbox Application-Support folder the Swift app uses
+// (NOT Caches — Caches is purgeable; the app migrated to
+// Application Support on 2026-05-15 so the model survives reboots
+// and "Optimize Mac Storage" sweeps). Override with QWEN_GGUF when
+// running elsewhere.
 #ifdef LLM_CLI
 static const char * LLM_GGUF_PATH_DEFAULT =
     "/Users/leo/Library/Containers/io.github.leok7v.QwenHaiku/Data/"
-    "Library/Caches/Qwen/Qwen3.5-0.8B-Q4_K_M.gguf";
+    "Library/Application Support/Qwen/Qwen3.5-0.8B-Q4_K_M.gguf";
 #endif
 
+// struct arr / chars and their arr_grow / chars_* helpers live in
+// `utils/arrays.c` + `utils/chars.c`, which llm.c #include's BEFORE
+// this file. Reuse them. The `oom(p)` wrapper there matches the
+// llm_oom semantics qwen used to define inline (warn on stderr,
+// abort on NULL).
+
 // ---------------------------------------------------------------------------
-// chars / arr / map primitives - small dependency-free utilities.
+// String → int32 hashmap. Simple open-addressing.
 // ---------------------------------------------------------------------------
-
-struct arr {
-    void * data;
-    size_t count;
-    size_t capacity;
-};
-
-static inline void * llm_oom(void * a) {
-    if (a == NULL) {
-        fprintf(stderr, "llm: OOM\n");
-        abort();
-    }
-    return a;
-}
-
-static inline void arr_grow(struct arr * a, size_t esize, size_t need) {
-    if (a->data == NULL) {
-        a->capacity = need;
-        a->data = llm_oom(malloc(need * esize));
-    } else if (need > a->capacity) {
-        a->capacity = need * 2;
-        a->data = llm_oom(realloc(a->data, a->capacity * esize));
-    }
-}
-
-struct chars {
-    char * data;
-    size_t count;
-    size_t capacity;
-};
-
-static inline void chars_grow(struct chars * s, size_t need) {
-    arr_grow((struct arr *)s, 1, need);
-}
-
-static inline void chars_put(struct chars * s, const char * d, size_t n) {
-    chars_grow(s, s->count + n + 1);
-    memcpy(s->data + s->count, d, n);
-    s->count += n;
-    s->data[s->count] = '\0';
-}
-
-static inline void chars_free(struct chars * s) {
-    free(s->data);
-    s->data = NULL;
-    s->count = 0;
-    s->capacity = 0;
-}
-
-// String hashmap (chars -> int32). Simple open-addressing.
 struct s2i_entry {
     struct chars key;
     int32_t      val;
@@ -113,7 +71,7 @@ static uint64_t s2i_hash(const char * d, size_t n) {
 
 static void s2i_grow(struct s2i * m, size_t new_cap) {
     struct s2i_entry * ns =
-        (struct s2i_entry *)llm_oom(calloc(new_cap,
+        (struct s2i_entry *)oom(calloc(new_cap,
                                            sizeof(struct s2i_entry)));
     size_t mask = new_cap - 1;
     for (size_t i = 0; i < m->capacity; i++) {
@@ -367,7 +325,7 @@ static int gguf_open(struct gguf * g, const char * path) {
     g->n_tensors = gr_u64(g->base, &c);
     g->n_kv      = gr_u64(g->base, &c);
     const size_t kv_bytes = sizeof(struct gguf_kv);
-    g->kvs = (struct gguf_kv *)llm_oom(calloc((size_t)g->n_kv, kv_bytes));
+    g->kvs = (struct gguf_kv *)oom(calloc((size_t)g->n_kv, kv_bytes));
     for (uint64_t i = 0; i < g->n_kv; i++) {
         struct gguf_kv * kv = &g->kvs[i];
         kv->key = gr_str(g->base, &c);
@@ -395,7 +353,7 @@ static int gguf_open(struct gguf * g, const char * path) {
         }
     }
     const size_t t_bytes = sizeof(struct gguf_tensor);
-    g->tensors = (struct gguf_tensor *)llm_oom(calloc((size_t)g->n_tensors,
+    g->tensors = (struct gguf_tensor *)oom(calloc((size_t)g->n_tensors,
                                                        t_bytes));
     for (uint64_t i = 0; i < g->n_tensors; i++) {
         struct gguf_tensor * t = &g->tensors[i];
@@ -809,7 +767,7 @@ static int32_t tok_load(struct tokenizer * t, const struct gguf * g,
         fprintf(stderr, "tok: missing tokenizer.ggml.tokens (str array)\n");
         return -1;
     }
-    t->vocab_strs = (struct chars *)llm_oom(
+    t->vocab_strs = (struct chars *)oom(
         calloc((size_t)t->vocab_size, sizeof(struct chars)));
     size_t c = 0;
     for (uint64_t i = 0; i < tk->v.arr_n; i++) {
@@ -907,7 +865,7 @@ static int32_t tok_encode_bpe(const struct tokenizer * t,
 
         // Build initial token list: one entry per UTF-8 byte, each
         // mapped through bytes-to-unicode.
-        struct chars * toks = (struct chars *)llm_oom(
+        struct chars * toks = (struct chars *)oom(
             calloc(word_len, sizeof(struct chars)));
         int32_t n_toks = 0;
         for (size_t i = 0; i < word_len; i++) {
@@ -1114,7 +1072,7 @@ static int32_t llm_load_weights(const struct gguf * g,
     // output.weight is optional; absent => tied embeddings.
     llm_resolve_tensor(g, "output.weight", &w->output, 0);
     if (w->output.data == NULL) { w->output = w->tok_embd; }
-    w->layers = (struct llm_layer_w *)llm_oom(
+    w->layers = (struct llm_layer_w *)oom(
         calloc((size_t)cfg->n_layers, sizeof(struct llm_layer_w)));
     char nm[64];
     for (int32_t L = 0; L < cfg->n_layers; L++) {
@@ -1283,9 +1241,9 @@ static int32_t kv_init(struct llm_kv * c, int32_t n_layers, int32_t n_kv_heads,
     c->max_position = max_position;
     c->used         = 0;
     size_t per_layer = (size_t)max_position * n_kv_heads * head_dim;
-    c->k = (_Float16 *)llm_oom(calloc((size_t)n_layers * per_layer,
+    c->k = (_Float16 *)oom(calloc((size_t)n_layers * per_layer,
                                       sizeof(_Float16)));
-    c->v = (_Float16 *)llm_oom(calloc((size_t)n_layers * per_layer,
+    c->v = (_Float16 *)oom(calloc((size_t)n_layers * per_layer,
                                       sizeof(_Float16)));
     return 0;
 }
@@ -1354,9 +1312,9 @@ static int32_t ssm_cache_init(struct llm_ssm_cache * s,
         size_t sb = (size_t)s->n_layers * cfg->linear_n_heads *
                     cfg->linear_k_head_dim * cfg->linear_v_head_dim *
                     sizeof(float);
-        s->conv_state = (float *)llm_oom(calloc(1, cb));
-        s->ssm_state  = (float *)llm_oom(calloc(1, sb));
-        s->conv_head  = (int32_t *)llm_oom(
+        s->conv_state = (float *)oom(calloc(1, cb));
+        s->ssm_state  = (float *)oom(calloc(1, sb));
+        s->conv_head  = (int32_t *)oom(
             calloc((size_t)s->n_layers, sizeof(int32_t)));
     }
     return 0;

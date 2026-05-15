@@ -30,7 +30,13 @@ BIN   := $(BUILD)/llm
 
 all: $(BIN)
 
-$(BIN): llm.c tensor.c llm.h | $(BUILD)
+# Single TU rooted at llm.c, but every `#include`-d single-file
+# library needs to be a prerequisite or edits won't trigger a
+# rebuild (made/llm.c-only deps gave a stale binary against the
+# new qwen.c path on 2026-05-15).
+$(BIN): llm.c llm.h qwen.c tensor.c neon.c chunked.c \
+        jinja-template.c tools.c agent.c \
+        utils/arrays.c utils/chars.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ llm.c $(LDFLAGS)
 
 $(BUILD):

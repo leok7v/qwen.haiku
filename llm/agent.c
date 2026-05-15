@@ -614,7 +614,7 @@ static char * agent_run(struct llm_ctx * ctx,
     int iter = 0;
     int rc_ok = 1;
     int32_t * ids =
-        (int32_t *)llm_oom(calloc(16384, sizeof(int32_t)));
+        (int32_t *)oom(calloc(16384, sizeof(int32_t)));
     while (!done && iter < max_iters && rc_ok) {
         iter++;
         char * prompt =
