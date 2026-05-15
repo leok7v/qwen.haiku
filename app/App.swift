@@ -25,14 +25,52 @@
 
 import SwiftUI
 import Observation
+#if os(macOS)
+import AppKit
+#endif
+
+// macOS single-window behavior: the default SwiftUI App lifecycle
+// on macOS leaves the dock icon running after the last window
+// closes (the "open recent" Mac convention). For QwenHaiku's
+// single-purpose chat surface that's confusing — the model stays
+// resident, eating ~500 MB of RSS, with no UI to interact with it.
+// AppDelegate's applicationShouldTerminateAfterLastWindowClosed
+// flips that to "terminate when the window closes", and a
+// CommandGroup .newItem suppression in the body() removes the
+// File -> New Window menu item so the user can't open a second
+// chat that would share Qwen ctx state. iOS is untouched (no
+// equivalent concept).
+#if os(macOS)
+final class QwenAppDelegate: NSObject, NSApplicationDelegate {
+
+    func applicationShouldTerminateAfterLastWindowClosed(
+        _ sender: NSApplication
+    ) -> Bool {
+        return true
+    }
+
+}
+#endif
 
 @main
 struct QwenHaikuApp: App {
+
+    #if os(macOS)
+    @NSApplicationDelegateAdaptor(QwenAppDelegate.self)
+    var appDelegate
+    #endif
+
     var body: some Scene {
         WindowGroup {
             ContentView()
         }
+        #if os(macOS)
+        .commands {
+            CommandGroup(replacing: .newItem) { }
+        }
+        #endif
     }
+
 }
 
 @Observable
