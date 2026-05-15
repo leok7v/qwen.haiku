@@ -39,8 +39,12 @@
 // dumper is what gates "ok to refactor": if the post-refactor dump
 // matches byte-for-byte, the change is safe.
 
+#ifndef NEON_C
+#define NEON_C
+
 #include <arm_neon.h>
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 
 // ---------------------------------------------------------------------------
@@ -699,3 +703,5 @@ static inline void neon_silu_vec_f32(int n, float * dst, const float * src) {
         dst[i] = src[i] / (1.0f + expf(-src[i]));
     }
 }
+
+#endif // NEON_C

@@ -15,6 +15,23 @@
 // are also visible because the tokenizer reaches into raw array
 // bodies that the high-level API doesn't surface yet.
 
+#ifndef GGUF_C
+#define GGUF_C
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+// `oom()` allocator wrapper. Idempotent (own guard); when slm.c has
+// already pulled it in, this is a no-op.
+#include "utils/arrays.c"
+
 // ---------------------------------------------------------------------------
 // GGUF v3 reader (subset: covers Qwen3 GGUFs from llama.cpp)
 // ---------------------------------------------------------------------------
@@ -306,3 +323,5 @@ static float gguf_kv_f32(const struct gguf * g, const char * k, float dflt) {
     }
     return r;
 }
+
+#endif // GGUF_C

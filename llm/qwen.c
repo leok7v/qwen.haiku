@@ -1,3 +1,34 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// qwen.c -- Qwen3.5 model implementation (single-file).
+//
+// `#include`-d from slm.c as part of the single-TU build, BUT also
+// self-sufficient: build standalone with `-DQWEN_TESTS` to get a
+// `qwen-test` binary that runs `qwen_self_test` (forward-pass sanity)
+// + `chunked_self_test` (chunked vs autoregressive parity). All
+// dependencies are pulled in via header-guarded `#include`s below,
+// so this works whether qwen.c is processed first or later in a TU.
+//
+// Pattern: matches `utils/{arrays,chars,maps,text}.c` — header guard,
+// own includes, optional `#ifdef *_TESTS` main(). The TU-root file
+// (slm.c) just `#include`s qwen.c; the guards make repeated inclusion
+// of the transitive deps (utils, tensor, gguf, slm.h) no-ops.
+
+#ifndef QWEN_C
+#define QWEN_C
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "utils/maps.c"  // oom, struct chars, struct arr, struct map
+#include "tensor.c"      // struct tensor + ops (incl. neon.c + chunked.c)
+#include "slm.h"         // struct slm_ctrl + public API types
+#include "gguf.c"        // GGUF v3 reader
+
 static double slm_monotonic_seconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -876,6 +907,13 @@ static void slm_dump_row(const char * label, const float * data, int32_t n) {
 // Reference: NVlabs/GatedDeltaNet (ICLR'25) + qwen3_next paper.
 // ---------------------------------------------------------------------------
 
+// Forward-pass arena helper. Captures the local `a` (struct arena *)
+// from the enclosing function — every forward_* here declares
+// `struct arena * a = c->arena;` as its first line, so the macro
+// just lifts the (float*)+sizeof(float) noise out of the call site.
+// Stays scoped to qwen.c via the file-internal `#define`.
+#define ARENA_F32(n) ((float *)arena_alloc(a, (size_t)(n) * sizeof(float)))
+
 static struct tensor * slm_forward_ssm(struct slm_ctx * c,
                                        int32_t L,
                                        struct tensor * h) {
@@ -1298,9 +1336,9 @@ static struct tensor * slm_forward_ssm_batch(struct slm_ctx * c,
         qwen_trace_batch(nm, "SILU", mixed->data, conv_dim, n);
     }
     // 5. Split Q, K, V (per-token contiguous within conv_dim).
-    float * Q_all = (float *)arena_alloc(a, (size_t)n * K_dim * sizeof(float));
-    float * K_all = (float *)arena_alloc(a, (size_t)n * K_dim * sizeof(float));
-    float * V_all = (float *)arena_alloc(a, (size_t)n * V_dim * sizeof(float));
+    float * Q_all = ARENA_F32((size_t)n * K_dim);
+    float * K_all = ARENA_F32((size_t)n * K_dim);
+    float * V_all = ARENA_F32((size_t)n * V_dim);
     for (int32_t t = 0; t < n; t++) {
         const float * row = mixed->data + (size_t)t * conv_dim;
         memcpy(Q_all + (size_t)t * K_dim, row,         (size_t)K_dim * sizeof(float));
@@ -1337,8 +1375,8 @@ static struct tensor * slm_forward_ssm_batch(struct slm_ctx * c,
     // 8. beta, g_log per token per head.
     const float * ssm_a_w   = (const float *)Lw->ssm_a.data;
     const float * dt_bias_w = (const float *)Lw->ssm_dt_bias.data;
-    float * beta_all  = (float *)arena_alloc(a, (size_t)n * n_heads * sizeof(float));
-    float * g_log_all = (float *)arena_alloc(a, (size_t)n * n_heads * sizeof(float));
+    float * beta_all  = ARENA_F32((size_t)n * n_heads);
+    float * g_log_all = ARENA_F32((size_t)n * n_heads);
     for (int32_t t = 0; t < n; t++) {
         for (int32_t h2 = 0; h2 < n_heads; h2++) {
             float bb = b_t->data[t * n_heads + h2];
@@ -1358,35 +1396,37 @@ static struct tensor * slm_forward_ssm_batch(struct slm_ctx * c,
     // 9. Chunked SSM per head. Per-chunk buffers (sized at CHUNK_SIZE
     //    so the same scratch handles every chunk; the kernel uses the
     //    actual chunk_n as its leading dim).
-    float * q_chunk    = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
-    float * k_chunk    = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
-    float * v_chunk    = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
-    float * g_log_h    = (float *)arena_alloc(a, CHUNK_SIZE * sizeof(float));
-    float * beta_h     = (float *)arena_alloc(a, CHUNK_SIZE * sizeof(float));
-    float * out_chunk  = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
+    // TODO: const size_t n = CHUNK_SIZE * sizeof(float) maybe?
+    // TODO: #define slm_alloc() to fight this ugliness: ARENA_F32(CHUNK_SIZE * k_hd); ?
+    float * q_chunk    = ARENA_F32(CHUNK_SIZE * k_hd);
+    float * k_chunk    = ARENA_F32(CHUNK_SIZE * k_hd);
+    float * v_chunk    = ARENA_F32(CHUNK_SIZE * v_hd);
+    float * g_log_h    = ARENA_F32(CHUNK_SIZE);
+    float * beta_h     = ARENA_F32(CHUNK_SIZE);
+    float * out_chunk  = ARENA_F32(CHUNK_SIZE * v_hd);
     // Chunked scratch — reused per head.
-    float * sc_gcs        = (float *)arena_alloc(a, CHUNK_SIZE * sizeof(float));
-    float * sc_gexp       = (float *)arena_alloc(a, CHUNK_SIZE * sizeof(float));
-    float * sc_decay_mask = (float *)arena_alloc(a, CHUNK_SIZE * CHUNK_SIZE * sizeof(float));
-    float * sc_k_beta     = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
-    float * sc_v_beta     = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
-    float * sc_kk_dot     = (float *)arena_alloc(a, CHUNK_SIZE * CHUNK_SIZE * sizeof(float));
-    float * sc_lhs        = (float *)arena_alloc(a, CHUNK_SIZE * CHUNK_SIZE * sizeof(float));
-    float * sc_attn       = (float *)arena_alloc(a, CHUNK_SIZE * CHUNK_SIZE * sizeof(float));
-    float * sc_v_eff      = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
-    float * sc_kbeta_gexp = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
-    float * sc_k_cumdecay = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
-    float * sc_attn_kq    = (float *)arena_alloc(a, CHUNK_SIZE * CHUNK_SIZE * sizeof(float));
-    float * sc_q_g_exp    = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
-    float * sc_attn_inter = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
-    float * sc_v_prime    = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
-    float * sc_v_new      = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
-    float * sc_v_attn     = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
-    float * sc_key_gdiff  = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
-    float * sc_kgd_vnew   = (float *)arena_alloc(a, k_hd * v_hd * sizeof(float));
+    float * sc_gcs        = ARENA_F32(CHUNK_SIZE);
+    float * sc_gexp       = ARENA_F32(CHUNK_SIZE);
+    float * sc_decay_mask = ARENA_F32(CHUNK_SIZE * CHUNK_SIZE);
+    float * sc_k_beta     = ARENA_F32(CHUNK_SIZE * k_hd);
+    float * sc_v_beta     = ARENA_F32(CHUNK_SIZE * v_hd);
+    float * sc_kk_dot     = ARENA_F32(CHUNK_SIZE * CHUNK_SIZE);
+    float * sc_lhs        = ARENA_F32(CHUNK_SIZE * CHUNK_SIZE);
+    float * sc_attn       = ARENA_F32(CHUNK_SIZE * CHUNK_SIZE);
+    float * sc_v_eff      = ARENA_F32(CHUNK_SIZE * v_hd);
+    float * sc_kbeta_gexp = ARENA_F32(CHUNK_SIZE * k_hd);
+    float * sc_k_cumdecay = ARENA_F32(CHUNK_SIZE * k_hd);
+    float * sc_attn_kq    = ARENA_F32(CHUNK_SIZE * CHUNK_SIZE);
+    float * sc_q_g_exp    = ARENA_F32(CHUNK_SIZE * k_hd);
+    float * sc_attn_inter = ARENA_F32(CHUNK_SIZE * v_hd);
+    float * sc_v_prime    = ARENA_F32(CHUNK_SIZE * v_hd);
+    float * sc_v_new      = ARENA_F32(CHUNK_SIZE * v_hd);
+    float * sc_v_attn     = ARENA_F32(CHUNK_SIZE * v_hd);
+    float * sc_key_gdiff  = ARENA_F32(CHUNK_SIZE * k_hd);
+    float * sc_kgd_vnew   = ARENA_F32(k_hd * v_hd);
     size_t state_off  = (size_t)L * n_heads * k_hd * v_hd;
     float * state_base = c->ssm.ssm_state + state_off;
-    float * out_flat = (float *)arena_alloc(a, (size_t)n * V_dim * sizeof(float));
+    float * out_flat = ARENA_F32((size_t)n * V_dim);
     // Multi-chunk loop: process min(remaining, CHUNK_SIZE) tokens
     // per call. State carries in place across chunks because
     // chunked_ssm_step_f32 updates it. The tail chunk is whatever
@@ -2174,6 +2214,226 @@ static inline float rng_uniform(struct rng * r) {
 }
 
 // ---------------------------------------------------------------------------
+// --chunked-test: lives here (not in chunked.c) because the
+// reference implementation `autoregressive_ref` IS Qwen3-next math
+// (the gated DeltaNet SSM recurrence the chunked kernel must
+// match). chunked.c stays a pure SSM kernel; this test asserts
+// "chunked-vs-autoregressive agree for Qwen-shaped inputs", which
+// is a qwen.c concern.
+
+
+// ---------------------------------------------------------------------------
+// --chunked-test: run the chunked SSM kernel on a 1-real-token chunk
+// (padded with 63 zero-tokens) and compare to the autoregressive
+// math direct evaluation. Per the degeneracy proof above, they MUST
+// agree (mathematically identical operations applied to the same
+// fp32 inputs). A 1-2 ULP discrepancy on a handful of elements is
+// acceptable - that is intra-kernel reduction order drift. A larger
+// discrepancy means our chunked port is wrong.
+//
+// Lives here so the test sits next to the code it exercises;
+// `#include`-d into slm.c as part of the single-TU build, and
+// invoked from slm.c's CLI dispatch via `--chunked-test`.
+
+#define CHUNKED_TEST_KHD 128
+#define CHUNKED_TEST_VHD 128
+// N=8 validates the chunked recurrence against an autoregressive
+// reference implementation. Both should agree to within fp32
+// accumulation noise (sub-1e-5 relative). The chunked path uses
+// a slightly different reduction order, hence the small tolerance.
+#define CHUNKED_TEST_NTOK 8
+
+static void autoregressive_ref(int n, int k_hd, int v_hd,
+                               const float * Q,       // [n, k_hd]
+                               const float * K,       // [n, k_hd]
+                               const float * V,       // [n, v_hd]
+                               const float * g_log,   // [n]
+                               const float * beta,    // [n]
+                               float * state,         // [k_hd, v_hd], zeroed by caller
+                               float * out) {         // [n, v_hd]
+    for (int t = 0; t < n; t++) {
+        float g = expf(g_log[t]);
+        float b = beta[t];
+        // state *= g
+        for (int d = 0; d < k_hd; d++) {
+            for (int e = 0; e < v_hd; e++) {
+                state[d * v_hd + e] *= g;
+            }
+        }
+        // kv_mem[v] = sum_k state[k, v] * K[t, k]
+        float kv_mem[CHUNKED_TEST_VHD];
+        for (int e = 0; e < v_hd; e++) {
+            float s = 0.0f;
+            for (int d = 0; d < k_hd; d++) {
+                s += state[d * v_hd + e] * K[t * k_hd + d];
+            }
+            kv_mem[e] = s;
+        }
+        // delta = (V - kv_mem) * beta
+        float delta[CHUNKED_TEST_VHD];
+        for (int e = 0; e < v_hd; e++) {
+            delta[e] = (V[t * v_hd + e] - kv_mem[e]) * b;
+        }
+        // state[k, v] += K[t, k] * delta[v]
+        for (int d = 0; d < k_hd; d++) {
+            float kd = K[t * k_hd + d];
+            for (int e = 0; e < v_hd; e++) {
+                state[d * v_hd + e] += kd * delta[e];
+            }
+        }
+        // out[t, v] = sum_k state[k, v] * Q[t, k]
+        for (int e = 0; e < v_hd; e++) {
+            float s = 0.0f;
+            for (int d = 0; d < k_hd; d++) {
+                s += state[d * v_hd + e] * Q[t * k_hd + d];
+            }
+            out[t * v_hd + e] = s;
+        }
+    }
+}
+
+__attribute__((unused))
+static int32_t chunked_self_test(void) {
+    enum { k_hd = CHUNKED_TEST_KHD, v_hd = CHUNKED_TEST_VHD,
+           N   = CHUNKED_TEST_NTOK };
+    // Deterministic multi-token inputs (4 distinct tokens).
+    float Q[N * k_hd], K[N * k_hd], V[N * v_hd];
+    float g_log[N], beta_arr_in[N];
+    for (int t = 0; t < N; t++) {
+        for (int i = 0; i < k_hd; i++) {
+            Q[t * k_hd + i] = sinf((float)((t + 1) * (i + 1)) * 0.0173f);
+            K[t * k_hd + i] = cosf((float)((t + 1) * (i + 1)) * 0.0211f);
+        }
+        for (int i = 0; i < v_hd; i++) {
+            V[t * v_hd + i] = sinf((float)((t + 1) * (i + 1)) * 0.0149f) * 0.5f;
+        }
+        g_log[t]       = -0.25f - 0.05f * (float)t;
+        beta_arr_in[t] = 0.55f + 0.03f * (float)t;
+    }
+    // Autoregressive reference (N sequential steps).
+    static float auto_state[k_hd * v_hd];
+    static float auto_out  [N * v_hd];
+    memset(auto_state, 0, sizeof(auto_state));
+    memset(auto_out,   0, sizeof(auto_out));
+    autoregressive_ref(N, k_hd, v_hd, Q, K, V, g_log, beta_arr_in,
+                       auto_state, auto_out);
+    // Chunked path: N real tokens padded to CHUNK_SIZE.
+    static float q_pad   [CHUNK_SIZE * k_hd];
+    static float k_pad   [CHUNK_SIZE * k_hd];
+    static float v_pad   [CHUNK_SIZE * v_hd];
+    static float g_log_p [CHUNK_SIZE];
+    static float beta_p  [CHUNK_SIZE];
+    static float state   [k_hd * v_hd];
+    static float out     [CHUNK_SIZE * v_hd];
+    memset(q_pad,   0, sizeof(q_pad));
+    memset(k_pad,   0, sizeof(k_pad));
+    memset(v_pad,   0, sizeof(v_pad));
+    memset(g_log_p, 0, sizeof(g_log_p));
+    memset(beta_p,  0, sizeof(beta_p));
+    memset(state,   0, sizeof(state));
+    memset(out,     0, sizeof(out));
+    for (int t = 0; t < N; t++) {
+        for (int i = 0; i < k_hd; i++) {
+            q_pad[t * k_hd + i] = Q[t * k_hd + i];
+            k_pad[t * k_hd + i] = K[t * k_hd + i];
+        }
+        for (int i = 0; i < v_hd; i++) {
+            v_pad[t * v_hd + i] = V[t * v_hd + i];
+        }
+        g_log_p[t] = g_log[t];
+        beta_p [t] = beta_arr_in[t];
+    }
+    // Scratch (heap; one-shot test, no perf concern).
+    float * sc_gcs        = (float *)oom(calloc(CHUNK_SIZE, sizeof(float)));
+    float * sc_gexp       = (float *)oom(calloc(CHUNK_SIZE, sizeof(float)));
+    float * sc_decay_mask = (float *)oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_k_beta     = (float *)oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_v_beta     = (float *)oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_kk_dot     = (float *)oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_lhs        = (float *)oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_attn       = (float *)oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_v_eff      = (float *)oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_kbeta_gexp = (float *)oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_k_cumdecay = (float *)oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_attn_kq    = (float *)oom(calloc((size_t)CHUNK_SIZE * CHUNK_SIZE, sizeof(float)));
+    float * sc_q_g_exp    = (float *)oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_attn_inter = (float *)oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_v_prime    = (float *)oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_v_new      = (float *)oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_v_attn     = (float *)oom(calloc((size_t)CHUNK_SIZE * v_hd,       sizeof(float)));
+    float * sc_key_gdiff  = (float *)oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
+    float * sc_kgd_vnew   = (float *)oom(calloc((size_t)k_hd * v_hd,             sizeof(float)));
+    // Run the kernel with the actual N (dynamic chunk size — exercises
+    // the same path that slm_forward_ssm_batch takes for partial tail
+    // chunks).
+    chunked_ssm_step_f32(N, k_hd, v_hd,
+                         q_pad, k_pad, v_pad, g_log_p, beta_p,
+                         state, out,
+                         sc_gcs, sc_gexp, sc_decay_mask,
+                         sc_k_beta, sc_v_beta, sc_kk_dot, sc_lhs,
+                         sc_attn, sc_v_eff, sc_kbeta_gexp, sc_k_cumdecay,
+                         sc_attn_kq, sc_q_g_exp, sc_attn_inter,
+                         sc_v_prime, sc_v_new, sc_v_attn,
+                         sc_key_gdiff, sc_kgd_vnew);
+    // Compare per-token outputs.
+    float max_abs_diff = 0.0f;
+    float max_rel_diff = 0.0f;
+    int   max_t = -1, max_e = -1;
+    for (int t = 0; t < N; t++) {
+        for (int e = 0; e < v_hd; e++) {
+            float ae = auto_out[t * v_hd + e];
+            float ce = out     [t * v_hd + e];
+            float d  = fabsf(ae - ce);
+            float r  = (fabsf(ae) > 1e-6f) ? d / fabsf(ae) : d;
+            if (d > max_abs_diff) {
+                max_abs_diff = d;
+                max_rel_diff = r;
+                max_t = t;
+                max_e = e;
+            }
+        }
+    }
+    // Compare final states.
+    float max_state_diff = 0.0f;
+    int   max_state_d = -1, max_state_e = -1;
+    for (int d = 0; d < k_hd; d++) {
+        for (int e = 0; e < v_hd; e++) {
+            float ae = auto_state[d * v_hd + e];
+            float ce = state     [d * v_hd + e];
+            float diff = fabsf(ae - ce);
+            if (diff > max_state_diff) {
+                max_state_diff = diff;
+                max_state_d = d;
+                max_state_e = e;
+            }
+        }
+    }
+    for (int t = 0; t < N; t++) {
+        printf("chunked-test t=%d: auto[0..3] = %.7g %.7g %.7g %.7g\n",
+               t,
+               auto_out[t * v_hd + 0], auto_out[t * v_hd + 1],
+               auto_out[t * v_hd + 2], auto_out[t * v_hd + 3]);
+        printf("chunked-test t=%d: chunk[0..3] = %.7g %.7g %.7g %.7g\n",
+               t,
+               out[t * v_hd + 0], out[t * v_hd + 1],
+               out[t * v_hd + 2], out[t * v_hd + 3]);
+    }
+    printf("chunked-test: max |Δ_out| = %.4g at t=%d e=%d (rel %.4g)\n",
+           max_abs_diff, max_t, max_e, max_rel_diff);
+    printf("chunked-test: max |Δ_state| = %.4g at d=%d e=%d\n",
+           max_state_diff, max_state_d, max_state_e);
+    // Free scratch.
+    free(sc_gcs); free(sc_gexp); free(sc_decay_mask);
+    free(sc_k_beta); free(sc_v_beta); free(sc_kk_dot); free(sc_lhs);
+    free(sc_attn); free(sc_v_eff); free(sc_kbeta_gexp);
+    free(sc_k_cumdecay); free(sc_attn_kq); free(sc_q_g_exp);
+    free(sc_attn_inter); free(sc_v_prime); free(sc_v_new);
+    free(sc_v_attn); free(sc_key_gdiff); free(sc_kgd_vnew);
+    // Pass if rel <= 1e-5 (a few ULPs at fp32 precision).
+    return (max_rel_diff <= 1e-5f) ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
 // --self-test: build a tiny synthetic Qwen3.5 model with deterministic
 // weights and run one forward step. Validates the data flow (config →
 // weights → KV cache → forward step → logits) without needing the
@@ -2210,7 +2470,7 @@ static int32_t qwen_self_test(void) {
         a, (size_t)hidden * cfg.vocab_size * sizeof(float));
     for (int32_t i = 0; i < hidden * cfg.vocab_size; i++) tok_embd[i] = RNDF();
     // output_norm: (hidden,)
-    float * out_norm = (float *)arena_alloc(a, (size_t)hidden * sizeof(float));
+    float * out_norm = ARENA_F32(hidden);
     for (int32_t i = 0; i < hidden; i++) out_norm[i] = 1.0f + RNDF();
     // Per-layer weights:
     struct slm_layer_w * layers = (struct slm_layer_w *)oom(
@@ -2295,3 +2555,29 @@ static int32_t qwen_self_test(void) {
     arena_free(a);
     return ok ? 0 : 1;
 }
+
+// ---------------------------------------------------------------------------
+// Standalone test harness. Enabled with -DQWEN_TESTS at compile time
+// (see `qwen-test` target in llm/Makefile). When qwen.c is included
+// from slm.c instead, QWEN_TESTS is undefined and this block emits
+// no code, so slm.c's own main() drives the CLI.
+// ---------------------------------------------------------------------------
+#ifdef QWEN_TESTS
+int main(int argc, char ** argv) {
+    int rc = 0;
+    bool want_chunked = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--chunked-test") == 0) { want_chunked = true; }
+    }
+    if (want_chunked) {
+        rc = chunked_self_test();
+        fprintf(stderr, "chunked-test: %s\n", rc == 0 ? "PASS" : "FAIL");
+    } else {
+        rc = qwen_self_test();
+        fprintf(stderr, "qwen-self-test: %s\n", rc == 0 ? "PASS" : "FAIL");
+    }
+    return rc;
+}
+#endif  // QWEN_TESTS
+
+#endif  // QWEN_C

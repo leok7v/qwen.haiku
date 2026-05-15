@@ -27,8 +27,13 @@ endif
 
 BUILD := ../Build/cli
 BIN   := $(BUILD)/llm
+# Standalone qwen.c test binary: compiles qwen.c on its own (own
+# header guards + #include's) with -DQWEN_TESTS so its trailing
+# main() runs `qwen_self_test` / `chunked_self_test` without the
+# slm.c TU.
+QWEN_TEST := $(BUILD)/qwen-test
 
-all: $(BIN)
+all: $(BIN) $(QWEN_TEST)
 
 # Single TU rooted at slm.c, but every `#include`-d single-file
 # library needs to be a prerequisite or edits won't trigger a
@@ -40,6 +45,18 @@ $(BIN): slm.c slm.h qwen.c gguf.c tokenizer.c sampler.c jinja.c \
         utils/arrays.c utils/chars.c utils/maps.c \
         | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ slm.c $(LDFLAGS)
+
+# qwen.c standalone: not LLM_CLI (no slm.c main()), but QWEN_TESTS
+# (qwen.c's own main() that runs qwen_self_test + chunked_self_test).
+$(QWEN_TEST): qwen.c slm.h gguf.c tensor.c neon.c chunked.c \
+              utils/arrays.c utils/chars.c utils/maps.c \
+              | $(BUILD)
+	$(CC) -O3 -std=c17 -Wall -Wextra \
+	      -Wno-unused-parameter -Wno-missing-braces \
+	      -DQWEN_TESTS \
+	      -fvectorize -fslp-vectorize \
+	      $(if $(filter arm64,$(shell uname -m)),-mcpu=apple-m1,) \
+	      -o $@ qwen.c -lm
 
 $(BUILD):
 	mkdir -p $@
