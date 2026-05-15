@@ -2477,11 +2477,22 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
     // h shape: (hidden_dim, 1)
     qh_trace_row("inp_embd", "GET_ROWS", h->data, c->cfg.hidden_dim);
 
+    static int8_t use_ssm_batch = -1;
+    if (use_ssm_batch < 0) {
+        use_ssm_batch = (getenv("LLM_USE_SSM_BATCH") != NULL) ? 1 : 0;
+    }
     for (int32_t L = 0; L < c->cfg.n_layers; L++) {
         struct llm_layer_w * Lw = &c->W.layers[L];
         struct tensor * mix;
         if (Lw->is_ssm) {
-            mix = llm_forward_ssm(c, L, h);
+            // Single-token forward: route to the chunked-SSM batched
+            // wrapper under LLM_USE_SSM_BATCH=1. For n=1 the chunked
+            // kernel is mathematically equivalent to the recurrent
+            // autoregressive path; this gate exists so we can run
+            // `--single "Hello"` with both paths and diff the traces.
+            mix = use_ssm_batch
+                ? llm_forward_ssm_batch(c, L, 1, h)
+                : llm_forward_ssm(c, L, h);
         } else {
             mix = llm_forward_attn(c, L, pos, h);
         }
