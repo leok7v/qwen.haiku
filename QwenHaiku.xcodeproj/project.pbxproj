@@ -15,6 +15,8 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Makefile,
+				chunked.c,
+				neon.c,
 				tensor.c,
 			);
 			target = B3F4AAAA2F904FAC00000006 /* QwenHaiku */;

@@ -84,6 +84,15 @@
 // `expf` from libm (matches ggml's non-Accelerate, non-vectorised
 // scalar path).
 
+// chunked.c is `#include`-d once from tensor.c (its canonical use)
+// and is listed under membershipExceptions in QwenHaiku.xcodeproj
+// alongside tensor.c so Xcode's file-system-synced group does NOT
+// pick it up and compile it as an independent TU. We still keep the
+// include set self-contained (arm_neon.h on its own line) so a future
+// caller — direct compile, swift-cli's swiftc invocation, an outside
+// repo — can drop it in as a single-file lib without arm_neon.h
+// needing to be pre-included.
+#include <arm_neon.h>
 #include <math.h>
 #include <string.h>
 
