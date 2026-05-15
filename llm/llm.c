@@ -3888,6 +3888,118 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
     return r;
 }
 
+// Capture-and-hash callback: accumulates the decoded UTF-8 stream
+// into a chars buffer (for the visible reply) AND folds each piece
+// into a running FNV-1a 64-bit hash (for compact pass/fail comparison
+// across runs). The hash is what --chat-test compares between
+// run-1-pre-reset and run-2-post-reset; the captured text is shown
+// to the user only when something diverges.
+struct chat_test_capture {
+    struct chars text;
+    uint64_t     hash;
+};
+
+static int chat_test_cb(const char * utf8, void * user) {
+    struct chat_test_capture * cap = (struct chat_test_capture *)user;
+    size_t n = strlen(utf8);
+    chars_put(&cap->text, utf8, n);
+    // Same FNV-1a polynomial as qh_fnv1a64 — keep its byte loop
+    // inline so the hash is computed incrementally as tokens stream
+    // in (the qh_fnv1a64 helper expects a single contiguous buffer).
+    for (size_t i = 0; i < n; i++) {
+        cap->hash ^= (uint64_t)(uint8_t)utf8[i];
+        cap->hash *= 0x100000001b3ULL;
+    }
+    return 0;
+}
+
+// Multi-turn scripted chat test. Runs three deterministic turns
+// twice — once on a fresh context, then again after llm_reset() — and
+// verifies the reply hashes match across the two passes. This exercises
+// the chat-template state machine, the persistent KV cache, the
+// chunked-SSM prefill, AND the llm_reset() contract that state is
+// fully cleared between conversations.
+//
+// Fixed inputs (not user-configurable) so a CI run produces a stable
+// PASS/FAIL signal: im.ai sampler preset, seed=42, three short turns.
+// Failure prints both passes' replies side-by-side for diagnosis.
+static int32_t run_chat_test(int32_t max_new) {
+    static const char * const turns[] = {
+        "Hi! Just say hello back.",
+        "What did I just ask?",
+        "Thanks!"
+    };
+    enum { N_TURNS = 3 };
+    struct llm_sampler sp = llm_sampler_im_ai();
+    uint64_t seed = 42;
+    struct llm_ctx * c = llm_create(llm_cli_gguf_path());
+    int32_t r = 0;
+    if (!c->loaded) {
+        fprintf(stderr, "llm: load failed: %s\n", llm_get_error(c));
+        r = 1;
+    } else {
+        struct chat_test_capture caps_a[N_TURNS] = {0};
+        struct chat_test_capture caps_b[N_TURNS] = {0};
+        int32_t * ids = (int32_t *)llm_oom(calloc(16384,
+                                                  sizeof(int32_t)));
+        for (int32_t pass = 0; pass < 2 && r == 0; pass++) {
+            struct chat_test_capture * caps = (pass == 0) ? caps_a : caps_b;
+            // Reset before pass 1; pass 0 starts from a fresh ctx so
+            // the SSM state and pos are already zeroed by llm_create.
+            if (pass == 1) { llm_reset(c); }
+            struct chars delta = {0};
+            for (int32_t t = 0; t < N_TURNS && r == 0; t++) {
+                struct chat_test_capture * cap = &caps[t];
+                cap->hash = 0xcbf29ce484222325ULL;
+                delta.count = 0;
+                if (delta.data != NULL) { delta.data[0] = '\0'; }
+                chars_put(&delta, "<|im_start|>user\n", 17);
+                chars_put(&delta, turns[t],
+                          (int32_t)strlen(turns[t]));
+                chars_put(&delta,
+                          "<|im_end|>\n<|im_start|>assistant\n"
+                          "<think>\n\n</think>\n\n",
+                          52);
+                chars_put(&delta, "", 0);
+                int32_t nids = tok_encode(&c->tok, delta.data,
+                                          ids, 16384);
+                int32_t gen = llm_generate(c, ids, nids, max_new,
+                                           g_min_new, &sp, seed,
+                                           chat_test_cb, cap);
+                chars_put(&cap->text, "", 0);
+                fprintf(stderr,
+                        "chat-test pass %d turn %d: gen=%d "
+                        "hash=%016llx pos=%d\n",
+                        (int)pass, (int)(t + 1), (int)gen,
+                        (unsigned long long)cap->hash,
+                        (int)c->pos);
+            }
+            chars_free(&delta);
+        }
+        free(ids);
+        int32_t mismatch = -1;
+        for (int32_t t = 0; t < N_TURNS && mismatch < 0; t++) {
+            if (caps_a[t].hash != caps_b[t].hash) { mismatch = t; }
+        }
+        if (mismatch < 0) {
+            printf("chat-test: PASS (3 turns x 2 passes,"
+                   " hashes match across llm_reset)\n");
+        } else {
+            printf("chat-test: FAIL at turn %d\n", (int)(mismatch + 1));
+            printf("  user:       %s\n", turns[mismatch]);
+            printf("  pass A:     %s\n", caps_a[mismatch].text.data);
+            printf("  pass B:     %s\n", caps_b[mismatch].text.data);
+            r = 1;
+        }
+        for (int32_t t = 0; t < N_TURNS; t++) {
+            chars_free(&caps_a[t].text);
+            chars_free(&caps_b[t].text);
+        }
+    }
+    llm_destroy(c);
+    return r;
+}
+
 static int32_t run_single(const char * prompt, int32_t max_new,
                           const struct llm_sampler * sp, uint64_t seed) {
     struct llm_ctx * c = llm_create(llm_cli_gguf_path());
@@ -3986,6 +4098,8 @@ int main(int argc, char ** argv) {
             mode = 3;
         } else if (strcmp(argv[i], "--chat") == 0) {
             mode = 4;
+        } else if (strcmp(argv[i], "--chat-test") == 0) {
+            mode = 6;
         } else if ((strcmp(argv[i], "-p") == 0 ||
                     strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
             if (chat_n < LLM_CLI_MAX_TURNS) {
@@ -4055,6 +4169,8 @@ int main(int argc, char ** argv) {
             rc = run_chat(chat_prompts, chat_n, system_prompt,
                           &sp, seed, max_new);
         }
+    } else if (mode == 6) {
+        rc = run_chat_test(max_new);
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  llm --self-test\n"
@@ -4062,6 +4178,7 @@ int main(int argc, char ** argv) {
                "  llm --repl [--max-new N] [sampler flags]\n"
                "  llm --chat -p \"turn1\" [-p \"turn2\" ...] "
                        "[-sys \"system prompt\"] [sampler flags]\n"
+               "  llm --chat-test [--max-new N]\n"
                "\n"
                "sampler flags:\n"
                "  --preset {default|im_ai|greedy}   load named preset\n"
