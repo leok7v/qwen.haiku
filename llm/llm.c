@@ -2032,6 +2032,213 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     return out_t;
 }
 
+// Multi-token SSM block for batched prefill. Processes `n` tokens
+// in one call using the chunked Gated DeltaNet kernel
+// (chunked_ssm_step_f32). Returns a [hidden_dim, n] tensor of
+// post-output-projection vectors, ready for the residual add.
+//
+// Requires n <= CHUNK_SIZE (=64); larger prompts must be split
+// into multiple chunked calls (loop in the caller, state carries
+// over). State is updated in place once after processing all `n`
+// tokens.
+//
+// `h` is [hidden_dim, n] - the input residual stream for these n
+// tokens. The SSM layer reads h as-is; the embedding lookup +
+// per-token RMS norm scaffolding is done by `llm_forward_step_batch`.
+static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
+                                              int32_t L, int32_t n,
+                                              struct tensor * h) {
+    struct arena * a = c->arena;
+    struct llm_layer_w * Lw = &c->W.layers[L];
+    int32_t n_heads  = c->cfg.linear_n_heads;
+    int32_t k_hd     = c->cfg.linear_k_head_dim;
+    int32_t v_hd     = c->cfg.linear_v_head_dim;
+    int32_t K_dim    = n_heads * k_hd;
+    int32_t V_dim    = n_heads * v_hd;
+    int32_t kK       = c->cfg.linear_conv_kernel;
+    int32_t conv_dim = 2 * K_dim + V_dim;
+    assert(n > 0 && n <= CHUNK_SIZE);
+    // 1. attn_norm per token (rms_norm handles n via x->ne[1]).
+    struct tensor attn_norm_w = weights_as_f32_view(&Lw->attn_norm, a);
+    struct tensor * h_norm =
+        tensor_rms_norm(h, &attn_norm_w, c->cfg.norm_eps);
+    // 2. In-projections - matmul_dispatch already iterates the n axis.
+    struct tensor * qkv_pre = matmul_dispatch(&Lw->attn_qkv,  h_norm);  // [conv_dim, n]
+    struct tensor * z       = matmul_dispatch(&Lw->attn_gate, h_norm);  // [V_dim, n]
+    struct tensor * b_t     = matmul_dispatch(&Lw->ssm_beta,  h_norm);  // [n_heads, n]
+    struct tensor * a_t     = matmul_dispatch(&Lw->ssm_alpha, h_norm);  // [n_heads, n]
+    // 3. Conv1d step per token (sequential, ring buffer state).
+    struct tensor * mixed = tensor_new_2d(a, conv_dim, n);
+    const float * conv_w = (const float *)Lw->ssm_conv1d.data;
+    size_t conv_lane_base = (size_t)L * kK * conv_dim;
+    for (int32_t t = 0; t < n; t++) {
+        int32_t head = c->ssm.conv_head[L];
+        size_t  lane_off = conv_lane_base + (size_t)head * conv_dim;
+        float * lane = c->ssm.conv_state + lane_off;
+        for (int32_t i = 0; i < conv_dim; i++) {
+            lane[i] = qkv_pre->data[t * conv_dim + i];
+        }
+        c->ssm.conv_head[L] = (head + 1) % kK;
+        int32_t head_after = c->ssm.conv_head[L];
+        for (int32_t ch = 0; ch < conv_dim; ch++) {
+            float acc = 0.0f;
+            const float * wch = conv_w + (size_t)ch * kK;
+            for (int32_t k = 0; k < kK; k++) {
+                int32_t slot = (head_after + k) % kK;
+                float v_l = c->ssm.conv_state[
+                    conv_lane_base + (size_t)slot * conv_dim + ch];
+                acc += v_l * wch[k];
+            }
+            mixed->data[t * conv_dim + ch] = acc;
+        }
+    }
+    // 4. SiLU on all tokens at once.
+    neon_silu_vec_f32(n * conv_dim, mixed->data, mixed->data);
+    // 5. Split Q, K, V (per-token contiguous within conv_dim).
+    float * Q_all = (float *)arena_alloc(a, (size_t)n * K_dim * sizeof(float));
+    float * K_all = (float *)arena_alloc(a, (size_t)n * K_dim * sizeof(float));
+    float * V_all = (float *)arena_alloc(a, (size_t)n * V_dim * sizeof(float));
+    for (int32_t t = 0; t < n; t++) {
+        const float * row = mixed->data + (size_t)t * conv_dim;
+        memcpy(Q_all + (size_t)t * K_dim, row,         (size_t)K_dim * sizeof(float));
+        memcpy(K_all + (size_t)t * K_dim, row + K_dim, (size_t)K_dim * sizeof(float));
+        memcpy(V_all + (size_t)t * V_dim, row + 2 * K_dim, (size_t)V_dim * sizeof(float));
+    }
+    // 6/7. L2-norm Q, K per head, scale Q by 1/sqrt(k_hd).
+    const float l2_eps = 1e-6f;
+    float scale = 1.0f / sqrtf((float)k_hd);
+    for (int32_t t = 0; t < n; t++) {
+        for (int32_t h2 = 0; h2 < n_heads; h2++) {
+            double qss = 0.0, kss = 0.0;
+            for (int32_t i = 0; i < k_hd; i++) {
+                float qv = Q_all[t * K_dim + h2 * k_hd + i];
+                float kv = K_all[t * K_dim + h2 * k_hd + i];
+                qss += (double)(qv * qv);
+                kss += (double)(kv * kv);
+            }
+            float qrs = 1.0f / fmaxf(sqrtf((float)qss), l2_eps);
+            float krs = 1.0f / fmaxf(sqrtf((float)kss), l2_eps);
+            for (int32_t i = 0; i < k_hd; i++) {
+                Q_all[t * K_dim + h2 * k_hd + i] *= qrs * scale;
+                K_all[t * K_dim + h2 * k_hd + i] *= krs;
+            }
+        }
+    }
+    // 8. beta, g_log per token per head.
+    const float * ssm_a_w   = (const float *)Lw->ssm_a.data;
+    const float * dt_bias_w = (const float *)Lw->ssm_dt_bias.data;
+    float * beta_all  = (float *)arena_alloc(a, (size_t)n * n_heads * sizeof(float));
+    float * g_log_all = (float *)arena_alloc(a, (size_t)n * n_heads * sizeof(float));
+    for (int32_t t = 0; t < n; t++) {
+        for (int32_t h2 = 0; h2 < n_heads; h2++) {
+            float bb = b_t->data[t * n_heads + h2];
+            beta_all[t * n_heads + h2] = 1.0f / (1.0f + expf(-bb));
+            float aa = a_t->data[t * n_heads + h2] + dt_bias_w[h2];
+            float softplus_a = aa > 20.0f ? aa : logf(1.0f + expf(aa));
+            g_log_all[t * n_heads + h2] = ssm_a_w[h2] * softplus_a;
+        }
+    }
+    // 9. Chunked SSM per head. Padded chunk buffers, allocated once
+    //    and reused per head.
+    float * q_chunk    = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
+    float * k_chunk    = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
+    float * v_chunk    = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
+    float * g_log_h    = (float *)arena_alloc(a, CHUNK_SIZE * sizeof(float));
+    float * beta_h     = (float *)arena_alloc(a, CHUNK_SIZE * sizeof(float));
+    float * out_chunk  = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
+    // Chunked scratch — reused per head.
+    float * sc_gcs        = (float *)arena_alloc(a, CHUNK_SIZE * sizeof(float));
+    float * sc_gexp       = (float *)arena_alloc(a, CHUNK_SIZE * sizeof(float));
+    float * sc_decay_mask = (float *)arena_alloc(a, CHUNK_SIZE * CHUNK_SIZE * sizeof(float));
+    float * sc_k_beta     = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
+    float * sc_v_beta     = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
+    float * sc_kk_dot     = (float *)arena_alloc(a, CHUNK_SIZE * CHUNK_SIZE * sizeof(float));
+    float * sc_lhs        = (float *)arena_alloc(a, CHUNK_SIZE * CHUNK_SIZE * sizeof(float));
+    float * sc_attn       = (float *)arena_alloc(a, CHUNK_SIZE * CHUNK_SIZE * sizeof(float));
+    float * sc_v_eff      = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
+    float * sc_kbeta_gexp = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
+    float * sc_k_cumdecay = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
+    float * sc_attn_kq    = (float *)arena_alloc(a, CHUNK_SIZE * CHUNK_SIZE * sizeof(float));
+    float * sc_q_g_exp    = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
+    float * sc_attn_inter = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
+    float * sc_v_prime    = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
+    float * sc_v_new      = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
+    float * sc_v_attn     = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
+    float * sc_key_gdiff  = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
+    float * sc_kgd_vnew   = (float *)arena_alloc(a, k_hd * v_hd * sizeof(float));
+    size_t state_off  = (size_t)L * n_heads * k_hd * v_hd;
+    float * state_base = c->ssm.ssm_state + state_off;
+    float * out_flat = (float *)arena_alloc(a, (size_t)n * V_dim * sizeof(float));
+    for (int32_t h2 = 0; h2 < n_heads; h2++) {
+        // Pack inputs for this head, padded to CHUNK_SIZE.
+        memset(q_chunk, 0, CHUNK_SIZE * k_hd * sizeof(float));
+        memset(k_chunk, 0, CHUNK_SIZE * k_hd * sizeof(float));
+        memset(v_chunk, 0, CHUNK_SIZE * v_hd * sizeof(float));
+        memset(g_log_h, 0, CHUNK_SIZE * sizeof(float));
+        memset(beta_h,  0, CHUNK_SIZE * sizeof(float));
+        for (int32_t t = 0; t < n; t++) {
+            memcpy(q_chunk + (size_t)t * k_hd,
+                   Q_all   + (size_t)t * K_dim + (size_t)h2 * k_hd,
+                   (size_t)k_hd * sizeof(float));
+            memcpy(k_chunk + (size_t)t * k_hd,
+                   K_all   + (size_t)t * K_dim + (size_t)h2 * k_hd,
+                   (size_t)k_hd * sizeof(float));
+            memcpy(v_chunk + (size_t)t * v_hd,
+                   V_all   + (size_t)t * V_dim + (size_t)h2 * v_hd,
+                   (size_t)v_hd * sizeof(float));
+            g_log_h[t] = g_log_all[t * n_heads + h2];
+            beta_h [t] = beta_all [t * n_heads + h2];
+        }
+        float * state_h = state_base + (size_t)h2 * k_hd * v_hd;
+        chunked_ssm_step_f32(k_hd, v_hd,
+                             q_chunk, k_chunk, v_chunk, g_log_h, beta_h,
+                             state_h, out_chunk,
+                             sc_gcs, sc_gexp, sc_decay_mask,
+                             sc_k_beta, sc_v_beta, sc_kk_dot, sc_lhs,
+                             sc_attn, sc_v_eff, sc_kbeta_gexp, sc_k_cumdecay,
+                             sc_attn_kq, sc_q_g_exp, sc_attn_inter,
+                             sc_v_prime, sc_v_new, sc_v_attn,
+                             sc_key_gdiff, sc_kgd_vnew);
+        // Copy the n real outputs into out_flat.
+        for (int32_t t = 0; t < n; t++) {
+            memcpy(out_flat + (size_t)t * V_dim + (size_t)h2 * v_hd,
+                   out_chunk + (size_t)t * v_hd,
+                   (size_t)v_hd * sizeof(float));
+        }
+    }
+    // 10. Gated RMSNorm + z-SiLU per token. Each token's y_norm
+    //     depends only on its own out_flat row + z row.
+    const float * norm_w = (const float *)Lw->ssm_norm.data;
+    struct tensor * y_norm = tensor_new_2d(a, V_dim, n);
+    float z_silu_buf[2048];
+    for (int32_t t = 0; t < n; t++) {
+        neon_silu_vec_f32(V_dim, z_silu_buf, z->data + (size_t)t * V_dim);
+        for (int32_t h2 = 0; h2 < n_heads; h2++) {
+            double ssq = 0.0;
+            float * yh = out_flat + (size_t)t * V_dim + (size_t)h2 * v_hd;
+            for (int32_t v = 0; v < v_hd; v++) {
+                ssq += (double)(yh[v] * yh[v]);
+            }
+            float mean = (float)(ssq / (double)v_hd);
+            float rs   = 1.0f / sqrtf(mean + c->cfg.norm_eps);
+            const float * sg = z_silu_buf + (size_t)h2 * v_hd;
+            float * yo = y_norm->data + (size_t)t * V_dim + (size_t)h2 * v_hd;
+            for (int32_t v = 0; v < v_hd; v++) {
+                yo[v] = yh[v] * rs;
+            }
+            for (int32_t v = 0; v < v_hd; v++) {
+                yo[v] = yo[v] * norm_w[v];
+            }
+            for (int32_t v = 0; v < v_hd; v++) {
+                yo[v] = yo[v] * sg[v];
+            }
+        }
+    }
+    // 11. Output projection V_dim -> hidden_dim, per token.
+    struct tensor * out_t = matmul_dispatch(&Lw->ssm_out, y_norm);
+    return out_t;
+}
+
 // Attention block for one transformer layer (non-SSM). Returns the
 // post-output-projection tensor; the caller is responsible for the
 // residual add. Mirrors llm_forward_ssm's contract.
