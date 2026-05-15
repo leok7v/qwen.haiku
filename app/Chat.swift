@@ -122,21 +122,24 @@ public enum ChatTemplate {
     /// `systemPrefix` ONLY on the first turn of a conversation; it
     /// is rendered inline with the user message (no
     /// `<|im_start|>system` block) matching im.ai's framing.
+    ///
+    /// Delegates to the C side (`llm_chat_format_delta` in llm.c,
+    /// implemented in llm/jinja-template.c). One source of truth for
+    /// the framing — when llama.cpp's upstream chat template changes
+    /// (and the GGUF's tokenizer.chat_template KV changes), update
+    /// llm/jinja-template.c only.
     public static func applyDelta(userMessage: String,
                                   systemPrefix: String? = nil,
                                   reasoning: Bool = false) -> String {
-        var out  = "<|im_start|>user\n"
-        if let sys = systemPrefix, !sys.isEmpty {
-            out += sys + "\n\n"
+        var result = ""
+        let think: Int32 = reasoning ? 1 : 0
+        if let raw = llm_chat_format_delta(userMessage,
+                                           systemPrefix,
+                                           think) {
+            result = String(cString: raw)
+            free(raw)
         }
-        out += userMessage
-        out += "<|im_end|>\n<|im_start|>assistant\n"
-        if reasoning {
-            out += "<think>\n"
-        } else {
-            out += "<think>\n\n</think>\n\n"
-        }
-        return out
+        return result
     }
 
     private static func effortPrefix(_ e: ReasoningEffort) -> String {

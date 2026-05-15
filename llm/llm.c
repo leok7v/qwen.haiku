@@ -3270,6 +3270,45 @@ const char * llm_chat_template(const struct llm_ctx * c) {
     return (c == NULL) ? NULL : c->chat_template;
 }
 
+// Thin wrappers exposing jinja-template.c's chat-formatting through
+// the public llm_chat_format / llm_chat_format_delta API. We copy
+// the public llm_chat_message[] into the internal jinja_message
+// layout so the public ABI stays minimal (no tool_calls /
+// reasoning_content surface — text-only chat covers the iOS/macOS
+// app's needs). Tool support, when wired up later, can either grow
+// the public struct or take a richer "advanced" entry point.
+char * llm_chat_format(const struct llm_chat_message * messages,
+                       int n_messages,
+                       int add_generation_prompt,
+                       int enable_thinking) {
+    char * result = NULL;
+    if (messages != NULL && n_messages > 0) {
+        struct jinja_message * tmp =
+            (struct jinja_message *)calloc((size_t)n_messages,
+                                           sizeof(struct jinja_message));
+        if (tmp != NULL) {
+            for (int i = 0; i < n_messages; i++) {
+                tmp[i].role    = messages[i].role;
+                tmp[i].content = messages[i].content;
+                // reasoning_content / tool_calls left NULL — the
+                // assistant branch will derive reasoning from a
+                // <think>...</think> block in content if present.
+            }
+            result = jinja_apply(tmp, n_messages, NULL, 0,
+                                 add_generation_prompt, enable_thinking);
+            free(tmp);
+        }
+    }
+    return result;
+}
+
+char * llm_chat_format_delta(const char * user_message,
+                             const char * system_prefix,
+                             int enable_thinking) {
+    return jinja_apply_delta(user_message, system_prefix,
+                             enable_thinking);
+}
+
 typedef int (*llm_token_cb)(const char * utf8, void * user);
 
 int llm_generate(struct llm_ctx * c,

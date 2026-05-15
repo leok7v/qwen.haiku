@@ -157,6 +157,50 @@ int32_t llm_n_generated(const struct llm_ctx * ctx);
 // in docs/DESIGN.md whose structure mirrors this template.
 const char * llm_chat_template(const struct llm_ctx * ctx);
 
+// ---------------------------------------------------------------------------
+// Chat-template formatting (hand-translated Qwen3.5 Jinja, see
+// llm/jinja-template.c). These let Swift / Obj-C / Python callers
+// produce the model-facing prompt bytes without re-implementing the
+// state machine on their side. Returned strings are heap-allocated;
+// callers free with `free()` from <stdlib.h>.
+
+// Roles for llm_chat_message.role. Numbers match jinja-template.c
+// internals but are part of the public API contract.
+enum llm_chat_role {
+    LLM_CHAT_ROLE_SYSTEM    = 0,
+    LLM_CHAT_ROLE_USER      = 1,
+    LLM_CHAT_ROLE_ASSISTANT = 2,
+    LLM_CHAT_ROLE_TOOL      = 3,
+};
+
+struct llm_chat_message {
+    int          role;     // one of llm_chat_role
+    const char * content;  // NUL-terminated UTF-8, may be NULL
+};
+
+// Render a full conversation. `messages` is `n_messages` entries.
+// `add_generation_prompt` (1/0) controls whether the trailing
+// `<|im_start|>assistant\n...` block is emitted so the model
+// continues from there. `enable_thinking` (1/0) controls whether the
+// generation prompt opens a `<think>\n` block (model will fill it
+// before producing content) or pre-fills the empty
+// `<think>\n\n</think>\n\n` block (skip-reasoning default).
+// Returns NULL if `messages` is NULL or `n_messages <= 0`.
+char * llm_chat_format(const struct llm_chat_message * messages,
+                       int n_messages,
+                       int add_generation_prompt,
+                       int enable_thinking);
+
+// Render ONE new user turn for persistent-KV chat. Produces the
+// bytes you tokenize and feed into the next llm_generate() call,
+// given an already-warm context. `system_prefix` is rendered INLINE
+// with the user message (no separate <|im_start|>system block) and
+// should be passed only on the FIRST turn of a conversation, NULL
+// otherwise. Returns NULL if `user_message` is NULL.
+char * llm_chat_format_delta(const char * user_message,
+                             const char * system_prefix,
+                             int enable_thinking);
+
 #ifdef __cplusplus
 }
 #endif
