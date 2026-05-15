@@ -91,6 +91,14 @@ final class QwenViewModel {
     var systemPrompt: String       =
         "You are a helpful assistant.\n"
     var messages:     [ChatMessage] = []
+    // Think toggle controls reasoning. When on, the gen prompt opens
+    // a `<think>\n` block (instead of pre-filling the empty
+    // `<think>\n\n</think>\n\n`), and reasoning bytes the model
+    // produces get routed into `ChatMessage.reasoning` so the UI can
+    // render them as a muted block above the visible content. Off by
+    // default — Qwen3.5-0.8B's documented default, and at this size
+    // the reasoning is rarely worth the latency.
+    var think:        Bool          = false
     // Tools toggle drives both (a) the first-turn frame: when off,
     // the system block emitted by `ChatTemplate.applyDelta` has no
     // `# Tools` advertisement, so the model doesn't know any tools
@@ -244,6 +252,7 @@ final class QwenViewModel {
             let delta = ChatTemplate.applyDelta(
                 userMessage: trimmedUser,
                 systemPrefix: isFirstTurn ? trimmedSys : nil,
+                reasoning: self.think,
                 tools: self.tools)
             self.state         = .generating
             self.stopRequested = false
@@ -255,6 +264,7 @@ final class QwenViewModel {
             // when off, `<tool_call>` markers stream as plain content.
             self.qwen?.options.debug = self.debug
             self.qwen?.options.tools = self.tools
+            self.qwen?.options.think = self.think
             await self.streamAssistant(prompt: delta, at: assistantIdx)
         }
     }
@@ -267,6 +277,7 @@ final class QwenViewModel {
     private func streamAssistant(prompt: String, at idx: Int) async {
         if let qwen = self.qwen {
             let debugOn = self.debug
+            let thinkOn = self.think
             await Task.detached(priority: .userInitiated) { [weak self] in
                 var filter = ChatStreamFilter()
                 do {
@@ -282,10 +293,19 @@ final class QwenViewModel {
                                 }
                             }
                             if filter.done { keepGoing = false }
-                        case .reasoning(_):
-                            // Drop — could go to a thinking pane
-                            // in a future iteration.
-                            break
+                        case .reasoning(let s):
+                            // When Think is on, accumulate reasoning
+                            // into the message's reasoning field so
+                            // messageRow can render it muted above
+                            // the content. When off, drop silently
+                            // (model shouldn't emit any since the
+                            // gen prompt pre-filled an empty think
+                            // block — but be defensive).
+                            if thinkOn {
+                                Task { @MainActor in
+                                    self?.appendReasoning(s, at: idx)
+                                }
+                            }
                         case .toolCall(let body):
                             if debugOn {
                                 let line = "\n[tool: " + body + "]\n"
@@ -350,6 +370,13 @@ final class QwenViewModel {
     private func appendAssistant(_ piece: String, at idx: Int) {
         if idx < self.messages.count {
             self.messages[idx].content += piece
+        }
+    }
+
+    private func appendReasoning(_ piece: String, at idx: Int) {
+        if idx < self.messages.count {
+            let prev = self.messages[idx].reasoning ?? ""
+            self.messages[idx].reasoning = prev + piece
         }
     }
 
@@ -489,6 +516,14 @@ struct ContentView: View {
                 .toggleStyle(.checkbox)
                 .font(.caption.monospaced())
                 .disabled(vm.state == .generating)
+            // Think toggle: when on, the gen prompt opens a
+            // `<think>\n` block and the model emits reasoning before
+            // content. Reasoning lands in `ChatMessage.reasoning`
+            // and is rendered as a muted block above the bubble.
+            Toggle("Think", isOn: $vm.think)
+                .toggleStyle(.checkbox)
+                .font(.caption.monospaced())
+                .disabled(vm.state == .generating)
             // Debug toggle: when on, agent tool_call / tool_response
             // chunks land as bracketed lines in the assistant bubble
             // so the user can watch the model's web activity.
@@ -558,10 +593,22 @@ struct ContentView: View {
                     .textSelection(.enabled)
             }
         } else {
-            Text(m.content.isEmpty ? "..." : m.content)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .foregroundStyle(m.content.isEmpty ? .secondary : .primary)
-                .textSelection(.enabled)
+            VStack(alignment: .leading, spacing: 6) {
+                if let r = m.reasoning, !r.isEmpty {
+                    Text(r)
+                        .font(.callout.italic())
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.background.secondary)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .textSelection(.enabled)
+                }
+                Text(m.content.isEmpty ? "..." : m.content)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .foregroundStyle(m.content.isEmpty ? .secondary : .primary)
+                    .textSelection(.enabled)
+            }
         }
     }
 
