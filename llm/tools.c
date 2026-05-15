@@ -311,26 +311,38 @@ static void tools_collapse_ws(const struct ts_buf * in,
     }
 }
 
-// Two Chrome-shaped UA variants the rotation picks between. Kept
-// Chrome-only so the matching Sec-CH-UA / Sec-CH-UA-Platform Client
-// Hints (which only Chromium emits) can be sent unconditionally
-// without fingerprint inconsistency. The two slots differ only in
-// platform (macOS, Windows) — version stays at 148 (matches the
-// example real-request headers Leo captured from his browser).
+// UA pool. Each slot carries the User-Agent string AND a "style"
+// tag — Chrome and Safari emit DIFFERENT header sets in real
+// traffic, and sending the wrong set with the wrong UA is itself
+// a fingerprint inconsistency that bot detectors look for. The
+// style flag drives the per-style header builder below.
+//
+// Slots populated from real captured browser requests (Leo's
+// Chrome 148 + Safari Incognito 26.4 against duckduckgo.com).
+enum tools_ua_style {
+    TOOLS_UA_CHROME = 0,
+    TOOLS_UA_SAFARI = 1,
+};
+
 struct tools_ua_slot {
-    const char * ua;
-    const char * sec_ch_ua_platform;  // value for Sec-CH-UA-Platform
+    const char *        ua;
+    enum tools_ua_style style;
+    const char *        ch_platform;  // Chrome-only; NULL for Safari
 };
 
 static const struct tools_ua_slot TOOLS_UA_POOL[] = {
     { "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
       " AppleWebKit/537.36 (KHTML, like Gecko)"
       " Chrome/148.0.0.0 Safari/537.36",
-      "\"macOS\"" },
+      TOOLS_UA_CHROME, "\"macOS\"" },
     { "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
       " AppleWebKit/537.36 (KHTML, like Gecko)"
       " Chrome/148.0.0.0 Safari/537.36",
-      "\"Windows\"" },
+      TOOLS_UA_CHROME, "\"Windows\"" },
+    { "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+      " AppleWebKit/605.1.15 (KHTML, like Gecko)"
+      " Version/26.4 Safari/605.1.15",
+      TOOLS_UA_SAFARI, NULL },
 };
 
 static const struct tools_ua_slot * tools_pick_ua(void) {
@@ -362,35 +374,48 @@ static int tools_http_get(const char * url, long timeout_ms,
         snprintf(ua_header, sizeof(ua_header),
                  "User-Agent: %s", slot->ua);
         hdrs = curl_slist_append(hdrs, ua_header);
-        // Match real Chrome 148 request header set Leo captured.
-        // Order roughly matches Chrome's emission order, which DDG's
-        // bot-detection has been known to score on.
+        // Shared headers (both Chrome and Safari emit these on a
+        // top-level navigation to an HTTPS URL with no referer).
         hdrs = curl_slist_append(hdrs,
             "Accept: text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,*/*;q=0.8");
+            "q=0.9,*/*;q=0.8");
         hdrs = curl_slist_append(hdrs,
             "Accept-Language: en-US,en;q=0.9");
-        hdrs = curl_slist_append(hdrs, "Cache-Control: no-cache");
-        hdrs = curl_slist_append(hdrs, "Pragma: no-cache");
         hdrs = curl_slist_append(hdrs, "Priority: u=0, i");
-        hdrs = curl_slist_append(hdrs, "DNT: 1");
-        // Chromium User-Agent Client Hints — Chrome 148 emits these
-        // on any HTTPS top-level navigation; their absence is itself
-        // a fingerprint signal for "this is not a real browser."
-        hdrs = curl_slist_append(hdrs,
-            "Sec-CH-UA: \"Chromium\";v=\"148\","
-            " \"Google Chrome\";v=\"148\","
-            " \"Not/A)Brand\";v=\"99\"");
-        hdrs = curl_slist_append(hdrs, "Sec-CH-UA-Mobile: ?0");
-        char ch_platform[64];
-        snprintf(ch_platform, sizeof(ch_platform),
-                 "Sec-CH-UA-Platform: %s", slot->sec_ch_ua_platform);
-        hdrs = curl_slist_append(hdrs, ch_platform);
+        // Sec-Fetch-Site: none means "no Referer / new tab nav" —
+        // matches the absence of a Referer header in our request.
+        // Real Chrome / Safari send "none" in that case, NOT
+        // "cross-site" (the previous value, which implied we came
+        // from a different site — another fingerprint inconsistency).
         hdrs = curl_slist_append(hdrs, "Sec-Fetch-Dest: document");
         hdrs = curl_slist_append(hdrs, "Sec-Fetch-Mode: navigate");
-        hdrs = curl_slist_append(hdrs, "Sec-Fetch-Site: cross-site");
-        hdrs = curl_slist_append(hdrs, "Sec-Fetch-User: ?1");
-        hdrs = curl_slist_append(hdrs, "Upgrade-Insecure-Requests: 1");
+        hdrs = curl_slist_append(hdrs, "Sec-Fetch-Site: none");
+        if (slot->style == TOOLS_UA_CHROME) {
+            // Chrome-only extras: User-Agent Client Hints, DNT,
+            // Pragma/Cache-Control, Sec-Fetch-User, Upgrade-Insecure.
+            // Order matches Chrome 148's real emission order.
+            hdrs = curl_slist_append(hdrs, "Cache-Control: no-cache");
+            hdrs = curl_slist_append(hdrs, "Pragma: no-cache");
+            hdrs = curl_slist_append(hdrs, "DNT: 1");
+            hdrs = curl_slist_append(hdrs,
+                "Sec-CH-UA: \"Chromium\";v=\"148\","
+                " \"Google Chrome\";v=\"148\","
+                " \"Not/A)Brand\";v=\"99\"");
+            hdrs = curl_slist_append(hdrs, "Sec-CH-UA-Mobile: ?0");
+            char ch_platform[64];
+            snprintf(ch_platform, sizeof(ch_platform),
+                     "Sec-CH-UA-Platform: %s",
+                     slot->ch_platform != NULL ? slot->ch_platform
+                                               : "\"macOS\"");
+            hdrs = curl_slist_append(hdrs, ch_platform);
+            hdrs = curl_slist_append(hdrs, "Sec-Fetch-User: ?1");
+            hdrs = curl_slist_append(hdrs,
+                "Upgrade-Insecure-Requests: 1");
+        }
+        // Safari Incognito sends the minimal set above plus nothing
+        // else — no Sec-CH-UA (Safari doesn't implement Client Hints),
+        // no Pragma, no DNT, no Upgrade-Insecure-Requests on this
+        // particular nav. Matches Leo's captured Safari headers.
         char errbuf[CURL_ERROR_SIZE];
         errbuf[0] = '\0';
         curl_easy_setopt(h, CURLOPT_URL, url);
@@ -534,8 +559,18 @@ static void tools_websearch(const char * query, int max_results,
         struct ts_buf eq = {0};
         tools_url_encode(query, &eq);
         struct ts_buf url = {0};
-        ts_puts(&url, "https://lite.duckduckgo.com/lite/?q=");
+        // Match the URL shape Leo's Safari Incognito captured for a
+        // real DDG search: ia=web (instant-answer category), origin=
+        // funnel_home_website (came from DDG home page), t=h_ (DDG's
+        // browser-type hint), then q=..., chip-select=search.
+        // The lite endpoint is forgiving and accepts a bare ?q=,
+        // but adding the funnel params makes the request match an
+        // organic-navigation profile.
+        ts_puts(&url,
+            "https://lite.duckduckgo.com/lite/"
+            "?ia=web&origin=funnel_home_website&t=h_&q=");
         if (eq.data != NULL) { ts_puts(&url, eq.data); }
+        ts_puts(&url, "&chip-select=search");
         struct ts_buf body = {0};
         long status = 0;
         int rc = tools_http_get(url.data, 15000, &body, &status);
