@@ -150,12 +150,12 @@ static char * agent_json_string(const char ** pp) {
     if (*p == '"') {
         p++;
         struct ts_buf buf = {0};
-        int closed = 0;
-        int err = 0;
+        bool closed = false;
+        bool err = false;
         while (!closed && !err && *p != '\0') {
             char c = *p;
             if (c == '"') {
-                closed = 1;
+                closed = true;
                 p++;
             } else if (c == '\\') {
                 p++;
@@ -180,7 +180,7 @@ static char * agent_json_string(const char ** pp) {
                         else { ok = false; }
                         if (ok) { cp = cp * 16 + (unsigned)d; p++; }
                     }
-                    if (!ok) { err = 1; }
+                    if (!ok) { err = true; }
                     else if (cp < 0x80) {
                         char ch = (char)cp; ts_put(&buf, &ch, 1);
                     } else if (cp < 0x800) {
@@ -196,7 +196,7 @@ static char * agent_json_string(const char ** pp) {
                         ts_put(&buf, three, 3);
                     }
                 } else {
-                    err = 1;
+                    err = true;
                 }
             } else {
                 ts_put(&buf, &c, 1);
@@ -240,14 +240,14 @@ static char * agent_json_value(const char ** pp) {
         char close = (open == '{') ? '}' : ']';
         int  depth = 0;
         const char * start = p;
-        int closed = 0;
+        bool closed = false;
         while (!closed && *p != '\0') {
             char c = *p;
             if (c == open)  { depth++; p++; }
             else if (c == close) {
                 depth--;
                 p++;
-                if (depth == 0) { closed = 1; }
+                if (depth == 0) { closed = true; }
             } else if (c == '"') {
                 char * dummy = agent_json_string(&p);
                 free(dummy);  // we don't need the value, just to skip
@@ -610,12 +610,16 @@ static char * agent_run(struct llm_ctx * ctx,
     int n_owned = 0;
     memset(owned, 0, sizeof(owned));
     char * final_text = NULL;
-    bool done  = false;
-    int  iter  = 0;
-    bool rc_ok = true;
+    int    iter       = 0;
     int32_t * ids =
         (int32_t *)oom(calloc(16384, sizeof(int32_t)));
-    while (!done && iter < max_iters && rc_ok) {
+    // Loop post-condition: `final_text != NULL` is "we converged",
+    // `iter == max_iters` is "we ran out of attempts". No `done` /
+    // `rc_ok` flags — both were structural goto in disguise. A
+    // failed jinja_apply forces iter = max_iters (we can't proceed
+    // and re-trying would just hit the same NULL), which gives the
+    // same post-loop fallback path as natural exhaustion.
+    while (final_text == NULL && iter < max_iters) {
         iter++;
         char * prompt =
             jinja_apply((const struct jinja_message *)msgs,
@@ -623,7 +627,7 @@ static char * agent_run(struct llm_ctx * ctx,
                         /*add_generation_prompt=*/1,
                         /*enable_thinking=*/0);
         if (prompt == NULL) {
-            rc_ok = false;
+            iter = max_iters;   // force loop exit (no progress possible)
         } else {
             int32_t n_ids =
                 tokenizer_encode(&ctx->tok, prompt, ids, 16384);
@@ -666,10 +670,10 @@ static char * agent_run(struct llm_ctx * ctx,
                 // No tool calls - this is the final answer. The
                 // model's content may still contain <tool_call>-
                 // shaped fragments (rare) but the well-formed parser
-                // saw none, so just hand the bytes back.
+                // saw none, so just hand the bytes back. The loop
+                // exits because final_text is now non-NULL.
                 final_text = reply.data;
                 reply.data = NULL;
-                done = true;
             } else {
                 // Echo the assistant turn into history (verbatim;
                 // the Jinja's content-after-</think> rule strips

@@ -617,12 +617,12 @@ __attribute__((unused)) static int g_min_new = 0;
     } while (0)
 
 // ---------------------------------------------------------------------------
-// qh_trace: machine-comparable per-tensor JSONL dump, enabled when the
+// qwen_trace: machine-comparable per-tensor JSONL dump, enabled when the
 // QH_TRACE_OUT env var is set to a writable path. The schema matches
 // what llama.cpp/tools/qwen-haiku/llama-qwen-haiku emits, so a side-by-side
 // proofdiff of the two files reveals the first divergence on a fixed
 // prompt + greedy run. Disabled at runtime when the file pointer is
-// NULL - the qh_trace_f32 call sites then degenerate to a single
+// NULL - the qwen_trace_f32 call sites then degenerate to a single
 // pointer comparison.
 //
 // Emitted fields per line:
@@ -634,19 +634,19 @@ __attribute__((unused)) static int g_min_new = 0;
 
 static FILE * g_qh_trace_fp = NULL;
 
-static void qh_trace_open(void) {
+static void qwen_trace_open(void) {
     if (g_qh_trace_fp == NULL) {
         const char * p = getenv("QH_TRACE_OUT");
         if (p != NULL && p[0] != '\0') {
             g_qh_trace_fp = fopen(p, "w");
             if (g_qh_trace_fp != NULL) {
-                fprintf(stderr, "qh_trace: writing JSONL to %s\n", p);
+                fprintf(stderr, "qwen_trace: writing JSONL to %s\n", p);
             }
         }
     }
 }
 
-static void qh_trace_close(void) {
+static void qwen_trace_close(void) {
     if (g_qh_trace_fp != NULL) {
         fclose(g_qh_trace_fp);
         g_qh_trace_fp = NULL;
@@ -657,7 +657,7 @@ static void qh_trace_close(void) {
 // implementations; identical bytes -> identical hash. We do NOT need
 // cryptographic strength, just "did the bytes match?" - collision
 // probability for typical tensor sizes is negligible.
-static uint64_t qh_fnv1a64(const uint8_t * data, size_t n) {
+static uint64_t qwen_fnv1a64(const uint8_t * data, size_t n) {
     uint64_t h = 0xcbf29ce484222325ULL;
     for (size_t i = 0; i < n; i++) {
         h ^= (uint64_t)data[i];
@@ -666,7 +666,7 @@ static uint64_t qh_fnv1a64(const uint8_t * data, size_t n) {
     return h;
 }
 
-static void qh_emit_floats(FILE * f, const char * key,
+static void qwen_emit_floats(FILE * f, const char * key,
                            const float * v, int n) {
     fprintf(f, ",\"%s\":[", key);
     for (int i = 0; i < n; i++) {
@@ -690,7 +690,7 @@ static void qh_emit_floats(FILE * f, const char * key,
     fputs("]", f);
 }
 
-static void qh_trace_f32(const char * name, const char * op,
+static void qwen_trace_f32(const char * name, const char * op,
                          const float * data,
                          int64_t ne0, int64_t ne1,
                          int64_t ne2, int64_t ne3) {
@@ -698,7 +698,7 @@ static void qh_trace_f32(const char * name, const char * op,
     int64_t n = ne0 * ne1 * ne2 * ne3;
     if (f != NULL && n > 0) {
         size_t   nbytes = (size_t)n * sizeof(float);
-        uint64_t fnv    = qh_fnv1a64((const uint8_t *)data, nbytes);
+        uint64_t fnv    = qwen_fnv1a64((const uint8_t *)data, nbytes);
         int64_t  k      = n < 8 ? n : 8;
         int64_t  tstart = n - k > 0 ? n - k : 0;
         float    head[8] = {0,0,0,0,0,0,0,0};
@@ -730,27 +730,27 @@ static void qh_trace_f32(const char * name, const char * op,
                 (long long)ne2, (long long)ne3,
                 (long long)nb1, (long long)nb2, (long long)nb3,
                 nbytes, (unsigned long long)fnv);
-        qh_emit_floats(f, "head", head, (int)k);
-        qh_emit_floats(f, "tail", tail, (int)k);
+        qwen_emit_floats(f, "head", head, (int)k);
+        qwen_emit_floats(f, "tail", tail, (int)k);
         fprintf(f, ",\"sum\":%.9g,\"n_nan\":%d,\"n_inf\":%d}\n",
                 sum, n_nan, n_inf);
     }
 }
 
 // Convenience: trace a 1D row of n fp32 values.
-static inline void qh_trace_row(const char * name, const char * op,
+static inline void qwen_trace_row(const char * name, const char * op,
                                 const float * data, int64_t n) {
-    qh_trace_f32(name, op, data, n, 1, 1, 1);
+    qwen_trace_f32(name, op, data, n, 1, 1, 1);
 }
 
 // Convenience: trace a 2D batch tensor of shape (dim, n_tokens).
 // Emits one JSONL line covering all n_tokens; the receiving side
 // (llama.cpp/qwen-haiku reference dumper) uses the same shape when
 // it runs chunked prefill, so byte-comparing the two files works.
-static inline void qh_trace_batch(const char * name, const char * op,
+static inline void qwen_trace_batch(const char * name, const char * op,
                                   const float * data,
                                   int64_t dim, int64_t n_tokens) {
-    qh_trace_f32(name, op, data, dim, n_tokens, 1, 1);
+    qwen_trace_f32(name, op, data, dim, n_tokens, 1, 1);
 }
 
 static void llm_dump_row(const char * label, const float * data, int32_t n) {
@@ -857,7 +857,7 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
-        qh_trace_row(nm, "RMS_NORM", h_norm->data, c->cfg.hidden_dim);
+        qwen_trace_row(nm, "RMS_NORM", h_norm->data, c->cfg.hidden_dim);
     }
     // 2. In-projections.
     struct tensor * qkv_pre = matmul_dispatch(&Lw->attn_qkv,  h_norm);
@@ -865,7 +865,7 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_qkv-%d", (int)L);
-        qh_trace_row(nm, "MUL_MAT", qkv_pre->data, conv_dim);
+        qwen_trace_row(nm, "MUL_MAT", qkv_pre->data, conv_dim);
     }
     struct tensor * z = matmul_dispatch(&Lw->attn_gate, h_norm);
     // GGUF naming ambiguity: ssm_alpha vs ssm_beta - neither the
@@ -883,9 +883,9 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "alpha-%d", (int)L);
-        qh_trace_row(nm, "MUL_MAT", a_t->data, n_heads);
+        qwen_trace_row(nm, "MUL_MAT", a_t->data, n_heads);
         snprintf(nm, sizeof(nm), "beta-%d", (int)L);
-        qh_trace_row(nm, "MUL_MAT", b_t->data, n_heads);
+        qwen_trace_row(nm, "MUL_MAT", b_t->data, n_heads);
     }
     // shapes: qkv_pre(conv_dim,1), z(V_dim,1), b_t(n_heads,1), a_t(n_heads,1).
     // 3. Shift conv state ring; write qkv_pre into the new slot.
@@ -926,7 +926,7 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "conv_raw-%d", (int)L);
-        qh_trace_row(nm, "CONV1D", mixed->data, conv_dim);
+        qwen_trace_row(nm, "CONV1D", mixed->data, conv_dim);
     }
     // SiLU using ggml's NEON polynomial-approximation expf; bit-
     // identical to ggml's GGML_OP_SILU output. The libm scalar form
@@ -950,11 +950,11 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "Q_raw-%d", (int)L);
-        qh_trace_row(nm, "VIEW", Q_flat, K_dim);
+        qwen_trace_row(nm, "VIEW", Q_flat, K_dim);
         snprintf(nm, sizeof(nm), "K_raw-%d", (int)L);
-        qh_trace_row(nm, "VIEW", K_flat, K_dim);
+        qwen_trace_row(nm, "VIEW", K_flat, K_dim);
         snprintf(nm, sizeof(nm), "V_raw-%d", (int)L);
-        qh_trace_row(nm, "VIEW", V_flat, V_dim);
+        qwen_trace_row(nm, "VIEW", V_flat, V_dim);
     }
     // 6/7. L2-normalise Q and K per-head along head dim. Then scale
     //      Q by 1/sqrt(k_hd) (the attention temperature).
@@ -990,9 +990,9 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "Q_l2norm-%d", (int)L);
-        qh_trace_row(nm, "L2_NORM_SCALE", Q_norm, K_dim);
+        qwen_trace_row(nm, "L2_NORM_SCALE", Q_norm, K_dim);
         snprintf(nm, sizeof(nm), "K_l2norm-%d", (int)L);
-        qh_trace_row(nm, "L2_NORM", K_norm, K_dim);
+        qwen_trace_row(nm, "L2_NORM", K_norm, K_dim);
     }
     // 8. Per-head beta and g.
     //    NOTE: ssm_a in the GGUF is already pre-computed as the
@@ -1021,15 +1021,15 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
         // for layer 0 of qwen3-next; see tools/qwen-haiku trace map.
         char nm[48];
         snprintf(nm, sizeof(nm), "beta_in-%d", (int)L);
-        qh_trace_row(nm, "SIGMOID", beta, n_heads);
+        qwen_trace_row(nm, "SIGMOID", beta, n_heads);
         snprintf(nm, sizeof(nm), "a_softplus-%d", (int)L);
-        qh_trace_row(nm, "SOFTPLUS", a_softplus_dbg, n_heads);
+        qwen_trace_row(nm, "SOFTPLUS", a_softplus_dbg, n_heads);
         // llama's `g_in-0` is the PRE-EXP g_log value (ssm_a * softplus_a),
         // not the post-exp g. Trace g_log here so byte-equality is direct;
         // g_t = expf(g_log) is the local intermediate we feed into the
         // recurrent state update below.
         snprintf(nm, sizeof(nm), "g_in-%d", (int)L);
-        qh_trace_row(nm, "MUL", g_log_dbg, n_heads);
+        qwen_trace_row(nm, "MUL", g_log_dbg, n_heads);
     }
     // 9. Recurrent state update per head.
     //    state[L, h, k, v] flat as ssm_state[((L*n_heads + h)*k_hd + k)*v_hd + v]
@@ -1112,7 +1112,7 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
         // recurrent update separately from the gated rmsnorm.
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_output-%d", (int)L);
-        qh_trace_row(nm, "RECURRENT", out_flat, V_dim);
+        qwen_trace_row(nm, "RECURRENT", out_flat, V_dim);
     }
     // 10. Gated RMSNorm with z (per head, v_hd wide):
     //       y[h, :] = silu(z[h, :]) * (norm_w * rmsnorm(out[h, :]))
@@ -1154,9 +1154,9 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "conv_silu-%d", (int)L);
-        qh_trace_row(nm, "SILU", mixed->data, conv_dim);
+        qwen_trace_row(nm, "SILU", mixed->data, conv_dim);
         snprintf(nm, sizeof(nm), "y_norm-%d", (int)L);
-        qh_trace_row(nm, "RMS_NORM_GATED", y_norm->data, V_dim);
+        qwen_trace_row(nm, "RMS_NORM_GATED", y_norm->data, V_dim);
     }
     // 11. Output projection V_dim -> hidden.
     struct tensor * out_t = matmul_dispatch(&Lw->ssm_out, y_norm);
@@ -1164,7 +1164,7 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "ssm_out-%d", (int)L);
-        qh_trace_row(nm, "MUL_MAT", out_t->data, c->cfg.hidden_dim);
+        qwen_trace_row(nm, "MUL_MAT", out_t->data, c->cfg.hidden_dim);
     }
     return out_t;
 }
@@ -1203,7 +1203,7 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
-        qh_trace_batch(nm, "RMS_NORM",
+        qwen_trace_batch(nm, "RMS_NORM",
                        h_norm->data, c->cfg.hidden_dim, n);
     }
     // 2. In-projections - matmul_dispatch already iterates the n axis.
@@ -1214,11 +1214,11 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_qkv-%d", (int)L);
-        qh_trace_batch(nm, "MUL_MAT", qkv_pre->data, conv_dim, n);
+        qwen_trace_batch(nm, "MUL_MAT", qkv_pre->data, conv_dim, n);
         snprintf(nm, sizeof(nm), "alpha-%d", (int)L);
-        qh_trace_batch(nm, "MUL_MAT", a_t->data, n_heads, n);
+        qwen_trace_batch(nm, "MUL_MAT", a_t->data, n_heads, n);
         snprintf(nm, sizeof(nm), "beta-%d", (int)L);
-        qh_trace_batch(nm, "MUL_MAT", b_t->data, n_heads, n);
+        qwen_trace_batch(nm, "MUL_MAT", b_t->data, n_heads, n);
     }
     // 3. Conv1d step per token (sequential, ring buffer state).
     struct tensor * mixed = tensor_new_2d(a, conv_dim, n);
@@ -1248,14 +1248,14 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "conv_raw-%d", (int)L);
-        qh_trace_batch(nm, "CONV1D", mixed->data, conv_dim, n);
+        qwen_trace_batch(nm, "CONV1D", mixed->data, conv_dim, n);
     }
     // 4. SiLU on all tokens at once.
     neon_silu_vec_f32(n * conv_dim, mixed->data, mixed->data);
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "conv_silu-%d", (int)L);
-        qh_trace_batch(nm, "SILU", mixed->data, conv_dim, n);
+        qwen_trace_batch(nm, "SILU", mixed->data, conv_dim, n);
     }
     // 5. Split Q, K, V (per-token contiguous within conv_dim).
     float * Q_all = (float *)arena_alloc(a, (size_t)n * K_dim * sizeof(float));
@@ -1290,9 +1290,9 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "Q_l2norm-%d", (int)L);
-        qh_trace_batch(nm, "L2_NORM_SCALE", Q_all, K_dim, n);
+        qwen_trace_batch(nm, "L2_NORM_SCALE", Q_all, K_dim, n);
         snprintf(nm, sizeof(nm), "K_l2norm-%d", (int)L);
-        qh_trace_batch(nm, "L2_NORM", K_all, K_dim, n);
+        qwen_trace_batch(nm, "L2_NORM", K_all, K_dim, n);
     }
     // 8. beta, g_log per token per head.
     const float * ssm_a_w   = (const float *)Lw->ssm_a.data;
@@ -1311,9 +1311,9 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "beta_in-%d", (int)L);
-        qh_trace_batch(nm, "SIGMOID", beta_all, n_heads, n);
+        qwen_trace_batch(nm, "SIGMOID", beta_all, n_heads, n);
         snprintf(nm, sizeof(nm), "g_in-%d", (int)L);
-        qh_trace_batch(nm, "MUL", g_log_all, n_heads, n);
+        qwen_trace_batch(nm, "MUL", g_log_all, n_heads, n);
     }
     // 9. Chunked SSM per head. Per-chunk buffers (sized at CHUNK_SIZE
     //    so the same scratch handles every chunk; the kernel uses the
@@ -1424,14 +1424,14 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "y_norm-%d", (int)L);
-        qh_trace_batch(nm, "GATED_RMSNORM", y_norm->data, V_dim, n);
+        qwen_trace_batch(nm, "GATED_RMSNORM", y_norm->data, V_dim, n);
     }
     // 11. Output projection V_dim -> hidden_dim, per token.
     struct tensor * out_t = matmul_dispatch(&Lw->ssm_out, y_norm);
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "ssm_out-%d", (int)L);
-        qh_trace_batch(nm, "MUL_MAT",
+        qwen_trace_batch(nm, "MUL_MAT",
                        out_t->data, c->cfg.hidden_dim, n);
     }
     return out_t;
@@ -1462,7 +1462,7 @@ static struct tensor * llm_forward_attn(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
-        qh_trace_row(nm, "RMS_NORM", h_norm->data, c->cfg.hidden_dim);
+        qwen_trace_row(nm, "RMS_NORM", h_norm->data, c->cfg.hidden_dim);
     }
     // Q / K / V projections. Qwen3.5 has attn_output_gate=true: the
     // Q projection emits n_heads*head_dim*2, split into (Q, gate).
@@ -1475,11 +1475,11 @@ static struct tensor * llm_forward_attn(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "Qfull-%d", (int)L);
-        qh_trace_row(nm, "MUL_MAT", q_raw->data, attn_inner * 2);
+        qwen_trace_row(nm, "MUL_MAT", q_raw->data, attn_inner * 2);
         snprintf(nm, sizeof(nm), "Kcur-%d", (int)L);
-        qh_trace_row(nm, "MUL_MAT", k->data, kv_hidden);
+        qwen_trace_row(nm, "MUL_MAT", k->data, kv_hidden);
         snprintf(nm, sizeof(nm), "Vcur-%d", (int)L);
-        qh_trace_row(nm, "MUL_MAT", v->data, kv_hidden);
+        qwen_trace_row(nm, "MUL_MAT", v->data, kv_hidden);
     }
     if (c->dump_layer == L) {
         llm_dump_row("[A]Qfull  ", q_raw->data, attn_inner * 2);
@@ -1632,7 +1632,7 @@ static struct tensor * llm_forward_attn(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_out-%d", (int)L);
-        qh_trace_row(nm, "MUL_MAT",
+        qwen_trace_row(nm, "MUL_MAT",
                      attn_out_t->data, c->cfg.hidden_dim);
     }
     return attn_out_t;
@@ -1670,7 +1670,7 @@ static struct tensor * llm_forward_attn_batch(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
-        qh_trace_batch(nm, "RMS_NORM",
+        qwen_trace_batch(nm, "RMS_NORM",
                        h_norm->data, c->cfg.hidden_dim, n);
     }
     // Q/K/V projections — matmul_dispatch handles ne[1]=n natively.
@@ -1680,11 +1680,11 @@ static struct tensor * llm_forward_attn_batch(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "Qfull-%d", (int)L);
-        qh_trace_batch(nm, "MUL_MAT", q_raw->data, attn_inner * 2, n);
+        qwen_trace_batch(nm, "MUL_MAT", q_raw->data, attn_inner * 2, n);
         snprintf(nm, sizeof(nm), "Kcur-%d", (int)L);
-        qh_trace_batch(nm, "MUL_MAT", k->data, kv_hidden, n);
+        qwen_trace_batch(nm, "MUL_MAT", k->data, kv_hidden, n);
         snprintf(nm, sizeof(nm), "Vcur-%d", (int)L);
-        qh_trace_batch(nm, "MUL_MAT", v->data, kv_hidden, n);
+        qwen_trace_batch(nm, "MUL_MAT", v->data, kv_hidden, n);
     }
     // Split q_raw into (q, gate) per token when attn_output_gate=true.
     // q_raw has shape [2*attn_inner, n] in head-interleaved layout.
@@ -1818,7 +1818,7 @@ static struct tensor * llm_forward_attn_batch(struct llm_ctx * c,
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "attn_out-%d", (int)L);
-        qh_trace_batch(nm, "MUL_MAT",
+        qwen_trace_batch(nm, "MUL_MAT",
                        attn_out_t->data, c->cfg.hidden_dim, n);
     }
     return attn_out_t;
@@ -1859,7 +1859,7 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
         }
     }
     // h shape: (hidden_dim, 1)
-    qh_trace_row("inp_embd", "GET_ROWS", h->data, c->cfg.hidden_dim);
+    qwen_trace_row("inp_embd", "GET_ROWS", h->data, c->cfg.hidden_dim);
 
     static int8_t use_ssm_batch = -1;
     if (use_ssm_batch < 0) {
@@ -1883,7 +1883,7 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "mix-%d", (int)L);
-            qh_trace_row(nm, Lw->is_ssm ? "SSM" : "ATTN",
+            qwen_trace_row(nm, Lw->is_ssm ? "SSM" : "ATTN",
                          mix->data, c->cfg.hidden_dim);
         }
         h = tensor_add(h, mix);
@@ -1893,7 +1893,7 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "mix_residual-%d", (int)L);
-            qh_trace_row(nm, "ADD", h->data, c->cfg.hidden_dim);
+            qwen_trace_row(nm, "ADD", h->data, c->cfg.hidden_dim);
         }
         struct tensor ffn_norm_w =
             weights_as_f32_view(&Lw->ffn_norm, a);
@@ -1903,7 +1903,7 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "ffn_norm-%d", (int)L);
-            qh_trace_row(nm, "RMS_NORM",
+            qwen_trace_row(nm, "RMS_NORM",
                          h_ffn_norm->data, c->cfg.hidden_dim);
         }
         struct tensor * gate     = matmul_dispatch(&Lw->ffn_gate, h_ffn_norm);
@@ -1919,7 +1919,7 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "ffn_out-%d", (int)L);
-            qh_trace_row(nm, "MUL_MAT",
+            qwen_trace_row(nm, "MUL_MAT",
                          ffn_out->data, c->cfg.hidden_dim);
         }
         h = tensor_add(h, ffn_out);
@@ -1927,7 +1927,7 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "l_out-%d", (int)L);
-            qh_trace_row(nm, "ADD", h->data, c->cfg.hidden_dim);
+            qwen_trace_row(nm, "ADD", h->data, c->cfg.hidden_dim);
         }
     }
 
@@ -1936,10 +1936,10 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
         weights_as_f32_view(&c->W.output_norm, a);
     struct tensor * h_final =
         tensor_rms_norm(h, &output_norm_w, c->cfg.norm_eps);
-    qh_trace_row("result_norm", "RMS_NORM",
+    qwen_trace_row("result_norm", "RMS_NORM",
                  h_final->data, c->cfg.hidden_dim);
     struct tensor * logits = matmul_dispatch(&c->W.output, h_final);
-    qh_trace_row("result_output", "MUL_MAT",
+    qwen_trace_row("result_output", "MUL_MAT",
                  logits->data, (int64_t)tensor_nelements(logits));
     return logits;
 }
@@ -2004,7 +2004,7 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
             }
         }
     }
-    qh_trace_batch("inp_embd", "GET_ROWS", h->data, hidden_dim, n);
+    qwen_trace_batch("inp_embd", "GET_ROWS", h->data, hidden_dim, n);
     // 2. Per-layer.
     for (int32_t L = 0; L < c->cfg.n_layers; L++) {
         struct llm_layer_w * Lw = &c->W.layers[L];
@@ -2023,7 +2023,7 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "mix-%d", (int)L);
-            qh_trace_batch(nm, Lw->is_ssm ? "SSM" : "ATTN",
+            qwen_trace_batch(nm, Lw->is_ssm ? "SSM" : "ATTN",
                            mix->data, hidden_dim, n);
         }
         // h = h + mix (per-token elementwise add).
@@ -2031,7 +2031,7 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "mix_residual-%d", (int)L);
-            qh_trace_batch(nm, "ADD", h->data, hidden_dim, n);
+            qwen_trace_batch(nm, "ADD", h->data, hidden_dim, n);
         }
         // FFN: rms_norm + SwiGLU + matmul, all n-axis-aware.
         struct tensor ffn_norm_w = weights_as_f32_view(&Lw->ffn_norm, a);
@@ -2040,7 +2040,7 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "ffn_norm-%d", (int)L);
-            qh_trace_batch(nm, "RMS_NORM", h_ffn_norm->data, hidden_dim, n);
+            qwen_trace_batch(nm, "RMS_NORM", h_ffn_norm->data, hidden_dim, n);
         }
         struct tensor * gate     = matmul_dispatch(&Lw->ffn_gate, h_ffn_norm);
         struct tensor * up       = matmul_dispatch(&Lw->ffn_up,   h_ffn_norm);
@@ -2052,13 +2052,13 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "ffn_out-%d", (int)L);
-            qh_trace_batch(nm, "MUL_MAT", ffn_out->data, hidden_dim, n);
+            qwen_trace_batch(nm, "MUL_MAT", ffn_out->data, hidden_dim, n);
         }
         h = tensor_add(h, ffn_out);
         {
             char nm[48];
             snprintf(nm, sizeof(nm), "l_out-%d", (int)L);
-            qh_trace_batch(nm, "ADD", h->data, hidden_dim, n);
+            qwen_trace_batch(nm, "ADD", h->data, hidden_dim, n);
         }
     }
     // 3. Final RMS-norm + lm_head on the LAST token only.
@@ -2071,9 +2071,9 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
         weights_as_f32_view(&c->W.output_norm, a);
     struct tensor * h_final =
         tensor_rms_norm(h_last, &output_norm_w, c->cfg.norm_eps);
-    qh_trace_row("result_norm", "RMS_NORM", h_final->data, hidden_dim);
+    qwen_trace_row("result_norm", "RMS_NORM", h_final->data, hidden_dim);
     struct tensor * logits = matmul_dispatch(&c->W.output, h_final);
-    qh_trace_row("result_output", "MUL_MAT",
+    qwen_trace_row("result_output", "MUL_MAT",
                  logits->data, c->cfg.vocab_size);
     return logits;
 }

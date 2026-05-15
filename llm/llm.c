@@ -237,7 +237,7 @@ static int llm_generate_raw(struct llm_ctx * c,
     if (sampler_in != NULL) { sp = *sampler_in; }
     struct rng rng;
     rng_seed(&rng, seed != 0 ? seed : (uint64_t)time(NULL));
-    qh_trace_open();
+    qwen_trace_open();
     int32_t   generated = 0;
     int32_t   pos       = c->pos;        // resume after previous call
     bool      stop      = false;
@@ -266,7 +266,7 @@ static int llm_generate_raw(struct llm_ctx * c,
                                                    prompt_n, pos);
         (void)logits;
         pos += prompt_n;
-        qh_trace_close();
+        qwen_trace_close();
     } else {
         for (int32_t i = 0; i < prompt_n && !stop; i++) {
             struct tensor * logits = llm_forward_step(c, prompt_ids[i], pos);
@@ -274,7 +274,7 @@ static int llm_generate_raw(struct llm_ctx * c,
             // forward pass only - one prompt token -> ~1850 JSONL
             // lines matches the llama-qwen-haiku reference dump
             // shape. Close after step 0 to keep file size bounded.
-            if (i == 0) { qh_trace_close(); }
+            if (i == 0) { qwen_trace_close(); }
             (void)logits;
             pos++;
             // Periodically emit prefill progress so the UI can show
@@ -357,7 +357,7 @@ static int llm_generate_raw(struct llm_ctx * c,
     c->n_generated = generated;
     c->pos         = pos;                // persist across calls
     free(history);
-    qh_trace_close();
+    qwen_trace_close();
     return generated;
 }
 
@@ -410,10 +410,20 @@ enum llm_think_marker_row {
 
 struct llm_think_filter {
     enum llm_think_mode mode;
-    char                hold_data[64];   // partial-marker holdback
+    // Partial-marker hold-back: a fixed 64-byte sliding window. The
+    // size is NOT incidental — it's the algorithmic flush trigger in
+    // llm_think_filter_push: once hold_n == sizeof(hold_data), the
+    // loop emits the front and keeps the trailing
+    // LLM_THINK_MAX_MARKER-1 (=11) bytes as a potential prefix.
+    // Backing this with `struct chars` would let it grow unbounded
+    // and the flush would never happen, so we keep the fixed array.
+    char                hold_data[64];
     int                 hold_n;
-    char                tool_call_data[4096];  // body of <tool_call>
-    int                 tool_call_n;
+    // <tool_call>...</tool_call> body accumulator. Grows as needed
+    // via chars_put. Caller (llm_generate) calls `chars_free` after
+    // reading tool_call.data; the filter itself does no allocation
+    // bookkeeping outside chars_put.
+    struct chars        tool_call;
     // Flipped true by the filter the moment a </tool_call> marker
     // is consumed. The public llm_generate loop reads this after
     // the generate_raw call returns to dispatch the tool + re-feed
@@ -446,12 +456,15 @@ static const struct llm_think_marker THINK_MARKERS[] = {
     ((int)(sizeof(THINK_MARKERS) / sizeof(THINK_MARKERS[0])))
 #define LLM_THINK_MAX_MARKER 12  // strlen("</tool_call>")
 
+// Caller is expected to zero-init the filter (or its containing
+// struct, e.g. `struct llm_split_box box = {0};`) BEFORE calling
+// init the first time — init does not chars_free the tool_call
+// buffer, so it would leak any previous heap allocation.
 static void llm_think_filter_init(struct llm_think_filter * f) {
     f->mode = THINK_MODE_CONTENT;
     f->hold_n = 0;
     f->hold_data[0] = '\0';
-    f->tool_call_n = 0;
-    f->tool_call_data[0] = '\0';
+    f->tool_call = (struct chars){0};
     f->tool_call_ready = false;
     f->recognize_tool_calls = true;  // default on; llm_generate overrides
     f->emit_visibility      = true;
@@ -469,19 +482,11 @@ static int llm_think_emit(struct llm_think_filter * f,
     int rc = 0;
     if (n > 0) {
         if (f->mode == THINK_MODE_TOOL_CALL) {
-            // Buffering inside a tool_call block — don't emit yet.
-            int avail = (int)sizeof(f->tool_call_data) - 1
-                      - f->tool_call_n;
-            int copy = n < avail ? n : avail;
-            if (copy > 0) {
-                memcpy(f->tool_call_data + f->tool_call_n,
-                       start, (size_t)copy);
-                f->tool_call_n += copy;
-                f->tool_call_data[f->tool_call_n] = '\0';
-            }
-            // If the call body overflows the fixed buffer the
-            // overflow is dropped — small models in practice emit
-            // tool_call blocks <1 KB; 4 KB is comfortable.
+            // Buffering inside a tool_call block — don't emit yet;
+            // grow as needed. No upper bound: the runtime tool-call
+            // bodies are well under 1 KB in practice, but if a model
+            // ever emits a giant one, we won't truncate it now.
+            chars_put(&f->tool_call, start, (size_t)n);
         } else if (cb != NULL) {
             char tmp[80];
             int  copy = n < (int)sizeof(tmp) - 1
@@ -651,10 +656,10 @@ int llm_think_filter_push(struct llm_think_filter * f,
                     // dispatch + inject.
                     if (prev_mode == THINK_MODE_TOOL_CALL &&
                         f->mode  != THINK_MODE_TOOL_CALL) {
-                        if (cb != NULL && f->tool_call_n > 0 &&
+                        if (cb != NULL && f->tool_call.count > 0 &&
                             f->emit_visibility) {
                             struct llm_stream_chunk chunk = {0};
-                            chunk.tool_call = f->tool_call_data;
+                            chunk.tool_call = f->tool_call.data;
                             int r3 = cb(&chunk, user);
                             if (r3 != 0) { rc = r3; }
                         }
@@ -667,11 +672,14 @@ int llm_think_filter_push(struct llm_think_filter * f,
                         more = false;
                     }
                     // other -> tool_call: entering a tool_call block;
-                    // reset the accumulator.
+                    // reset the accumulator (keep heap buffer for
+                    // reuse — chars_put will overwrite from offset 0).
                     if (prev_mode != THINK_MODE_TOOL_CALL &&
                         f->mode  == THINK_MODE_TOOL_CALL) {
-                        f->tool_call_n = 0;
-                        f->tool_call_data[0] = '\0';
+                        f->tool_call.count = 0;
+                        if (f->tool_call.data != NULL) {
+                            f->tool_call.data[0] = '\0';
+                        }
                     }
                     int after = pos + THINK_MARKERS[m].len;
                     int remain = f->hold_n - after;
@@ -822,7 +830,9 @@ static int llm_think_test_case(const char * name,
                                const char * want_content,
                                const char * want_reasoning) {
     int failed = 0;
-    struct llm_think_filter f;
+    // Zero-init the filter (the tool_call accumulator's heap buffer
+    // is the only allocating field; init assumes a cleared start).
+    struct llm_think_filter f = {0};
     llm_think_filter_init(&f);
     struct llm_think_test_capture cap;
     cap.content_n = 0;
@@ -846,6 +856,7 @@ static int llm_think_test_case(const char * name,
             name, cap.reasoning, want_reasoning);
         failed = 1;
     }
+    chars_free(&f.tool_call);
     return failed;
 }
 
@@ -1275,7 +1286,10 @@ int llm_generate(struct llm_ctx * c,
     int iter  = 0;
     while (!done && iter < LLM_GENERATE_TOOL_ITER_CAP &&
            total_gen < max_new) {
-        struct llm_split_box box;
+        // Zero-init the box so llm_think_filter_init can assume the
+        // tool_call accumulator starts cleared (init does NOT
+        // chars_free the previous heap buffer — see its header).
+        struct llm_split_box box = {0};
         llm_think_filter_init(&box.filter);
         // Toggle marker recognition + visibility chunk emission per
         // sampler flags. The filter consults these when scanning
@@ -1313,9 +1327,9 @@ int llm_generate(struct llm_ctx * c,
             const char * pre  = "<tool_call>";
             const char * post = "</tool_call>";
             chars_put(&wrapped, pre, strlen(pre));
-            if (box.filter.tool_call_n > 0) {
-                chars_put(&wrapped, box.filter.tool_call_data,
-                          (size_t)box.filter.tool_call_n);
+            if (box.filter.tool_call.count > 0) {
+                chars_put(&wrapped, box.filter.tool_call.data,
+                          box.filter.tool_call.count);
             }
             chars_put(&wrapped, post, strlen(post));
             chars_put(&wrapped, "", 0);
@@ -1368,6 +1382,9 @@ int llm_generate(struct llm_ctx * c,
         } else {
             done = true;
         }
+        // The filter's tool_call accumulator was the only heap-owning
+        // field; free it now that the iteration's read of it is past.
+        chars_free(&box.filter.tool_call);
         iter++;
     }
     free(cur_ids);
