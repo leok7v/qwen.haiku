@@ -2450,6 +2450,171 @@ static struct tensor * llm_forward_attn(struct llm_ctx * c,
     return attn_out_t;
 }
 
+// Multi-token attention block for batched prefill. Processes `n`
+// tokens against the existing KV cache (rows 0..pos_start-1) plus
+// the n new rows written by this call (rows pos_start..pos_start+n-1).
+//
+// Mirrors llm_forward_attn's contract: input is the (hidden_dim, n)
+// residual stream, output is the (hidden_dim, n) post-projection
+// tensor; caller does the residual add. State writes:
+//   - KV cache rows pos_start..pos_start+n-1 (k_rope/v, cast to fp16)
+//
+// Causal masking is handled by tensor_attention, which uses
+// k_offset = pos_start so each query t attends only to keys
+// 0..(pos_start + t).
+static struct tensor * llm_forward_attn_batch(struct llm_ctx * c,
+                                              int32_t L,
+                                              int32_t pos_start,
+                                              int32_t n,
+                                              struct tensor * h) {
+    struct arena * a = c->arena;
+    struct llm_layer_w * Lw = &c->W.layers[L];
+    int32_t hd         = c->cfg.head_dim;
+    int32_t n_h        = c->cfg.n_heads;
+    int32_t n_kvh      = c->cfg.n_kv_heads;
+    int32_t attn_inner = n_h * hd;
+    int32_t kv_hidden  = n_kvh * hd;
+    // RMSNorm over the n tokens. tensor_rms_norm iterates ne[1] = n.
+    struct tensor attn_norm_w =
+        weights_as_f32_view(&Lw->attn_norm, a);
+    struct tensor * h_norm =
+        tensor_rms_norm(h, &attn_norm_w, c->cfg.norm_eps);
+    // Q/K/V projections — matmul_dispatch handles ne[1]=n natively.
+    struct tensor * q_raw = matmul_dispatch(&Lw->attn_q, h_norm);
+    struct tensor * k     = matmul_dispatch(&Lw->attn_k, h_norm);
+    struct tensor * v     = matmul_dispatch(&Lw->attn_v, h_norm);
+    // Split q_raw into (q, gate) per token when attn_output_gate=true.
+    // q_raw has shape [2*attn_inner, n] in head-interleaved layout.
+    struct tensor * q = tensor_new_3d(a, hd, n_h, n);
+    struct tensor * attn_gate_v = NULL;
+    if (c->cfg.attn_output_gate) {
+        attn_gate_v = tensor_new_2d(a, attn_inner, n);
+        for (int32_t t = 0; t < n; t++) {
+            const float * src = q_raw->data + (size_t)t * (2 * attn_inner);
+            float * qdst   = q->data           + (size_t)t * attn_inner;
+            float * gdst   = attn_gate_v->data + (size_t)t * attn_inner;
+            for (int32_t h2 = 0; h2 < n_h; h2++) {
+                const float * sh = src + h2 * (2 * hd);
+                for (int32_t i = 0; i < hd; i++) {
+                    qdst[h2 * hd + i] = sh[i];
+                    gdst[h2 * hd + i] = sh[hd + i];
+                }
+            }
+        }
+    } else {
+        for (int32_t t = 0; t < n; t++) {
+            memcpy(q->data + (size_t)t * attn_inner,
+                   q_raw->data + (size_t)t * attn_inner,
+                   (size_t)attn_inner * sizeof(float));
+        }
+    }
+    // Reshape k/v to (hd, n_kvh, n).
+    k->ndim = 3; k->ne[0] = hd; k->ne[1] = n_kvh; k->ne[2] = n;
+    k->ne[3] = 1; tensor_set_packed_strides(k);
+    v->ndim = 3; v->ne[0] = hd; v->ne[1] = n_kvh; v->ne[2] = n;
+    v->ne[3] = 1; tensor_set_packed_strides(v);
+    // Per-head Q / K RMS norm (Qwen3 specific). View as 2D
+    // (hd, n_h*n) / (hd, n_kvh*n) so tensor_rms_norm normalises
+    // each head-vector independently.
+    if (Lw->attn_q_norm.data != NULL) {
+        struct tensor qn_w = weights_as_f32_view(&Lw->attn_q_norm, a);
+        struct tensor q2 = *q;
+        q2.ndim = 2;
+        q2.ne[0] = hd; q2.ne[1] = (int64_t)n_h * n;
+        for (int32_t i = 2; i < TENSOR_MAX_DIMS; i++) q2.ne[i] = 1;
+        tensor_set_packed_strides(&q2);
+        struct tensor * qnorm =
+            tensor_rms_norm(&q2, &qn_w, c->cfg.norm_eps);
+        qnorm->ndim = 3;
+        qnorm->ne[0] = hd; qnorm->ne[1] = n_h; qnorm->ne[2] = n;
+        tensor_set_packed_strides(qnorm);
+        q = qnorm;
+    }
+    if (Lw->attn_k_norm.data != NULL) {
+        struct tensor kn_w = weights_as_f32_view(&Lw->attn_k_norm, a);
+        struct tensor k2 = *k;
+        k2.ndim = 2;
+        k2.ne[0] = hd; k2.ne[1] = (int64_t)n_kvh * n;
+        for (int32_t i = 2; i < TENSOR_MAX_DIMS; i++) k2.ne[i] = 1;
+        tensor_set_packed_strides(&k2);
+        struct tensor * knorm =
+            tensor_rms_norm(&k2, &kn_w, c->cfg.norm_eps);
+        knorm->ndim = 3;
+        knorm->ne[0] = hd; knorm->ne[1] = n_kvh; knorm->ne[2] = n;
+        tensor_set_packed_strides(knorm);
+        k = knorm;
+    }
+    // RoPE on q [hd, n_h, n] and k [hd, n_kvh, n] starting at pos_start.
+    // tensor_rope* already iterate seq axis (ne[2]) and apply
+    // pos_t = pos_offset + s.
+    int32_t rotary_dim = c->cfg.rope_dim > 0 ? c->cfg.rope_dim : hd;
+    int32_t use_imrope = c->cfg.rope_sections[0] ||
+                         c->cfg.rope_sections[1] ||
+                         c->cfg.rope_sections[2] ||
+                         c->cfg.rope_sections[3];
+    struct tensor * q_rope;
+    struct tensor * k_rope;
+    if (use_imrope) {
+        q_rope = tensor_rope_mrope_i(q, pos_start, c->cfg.rope_theta,
+                                     rotary_dim, c->cfg.rope_sections);
+        k_rope = tensor_rope_mrope_i(k, pos_start, c->cfg.rope_theta,
+                                     rotary_dim, c->cfg.rope_sections);
+    } else {
+        q_rope = tensor_rope(q, pos_start, c->cfg.rope_theta, rotary_dim);
+        k_rope = tensor_rope(k, pos_start, c->cfg.rope_theta, rotary_dim);
+    }
+    // Write the n new (K, V) rows into the KV cache.
+    for (int32_t t = 0; t < n; t++) {
+        _Float16 * kdst = kv_row_k(&c->kv, L, pos_start + t);
+        _Float16 * vdst = kv_row_v(&c->kv, L, pos_start + t);
+        const float * ksrc = k_rope->data + (size_t)t * kv_hidden;
+        const float * vsrc = v->data      + (size_t)t * kv_hidden;
+        for (int32_t i = 0; i < kv_hidden; i++) {
+            kdst[i] = (_Float16)ksrc[i];
+            vdst[i] = (_Float16)vsrc[i];
+        }
+    }
+    // Build full K/V views [hd, n_kvh, kv_len] over the whole cache
+    // up to pos_start + n - 1.
+    int32_t kv_len = pos_start + n;
+    struct tensor * k_all = tensor_new_3d(a, hd, n_kvh, kv_len);
+    struct tensor * v_all = tensor_new_3d(a, hd, n_kvh, kv_len);
+    for (int32_t p = 0; p < kv_len; p++) {
+        const _Float16 * ks = kv_row_k(&c->kv, L, p);
+        const _Float16 * vs = kv_row_v(&c->kv, L, p);
+        float * kd = k_all->data + (size_t)p * kv_hidden;
+        float * vd = v_all->data + (size_t)p * kv_hidden;
+        for (int32_t i = 0; i < kv_hidden; i++) {
+            kd[i] = (float)ks[i];
+            vd[i] = (float)vs[i];
+        }
+    }
+    // Batched attention: causal mask handled by tensor_attention via
+    // k_offset = pos_start (query t attends keys 0..pos_start+t).
+    struct tensor * ctx_t =
+        tensor_attention(q_rope, k_all, v_all, /*k_offset=*/pos_start);
+    // View as (attn_inner, n) for output projection.
+    ctx_t->ndim = 2;
+    ctx_t->ne[0] = attn_inner;
+    ctx_t->ne[1] = n;
+    for (int32_t i = 2; i < TENSOR_MAX_DIMS; i++) ctx_t->ne[i] = 1;
+    tensor_set_packed_strides(ctx_t);
+    // Output gate (per token): ctx *= sigmoid(gate).
+    if (c->cfg.attn_output_gate && attn_gate_v != NULL) {
+        for (int32_t t = 0; t < n; t++) {
+            float * out_row = ctx_t->data       + (size_t)t * attn_inner;
+            float * gat_row = attn_gate_v->data + (size_t)t * attn_inner;
+            for (int32_t i = 0; i < attn_inner; i++) {
+                float sig = 1.0f / (1.0f + expf(-gat_row[i]));
+                out_row[i] *= sig;
+            }
+        }
+    }
+    // Output projection [hidden_dim, n].
+    struct tensor * attn_out_t = matmul_dispatch(&Lw->attn_out, ctx_t);
+    return attn_out_t;
+}
+
 static struct tensor * llm_forward_step(struct llm_ctx * c,
                                         int32_t tok_id, int32_t pos) {
     struct arena * a = c->arena;
@@ -2639,22 +2804,11 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
             // multi-chunk loop handles n > CHUNK_SIZE.
             mix = llm_forward_ssm_batch(c, L, n, h);
         } else {
-            // Attention: per-token sequential. Each token attends
-            // against the KV cache built up so far (including the
-            // tokens already written by this loop's earlier iterations).
-            mix = tensor_new_2d(a, hidden_dim, n);
-            struct tensor * h_one = tensor_new_2d(a, hidden_dim, 1);
-            for (int32_t t = 0; t < n; t++) {
-                memcpy(h_one->data,
-                       h->data + (size_t)t * hidden_dim,
-                       (size_t)hidden_dim * sizeof(float));
-                struct tensor * mt = llm_forward_attn(c, L,
-                                                       pos_start + t,
-                                                       h_one);
-                memcpy(mix->data + (size_t)t * hidden_dim,
-                       mt->data,
-                       (size_t)hidden_dim * sizeof(float));
-            }
+            // Attention: batched-queries kernel. Processes all n
+            // tokens against the KV cache in one pass; tensor_attention
+            // applies the causal mask via k_offset = pos_start so
+            // query t attends only to keys 0..(pos_start+t).
+            mix = llm_forward_attn_batch(c, L, pos_start, n, h);
         }
         // h = h + mix (per-token elementwise add).
         h = tensor_add(h, mix);
