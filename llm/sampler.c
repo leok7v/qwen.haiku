@@ -2,7 +2,7 @@
 //
 // `#include`-d from llm.c AFTER qwen.c (depends on `struct rng` +
 // `rng_uniform` + `sample_argmax`, all defined in qwen.c). Holds
-// the `llm_sampler_defaults()` factory plus the sample_with chain:
+// the `slm_sampler_defaults()` factory plus the sample_with chain:
 //
 //     repetition penalty -> temperature softmax (top-K) ->
 //     top-P (nucleus) -> min-P -> roulette-wheel pick.
@@ -17,20 +17,24 @@
 // Greedy fast path: when sampler->temperature <= 0, skip the entire
 // chain and return argmax over the (penalty-adjusted) logits.
 
-struct llm_sampler llm_sampler_defaults(void) {
-    struct llm_sampler s;
+struct slm_sampler slm_sampler_defaults(void) {
+    struct slm_sampler s;
     s.temperature        = 0.7f;
     s.top_k              = 40;
     s.top_p              = 0.9f;
     s.min_p              = 0.05f;
     s.repetition_penalty = 1.25f;
     s.repetition_window  = 64;
-    s.tools              = true;   // agent dispatch on by default
-    s.think              = false;  // reasoning off (gen prompt skips
-                                   // the <think> block)
-    s.debug              = true;   // surface tool_call /
-                                   // tool_response chunks to UI
     return s;
+}
+
+struct slm_ctrl slm_ctrl_defaults(void) {
+    struct slm_ctrl c;
+    c.tools  = true;
+    c.think  = false;
+    c.effort = NULL;   // == "medium" (no hint)
+    c.debug  = 1;      // visibility chunks on by default
+    return c;
 }
 
 // Apply repetition penalty in-place to `logits`: any token id that
@@ -53,14 +57,14 @@ static void apply_rep_penalty(struct tensor * logits,
 }
 
 // Top-k filter into parallel arrays (idx, val) of length filled.
-// Linear scan; k is capped to LLM_SAMPLE_TOPK_MAX so the working set
+// Linear scan; k is capped to SLM_SAMPLE_TOPK_MAX so the working set
 // fits in a stack buffer.
-#define LLM_SAMPLE_TOPK_MAX 256
+#define SLM_SAMPLE_TOPK_MAX 256
 
 static int32_t topk_collect(const struct tensor * logits, int32_t k,
                             int32_t * idx, float * val) {
     int64_t n      = tensor_nelements(logits);
-    if (k <= 0 || k > LLM_SAMPLE_TOPK_MAX) { k = LLM_SAMPLE_TOPK_MAX; }
+    if (k <= 0 || k > SLM_SAMPLE_TOPK_MAX) { k = SLM_SAMPLE_TOPK_MAX; }
     int32_t filled = 0;
     for (int64_t i = 0; i < n; i++) {
         float lv = logits->data[i];
@@ -117,7 +121,7 @@ static void topk_sort_desc(int32_t * idx, float * val, int32_t filled) {
 }
 
 static int32_t sample_with(struct tensor * logits,
-                           const struct llm_sampler * sp,
+                           const struct slm_sampler * sp,
                            struct rng * rng,
                            const int32_t * history, int32_t hist_n) {
     apply_rep_penalty(logits, history, hist_n,
@@ -125,10 +129,10 @@ static int32_t sample_with(struct tensor * logits,
     if (sp->temperature <= 0.0f) {
         return sample_argmax(logits);
     }
-    int32_t idx[LLM_SAMPLE_TOPK_MAX];
-    float   val[LLM_SAMPLE_TOPK_MAX];
-    int32_t k = sp->top_k > 0 ? sp->top_k : LLM_SAMPLE_TOPK_MAX;
-    if (k > LLM_SAMPLE_TOPK_MAX) { k = LLM_SAMPLE_TOPK_MAX; }
+    int32_t idx[SLM_SAMPLE_TOPK_MAX];
+    float   val[SLM_SAMPLE_TOPK_MAX];
+    int32_t k = sp->top_k > 0 ? sp->top_k : SLM_SAMPLE_TOPK_MAX;
+    if (k > SLM_SAMPLE_TOPK_MAX) { k = SLM_SAMPLE_TOPK_MAX; }
     int32_t filled = topk_collect(logits, k, idx, val);
     topk_softmax(val, filled, sp->temperature);
     topk_sort_desc(idx, val, filled);

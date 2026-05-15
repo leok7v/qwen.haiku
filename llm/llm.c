@@ -27,7 +27,7 @@
 //        streamed token-by-token.
 //
 // File layout: this file holds the model-agnostic surface — the
-// public API (llm_create / llm_generate / ...), the sampler
+// public API (slm_create / slm_generate / ...), the sampler
 // chain, the <think>/<tool_call> state-machine filter that splits
 // the raw token stream into content/reasoning/tool_call/
 // tool_response chunks, the embedded agent loop, and the CLI
@@ -68,7 +68,7 @@
 #include "jinja.c"           // renamed from llm/jinja-template.c
 #include "tools.c"
 
-// Sampler chain (llm_sampler_defaults + sample_with + helpers).
+// Sampler chain (slm_sampler_defaults + sample_with + helpers).
 // Pulled in AFTER qwen.c so it can use struct rng / rng_uniform /
 // sample_argmax defined there.
 #include "sampler.c"
@@ -77,18 +77,18 @@
 // Public-ish API used by Swift bridge AND by main()
 // ---------------------------------------------------------------------------
 
-struct llm_ctx * llm_create(const char * path) {
-    struct llm_ctx * c =
-        (struct llm_ctx *)oom(calloc(1, sizeof(struct llm_ctx)));
+struct slm_ctx * slm_create(const char * path) {
+    struct slm_ctx * c =
+        (struct slm_ctx *)oom(calloc(1, sizeof(struct slm_ctx)));
     if (gguf_open(&c->gguf, path) != 0) {
         snprintf(c->err, sizeof(c->err), "gguf open failed");
         return c;
     }
-    if (llm_load_config(&c->gguf, &c->cfg) != 0) {
+    if (slm_load_config(&c->gguf, &c->cfg) != 0) {
         snprintf(c->err, sizeof(c->err), "config load failed");
         return c;
     }
-    if (llm_load_weights(&c->gguf, &c->cfg, &c->W) != 0) {
+    if (slm_load_weights(&c->gguf, &c->cfg, &c->W) != 0) {
         snprintf(c->err, sizeof(c->err), "weights resolve failed");
         return c;
     }
@@ -142,15 +142,24 @@ struct llm_ctx * llm_create(const char * path) {
     }
     c->loaded = 1;
     c->dump_layer = g_dump_layer;
+    c->ctrl = slm_ctrl_defaults();
     return c;
 }
 
-void llm_destroy(struct llm_ctx * c) {
+void slm_set_ctrl(struct slm_ctx * c, const struct slm_ctrl * ctrl) {
+    if (c != NULL && ctrl != NULL) { c->ctrl = *ctrl; }
+}
+
+struct slm_ctrl slm_get_ctrl(const struct slm_ctx * c) {
+    return c != NULL ? c->ctrl : slm_ctrl_defaults();
+}
+
+void slm_destroy(struct slm_ctx * c) {
     if (c != NULL) {
         ssm_cache_free(&c->ssm);
         kv_free(&c->kv);
         tokenizer_free(&c->tok);
-        llm_free_weights(&c->W);
+        slm_free_weights(&c->W);
         if (c->chat_template) { free(c->chat_template); }
         if (c->arena)         { arena_free(c->arena); c->arena = NULL; }
         gguf_close(&c->gguf);
@@ -158,33 +167,33 @@ void llm_destroy(struct llm_ctx * c) {
     }
 }
 
-void llm_reset(struct llm_ctx * c) {
+void slm_reset(struct slm_ctx * c) {
     if (c != NULL) {
         ssm_cache_reset(&c->ssm, &c->cfg);
         c->pos = 0;
     }
 }
 
-const char * llm_get_error(const struct llm_ctx * c) {
+const char * slm_get_error(const struct slm_ctx * c) {
     return c == NULL ? "no ctx" : c->err;
 }
 
-int llm_loaded(const struct llm_ctx * c) {
+int slm_loaded(const struct slm_ctx * c) {
     return (c != NULL && c->loaded) ? 1 : 0;
 }
 
-const char * llm_chat_template(const struct llm_ctx * c) {
+const char * slm_chat_template(const struct slm_ctx * c) {
     return (c == NULL) ? NULL : c->chat_template;
 }
 
 // Thin wrappers exposing jinja-template.c's chat-formatting through
-// the public llm_chat_format / llm_chat_format_delta API. We copy
-// the public llm_chat_message[] into the internal jinja_message
+// the public slm_chat_format / slm_chat_format_delta API. We copy
+// the public slm_chat_message[] into the internal jinja_message
 // layout so the public ABI stays minimal (no tool_calls /
 // reasoning_content surface — text-only chat covers the iOS/macOS
 // app's needs). Tool support, when wired up later, can either grow
 // the public struct or take a richer "advanced" entry point.
-char * llm_chat_format(const struct llm_chat_message * messages,
+char * slm_chat_format(const struct slm_chat_message * messages,
                        int n_messages,
                        int add_generation_prompt,
                        int enable_thinking) {
@@ -209,31 +218,30 @@ char * llm_chat_format(const struct llm_chat_message * messages,
     return result;
 }
 
-// llm_chat_format_delta is defined further down — its full body
+// slm_chat_format_delta is defined further down — its full body
 // needs the AGENT_TOOL_* tool-spec JSON strings (declared in
 // agent.c), so the definition lives below the `#include "agent.c"`
 // site. See the matching block right after the agent.c include.
 
-// File-internal token-stream callback. llm_generate_raw emits one
-// utf8 piece per generated token to this; the public llm_generate
+// File-internal token-stream callback. slm_generate_raw emits one
+// utf8 piece per generated token to this; the public slm_generate
 // trampolines into the <think>-filter on top of this (see further
 // down in this file).
-typedef int (*llm_token_cb)(const char * utf8, void * user);
+// File-internal token-stream callback. `utf8` is a NUL-terminated
+// UTF-8 piece — possibly a partial Unicode codepoint for byte-level
+// BPE; concatenating successive pieces always yields valid UTF-8.
+// Return non-zero to abort generation. Used by slm_generate_raw
+// internally; public callers go through `slm_stream_cb` in llm.h.
+typedef int (*slm_token_cb)(const char * utf8, void * user);
 
-// PREFILL_PROGRESS_EVERY: emit a prefill progress chunk every N
-// tokens. 16 is small enough that a 2048-token prompt fires ~128
-// progress events (smooth bar) but big enough that the overhead is
-// invisible next to a forward pass at ~5-15 ms each.
-#define PREFILL_PROGRESS_EVERY 16
-
-static int llm_generate_raw(struct llm_ctx * c,
+static int slm_generate_raw(struct slm_ctx * c,
                  const int32_t * prompt_ids, int prompt_n,
                  int max_new, int min_new,
-                 const struct llm_sampler * sampler_in,
+                 const struct slm_sampler * sampler_in,
                  uint64_t seed,
-                 llm_token_cb cb, void * user,
-                 llm_stream_cb progress_cb, void * progress_user) {
-    struct llm_sampler sp = {0};
+                 slm_token_cb cb, void * user,
+                 slm_stream_cb progress_cb, void * progress_user) {
+    struct slm_sampler sp = {0};
     if (sampler_in != NULL) { sp = *sampler_in; }
     struct rng rng;
     rng_seed(&rng, seed != 0 ? seed : (uint64_t)time(NULL));
@@ -241,7 +249,7 @@ static int llm_generate_raw(struct llm_ctx * c,
     int32_t   generated = 0;
     int32_t   pos       = c->pos;        // resume after previous call
     bool      stop      = false;
-    double    t0        = llm_monotonic_seconds();
+    double    t0        = slm_monotonic_seconds();
     // Repetition-penalty history: include the full prompt so the
     // model is discouraged from immediately echoing the input back,
     // plus everything it generates in this call. Capacity grows on
@@ -260,16 +268,16 @@ static int llm_generate_raw(struct llm_ctx * c,
         use_forward_batch = (getenv("LLM_USE_FORWARD_BATCH") != NULL) ? 1 : 0;
     }
     if (use_forward_batch && prompt_n > 1) {
-        // llm_forward_ssm_batch has a multi-chunk loop, so any
+        // slm_forward_ssm_batch has a multi-chunk loop, so any
         // prompt_n is allowed (CHUNK_SIZE no longer caps the call).
-        struct tensor * logits = llm_forward_batch(c, prompt_ids,
+        struct tensor * logits = slm_forward_batch(c, prompt_ids,
                                                    prompt_n, pos);
         (void)logits;
         pos += prompt_n;
         qwen_trace_close();
     } else {
         for (int32_t i = 0; i < prompt_n && !stop; i++) {
-            struct tensor * logits = llm_forward_step(c, prompt_ids[i], pos);
+            struct tensor * logits = slm_forward_step(c, prompt_ids[i], pos);
             // Trace facility is for parity diagnostics on the FIRST
             // forward pass only - one prompt token -> ~1850 JSONL
             // lines matches the llama-qwen-haiku reference dump
@@ -277,34 +285,25 @@ static int llm_generate_raw(struct llm_ctx * c,
             if (i == 0) { qwen_trace_close(); }
             (void)logits;
             pos++;
-            // Periodically emit prefill progress so the UI can show
-            // a bar. Returning non-zero from the progress callback
-            // aborts prefill via the same `stop` flag as decode.
-            if (progress_cb != NULL && prompt_n > 1 &&
-                ((i + 1) % PREFILL_PROGRESS_EVERY == 0 ||
-                 i + 1 == prompt_n)) {
-                struct llm_stream_chunk ch = {0};
-                ch.prefill_done  = i + 1;
-                ch.prefill_total = prompt_n;
-                if (progress_cb(&ch, progress_user) != 0) { stop = true; }
-            }
         }
     }
-    if (progress_cb != NULL && prompt_n > 0 && use_forward_batch) {
-        // Batched prefill ran in one shot — emit one terminal
-        // progress chunk so the UI can hide its bar.
-        struct llm_stream_chunk ch = {0};
-        ch.prefill_done  = prompt_n;
-        ch.prefill_total = prompt_n;
+    if (progress_cb != NULL && prompt_n > 0) {
+        // One terminal "prefill done" chunk after the prefill loop
+        // (either path — autoregressive or batched). Useful for
+        // hiding a spinner / progress indicator once decode starts.
+        // No granular per-token progress: at this model size prefill
+        // is ~1s and a per-token bar is more noise than value.
+        struct slm_stream_chunk ch = {0};
+        ch.prefilled = true;
         (void)progress_cb(&ch, progress_user);
     }
-    double t1 = llm_monotonic_seconds();
+    double t1 = slm_monotonic_seconds();
     c->t_prefill_s = t1 - t0;
     c->n_prefill   = prompt_n;
     int32_t last = prompt_n > 0 ? prompt_ids[prompt_n - 1] : c->cfg.bos_id;
     // Decode loop.
     while (!stop && generated < max_new && pos < c->cfg.max_position) {
-        struct tensor * logits = llm_forward_step(c, last, pos);
+        struct tensor * logits = slm_forward_step(c, last, pos);
         // While below min_new, force the model to keep producing
         // content by zeroing out the eos / eot logits (effectively
         // -infinity once normalized). Restored automatically once
@@ -352,7 +351,7 @@ static int llm_generate_raw(struct llm_ctx * c,
             last = next;
         }
     }
-    double t2 = llm_monotonic_seconds();
+    double t2 = slm_monotonic_seconds();
     c->t_gen_s     = t2 - t1;
     c->n_generated = generated;
     c->pos         = pos;                // persist across calls
@@ -362,11 +361,11 @@ static int llm_generate_raw(struct llm_ctx * c,
 }
 
 // ---------------------------------------------------------------------------
-// <think> stream filter. State machine that splits llm_generate's
+// <think> stream filter. State machine that splits slm_generate's
 // single output stream into two: content (outside `<think>`...
 // `</think>` blocks) and reasoning (inside). Marker bytes are NOT
-// emitted; both streams are routed through ONE llm_stream_cb
-// callback with a struct llm_stream_chunk that carries exactly one
+// emitted; both streams are routed through ONE slm_stream_cb
+// callback with a struct slm_stream_chunk that carries exactly one
 // non-NULL pointer per call.
 //
 // The model emits both streams interleaved; we hold back the last
@@ -381,9 +380,9 @@ static int llm_generate_raw(struct llm_ctx * c,
 // Adding a new model is a marker-table edit (see THINK_MARKERS
 // below). The state machine is otherwise marker-agnostic.
 //
-// Public surface (llm.h) is just `llm_generate_split`. The filter
+// Public surface (llm.h) is just `slm_generate_split`. The filter
 // struct + push/finish helpers are file-static here: clients should
-// not need the streaming pieces directly because llm_generate_split
+// not need the streaming pieces directly because slm_generate_split
 // already drives one filter end-to-end per generate call.
 // ---------------------------------------------------------------------------
 
@@ -392,7 +391,7 @@ static int llm_generate_raw(struct llm_ctx * c,
 // on the marker tags it has seen. THINK_MODE_NONE is a sentinel
 // used in the marker table for "this marker triggers an action but
 // doesn't change mode" (no live state ever holds it).
-enum llm_think_mode {
+enum slm_think_mode {
     THINK_MODE_CONTENT   = 0,  // visible reply text
     THINK_MODE_REASONING = 1,  // inside <think>...</think>
     THINK_MODE_TOOL_CALL = 2,  // inside <tool_call>...</tool_call>
@@ -401,35 +400,35 @@ enum llm_think_mode {
 
 // Marker-table row indices. Used to identify a specific marker
 // from its position in THINK_MARKERS without comparing tag strings.
-enum llm_think_marker_row {
-    LLM_MARKER_THINK_OPEN  = 0,
-    LLM_MARKER_THINK_CLOSE = 1,
-    LLM_MARKER_TOOL_OPEN   = 2,
-    LLM_MARKER_TOOL_CLOSE  = 3,
+enum slm_think_marker_row {
+    SLM_MARKER_THINK_OPEN  = 0,
+    SLM_MARKER_THINK_CLOSE = 1,
+    SLM_MARKER_TOOL_OPEN   = 2,
+    SLM_MARKER_TOOL_CLOSE  = 3,
 };
 
-struct llm_think_filter {
-    enum llm_think_mode mode;
+struct slm_think_filter {
+    enum slm_think_mode mode;
     // Partial-marker hold-back: a fixed 64-byte sliding window. The
     // size is NOT incidental — it's the algorithmic flush trigger in
-    // llm_think_filter_push: once hold_n == sizeof(hold_data), the
+    // slm_think_filter_push: once hold_n == sizeof(hold_data), the
     // loop emits the front and keeps the trailing
-    // LLM_THINK_MAX_MARKER-1 (=11) bytes as a potential prefix.
+    // SLM_THINK_MAX_MARKER-1 (=11) bytes as a potential prefix.
     // Backing this with `struct chars` would let it grow unbounded
     // and the flush would never happen, so we keep the fixed array.
     char                hold_data[64];
     int                 hold_n;
     // <tool_call>...</tool_call> body accumulator. Grows as needed
-    // via chars_put. Caller (llm_generate) calls `chars_free` after
+    // via chars_put. Caller (slm_generate) calls `chars_free` after
     // reading tool_call.data; the filter itself does no allocation
     // bookkeeping outside chars_put.
     struct chars        tool_call;
     // Flipped true by the filter the moment a </tool_call> marker
-    // is consumed. The public llm_generate loop reads this after
+    // is consumed. The public slm_generate loop reads this after
     // the generate_raw call returns to dispatch the tool + re-feed
     // the model. Reset by init().
     bool                tool_call_ready;
-    // Per-call configuration (set by llm_generate from sampler
+    // Per-call configuration (set by slm_generate from sampler
     // flags before kicking the trampoline). recognize_tool_calls
     // = false makes find_marker ignore <tool_call> / </tool_call>
     // entries so the body streams as plain content. emit_visibility
@@ -439,34 +438,34 @@ struct llm_think_filter {
     bool                emit_visibility;
 };
 
-struct llm_think_marker {
+struct slm_think_marker {
     const char *        tag;   // null-terminated literal
     int                 len;   // strlen(tag), cached
-    enum llm_think_mode mode;  // mode to switch INTO on match
+    enum slm_think_mode mode;  // mode to switch INTO on match
                                // (THINK_MODE_NONE = no-op)
 };
 
-static const struct llm_think_marker THINK_MARKERS[] = {
-    [LLM_MARKER_THINK_OPEN]  = { "<think>",      7, THINK_MODE_REASONING },
-    [LLM_MARKER_THINK_CLOSE] = { "</think>",     8, THINK_MODE_CONTENT   },
-    [LLM_MARKER_TOOL_OPEN]   = { "<tool_call>", 11, THINK_MODE_TOOL_CALL },
-    [LLM_MARKER_TOOL_CLOSE]  = { "</tool_call>",12, THINK_MODE_CONTENT   },
+static const struct slm_think_marker THINK_MARKERS[] = {
+    [SLM_MARKER_THINK_OPEN]  = { "<think>",      7, THINK_MODE_REASONING },
+    [SLM_MARKER_THINK_CLOSE] = { "</think>",     8, THINK_MODE_CONTENT   },
+    [SLM_MARKER_TOOL_OPEN]   = { "<tool_call>", 11, THINK_MODE_TOOL_CALL },
+    [SLM_MARKER_TOOL_CLOSE]  = { "</tool_call>",12, THINK_MODE_CONTENT   },
 };
-#define LLM_THINK_N_MARKERS \
+#define SLM_THINK_N_MARKERS \
     ((int)(sizeof(THINK_MARKERS) / sizeof(THINK_MARKERS[0])))
-#define LLM_THINK_MAX_MARKER 12  // strlen("</tool_call>")
+#define SLM_THINK_MAX_MARKER 12  // strlen("</tool_call>")
 
 // Caller is expected to zero-init the filter (or its containing
-// struct, e.g. `struct llm_split_box box = {0};`) BEFORE calling
+// struct, e.g. `struct slm_split_box box = {0};`) BEFORE calling
 // init the first time — init does not chars_free the tool_call
 // buffer, so it would leak any previous heap allocation.
-static void llm_think_filter_init(struct llm_think_filter * f) {
+static void slm_think_filter_init(struct slm_think_filter * f) {
     f->mode = THINK_MODE_CONTENT;
     f->hold_n = 0;
     f->hold_data[0] = '\0';
     f->tool_call = (struct chars){0};
     f->tool_call_ready = false;
-    f->recognize_tool_calls = true;  // default on; llm_generate overrides
+    f->recognize_tool_calls = true;  // default on; slm_generate overrides
     f->emit_visibility      = true;
 }
 
@@ -476,9 +475,9 @@ static void llm_think_filter_init(struct llm_think_filter * f) {
 // firing `cb` — the buffered call is dispatched as one atomic
 // chunk when </tool_call> arrives. Returns the callback's return
 // value, or 0 when there's no work / no callback / mode is 2.
-static int llm_think_emit(struct llm_think_filter * f,
+static int slm_think_emit(struct slm_think_filter * f,
                           const char * start, int n,
-                          llm_stream_cb cb, void * user) {
+                          slm_stream_cb cb, void * user) {
     int rc = 0;
     if (n > 0) {
         if (f->mode == THINK_MODE_TOOL_CALL) {
@@ -493,12 +492,12 @@ static int llm_think_emit(struct llm_think_filter * f,
                       ? n : (int)sizeof(tmp) - 1;
             memcpy(tmp, start, (size_t)copy);
             tmp[copy] = '\0';
-            struct llm_stream_chunk chunk = {0};
+            struct slm_stream_chunk chunk = {0};
             if (f->mode == THINK_MODE_REASONING) { chunk.reasoning = tmp; }
             else                                 { chunk.content   = tmp; }
             rc = cb(&chunk, user);
             if (n > copy && rc == 0) {
-                int rc2 = llm_think_emit(f, start + copy, n - copy,
+                int rc2 = slm_think_emit(f, start + copy, n - copy,
                                          cb, user);
                 if (rc2 != 0) { rc = rc2; }
             }
@@ -510,15 +509,15 @@ static int llm_think_emit(struct llm_think_filter * f,
 // Try to find the earliest complete marker fully present in hold[].
 // Returns marker index (0..N-1) and writes the start offset to *pos,
 // or -1 if no complete marker is in hold[].
-static int llm_think_find_marker(const struct llm_think_filter * f,
+static int slm_think_find_marker(const struct slm_think_filter * f,
                                  int * pos) {
     int best  = -1;
     int best_pos = f->hold_n;
-    for (int m = 0; m < LLM_THINK_N_MARKERS; m++) {
+    for (int m = 0; m < SLM_THINK_N_MARKERS; m++) {
         // Skip the tool_call markers when the sampler turned tools
         // off — their bytes will stream as plain content instead.
-        bool is_tool_call = (m == LLM_MARKER_TOOL_OPEN) ||
-                            (m == LLM_MARKER_TOOL_CLOSE);
+        bool is_tool_call = (m == SLM_MARKER_TOOL_OPEN) ||
+                            (m == SLM_MARKER_TOOL_CLOSE);
         bool skip = (!f->recognize_tool_calls && is_tool_call);
         if (!skip) {
             const char * tag = THINK_MARKERS[m].tag;
@@ -558,7 +557,7 @@ static int llm_think_find_marker(const struct llm_think_filter * f,
 // component glyphs briefly until the next chunk lands, then they
 // regroup. Full grapheme-cluster awareness would need ICU and is
 // scope creep for a small chat surface.
-static int llm_think_safe_utf8(const char * buf, int hold_n, int safe) {
+static int slm_think_safe_utf8(const char * buf, int hold_n, int safe) {
     while (safe > 0 && safe < hold_n &&
            ((unsigned char)buf[safe] & 0xC0) == 0x80) {
         safe--;
@@ -568,12 +567,12 @@ static int llm_think_safe_utf8(const char * buf, int hold_n, int safe) {
 
 // Returns true if hold[]'s last `tail_n` bytes could be a strict
 // prefix of any marker (i.e. we should hold them back rather than emit).
-static bool llm_think_could_be_prefix(const struct llm_think_filter * f,
+static bool slm_think_could_be_prefix(const struct slm_think_filter * f,
                                       int tail_start) {
     bool possible = false;
     int tail_n = f->hold_n - tail_start;
     if (tail_n > 0) {
-        for (int m = 0; m < LLM_THINK_N_MARKERS && !possible; m++) {
+        for (int m = 0; m < SLM_THINK_N_MARKERS && !possible; m++) {
             const char * tag = THINK_MARKERS[m].tag;
             int tlen = THINK_MARKERS[m].len;
             if (tail_n < tlen) {
@@ -590,9 +589,9 @@ static bool llm_think_could_be_prefix(const struct llm_think_filter * f,
     return possible;
 }
 
-int llm_think_filter_push(struct llm_think_filter * f,
+int slm_think_filter_push(struct slm_think_filter * f,
                           const char * utf8,
-                          llm_stream_cb cb,
+                          slm_stream_cb cb,
                           void * user) {
     int rc = 0;
     if (utf8 != NULL) {
@@ -605,14 +604,14 @@ int llm_think_filter_push(struct llm_think_filter * f,
         while (*src != '\0' && rc == 0) {
             if (avail <= 0) {
                 // Hold is full; emit the front (keeping last
-                // LLM_THINK_MAX_MARKER-1 bytes as potential prefix).
+                // SLM_THINK_MAX_MARKER-1 bytes as potential prefix).
                 // Same UTF-8 safety as the per-iter safe-emit below.
-                int keep = LLM_THINK_MAX_MARKER - 1;
+                int keep = SLM_THINK_MAX_MARKER - 1;
                 int emit_n = f->hold_n - keep;
-                emit_n = llm_think_safe_utf8(f->hold_data, f->hold_n,
+                emit_n = slm_think_safe_utf8(f->hold_data, f->hold_n,
                                              emit_n);
                 if (emit_n > 0) {
-                    int r2 = llm_think_emit(f, f->hold_data,
+                    int r2 = slm_think_emit(f, f->hold_data,
                                             emit_n, cb, user);
                     if (r2 != 0) { rc = r2; }
                     int remain = f->hold_n - emit_n;
@@ -637,15 +636,15 @@ int llm_think_filter_push(struct llm_think_filter * f,
             bool more = true;
             while (more && rc == 0) {
                 int pos = 0;
-                int m   = llm_think_find_marker(f, &pos);
+                int m   = slm_think_find_marker(f, &pos);
                 if (m < 0) {
                     more = false;
                 } else {
                     // Emit prefix in current mode.
-                    int r2 = llm_think_emit(f, f->hold_data, pos,
+                    int r2 = slm_think_emit(f, f->hold_data, pos,
                                             cb, user);
                     if (r2 != 0) { rc = r2; }
-                    enum llm_think_mode prev_mode = f->mode;
+                    enum slm_think_mode prev_mode = f->mode;
                     // Flip mode (or no-op for THINK_MODE_NONE markers).
                     if (THINK_MARKERS[m].mode != THINK_MODE_NONE) {
                         f->mode = THINK_MARKERS[m].mode;
@@ -658,14 +657,14 @@ int llm_think_filter_push(struct llm_think_filter * f,
                         f->mode  != THINK_MODE_TOOL_CALL) {
                         if (cb != NULL && f->tool_call.count > 0 &&
                             f->emit_visibility) {
-                            struct llm_stream_chunk chunk = {0};
-                            chunk.tool_call = f->tool_call.data;
+                            struct slm_stream_chunk chunk = {0};
+                            chunk.call = f->tool_call.data;
                             int r3 = cb(&chunk, user);
                             if (r3 != 0) { rc = r3; }
                         }
                         f->tool_call_ready = true;
-                        // Force llm_generate_raw's decode loop to
-                        // exit so the public llm_generate can run
+                        // Force slm_generate_raw's decode loop to
+                        // exit so the public slm_generate can run
                         // the dispatch + inject step before any
                         // further sampling.
                         rc = 1;
@@ -692,24 +691,24 @@ int llm_think_filter_push(struct llm_think_filter * f,
                 }
             }
             // Emit the part of hold that's safely past any partial
-            // marker. The trailing (LLM_THINK_MAX_MARKER-1) bytes
+            // marker. The trailing (SLM_THINK_MAX_MARKER-1) bytes
             // stay as potential prefix.
-            int safe = f->hold_n - (LLM_THINK_MAX_MARKER - 1);
+            int safe = f->hold_n - (SLM_THINK_MAX_MARKER - 1);
             if (safe > 0 && rc == 0) {
                 // Trim the safe region further: don't emit bytes
                 // that could still extend into a marker tail (i.e.
                 // if the LAST byte we'd emit is a '<', keep it).
                 while (safe > 0 &&
-                       llm_think_could_be_prefix(f, safe)) {
+                       slm_think_could_be_prefix(f, safe)) {
                     safe--;
                 }
                 // Also don't split a multibyte UTF-8 codepoint —
                 // hold continuation bytes back until the codepoint
                 // is complete (next push() will bring the tail).
-                safe = llm_think_safe_utf8(f->hold_data, f->hold_n,
+                safe = slm_think_safe_utf8(f->hold_data, f->hold_n,
                                            safe);
                 if (safe > 0) {
-                    int r2 = llm_think_emit(f, f->hold_data, safe,
+                    int r2 = slm_think_emit(f, f->hold_data, safe,
                                             cb, user);
                     if (r2 != 0) { rc = r2; }
                     int remain = f->hold_n - safe;
@@ -728,8 +727,8 @@ int llm_think_filter_push(struct llm_think_filter * f,
     return rc;
 }
 
-int llm_think_filter_finish(struct llm_think_filter * f,
-                            llm_stream_cb cb,
+int slm_think_filter_finish(struct slm_think_filter * f,
+                            slm_stream_cb cb,
                             void * user) {
     int rc = 0;
     // No-more-data flush: any pending markers won't get longer, so
@@ -738,11 +737,11 @@ int llm_think_filter_finish(struct llm_think_filter * f,
     bool more = true;
     while (more && rc == 0) {
         int pos = 0;
-        int m   = llm_think_find_marker(f, &pos);
+        int m   = slm_think_find_marker(f, &pos);
         if (m < 0) {
             more = false;
         } else {
-            int r2 = llm_think_emit(f, f->hold_data, pos, cb, user);
+            int r2 = slm_think_emit(f, f->hold_data, pos, cb, user);
             if (r2 != 0) { rc = r2; }
             if (THINK_MARKERS[m].mode != THINK_MODE_NONE) {
                 f->mode = THINK_MARKERS[m].mode;
@@ -758,45 +757,45 @@ int llm_think_filter_finish(struct llm_think_filter * f,
         }
     }
     if (f->hold_n > 0 && rc == 0) {
-        rc = llm_think_emit(f, f->hold_data, f->hold_n, cb, user);
+        rc = slm_think_emit(f, f->hold_data, f->hold_n, cb, user);
         f->hold_n = 0;
         f->hold_data[0] = '\0';
     }
     return rc;
 }
 
-// Trampoline box for llm_generate_split.
-struct llm_split_box {
-    struct llm_think_filter filter;
-    llm_stream_cb           cb;
+// Trampoline box for slm_generate_split.
+struct slm_split_box {
+    struct slm_think_filter filter;
+    slm_stream_cb           cb;
     void *                  user;
 };
 
-static int llm_split_trampoline(const char * utf8, void * user) {
-    struct llm_split_box * b = (struct llm_split_box *)user;
-    return llm_think_filter_push(&b->filter, utf8, b->cb, b->user);
+static int slm_split_trampoline(const char * utf8, void * user) {
+    struct slm_split_box * b = (struct slm_split_box *)user;
+    return slm_think_filter_push(&b->filter, utf8, b->cb, b->user);
 }
 
-// The public `llm_generate` definition lives AFTER `#include
+// The public `slm_generate` definition lives AFTER `#include
 // "agent.c"` so the tools-enabled build can reach
 // agent_parse_tool_calls + agent_dispatch (defined in agent.c).
 // See the matching definition further down in this file.
 
 // Self-test for the think filter. Feeds known streams through it
-// piece-by-piece (mimicking llm_generate's per-token callback) and
+// piece-by-piece (mimicking slm_generate's per-token callback) and
 // asserts the routed content / reasoning outputs match hand-traced
 // goldens. Returns 0 on PASS.
-struct llm_think_test_capture {
+struct slm_think_test_capture {
     char content  [512];
     int  content_n;
     char reasoning[512];
     int  reasoning_n;
 };
 
-static int llm_think_test_cb(const struct llm_stream_chunk * chunk,
+static int slm_think_test_cb(const struct slm_stream_chunk * chunk,
                              void * user) {
-    struct llm_think_test_capture * cap =
-        (struct llm_think_test_capture *)user;
+    struct slm_think_test_capture * cap =
+        (struct slm_think_test_capture *)user;
     if (chunk->content != NULL) {
         int n = (int)strlen(chunk->content);
         int avail = (int)sizeof(cap->content) - cap->content_n - 1;
@@ -825,25 +824,25 @@ static int llm_think_test_cb(const struct llm_stream_chunk * chunk,
 // Feed `chunks[0..n)` into the filter sequentially, then finish.
 // Verifies content / reasoning outputs against the goldens.
 // Returns 1 on fail (caller increments failure counter).
-static int llm_think_test_case(const char * name,
+static int slm_think_test_case(const char * name,
                                const char ** chunks, int n_chunks,
                                const char * want_content,
                                const char * want_reasoning) {
     int failed = 0;
     // Zero-init the filter (the tool_call accumulator's heap buffer
     // is the only allocating field; init assumes a cleared start).
-    struct llm_think_filter f = {0};
-    llm_think_filter_init(&f);
-    struct llm_think_test_capture cap;
+    struct slm_think_filter f = {0};
+    slm_think_filter_init(&f);
+    struct slm_think_test_capture cap;
     cap.content_n = 0;
     cap.content[0] = '\0';
     cap.reasoning_n = 0;
     cap.reasoning[0] = '\0';
     for (int i = 0; i < n_chunks; i++) {
-        llm_think_filter_push(&f, chunks[i],
-                              llm_think_test_cb, &cap);
+        slm_think_filter_push(&f, chunks[i],
+                              slm_think_test_cb, &cap);
     }
-    llm_think_filter_finish(&f, llm_think_test_cb, &cap);
+    slm_think_filter_finish(&f, slm_think_test_cb, &cap);
     if (strcmp(cap.content, want_content) != 0) {
         fprintf(stderr,
             "think-test %s: content MISMATCH\n  got:  %s\n  want: %s\n",
@@ -861,12 +860,12 @@ static int llm_think_test_case(const char * name,
 }
 
 __attribute__((unused))
-static int32_t llm_think_test(void) {
+static int32_t slm_think_test(void) {
     int failures = 0;
     // A: plain content, no markers.
     {
         const char * chunks[] = { "Hello, world." };
-        failures += llm_think_test_case("A", chunks, 1,
+        failures += slm_think_test_case("A", chunks, 1,
                                         "Hello, world.", "");
     }
     // B: leading <think> block emptied by gen prompt pre-fill,
@@ -877,7 +876,7 @@ static int32_t llm_think_test(void) {
         const char * chunks[] = {
             "</think>\n\nHello."
         };
-        failures += llm_think_test_case("B", chunks, 1,
+        failures += slm_think_test_case("B", chunks, 1,
                                         "\n\nHello.", "");
     }
     // C: real reasoning block then content.
@@ -885,7 +884,7 @@ static int32_t llm_think_test(void) {
         const char * chunks[] = {
             "<think>let me think</think>\n\nAnswer."
         };
-        failures += llm_think_test_case("C", chunks, 1,
+        failures += slm_think_test_case("C", chunks, 1,
                                         "\n\nAnswer.",
                                         "let me think");
     }
@@ -894,7 +893,7 @@ static int32_t llm_think_test(void) {
         const char * chunks[] = {
             "abc<thi", "nk>secret</thi", "nk>end"
         };
-        failures += llm_think_test_case("D", chunks, 3,
+        failures += slm_think_test_case("D", chunks, 3,
                                         "abcend", "secret");
     }
     // E: stray `<` that doesn't lead anywhere (must emit, not eat).
@@ -902,7 +901,7 @@ static int32_t llm_think_test(void) {
         const char * chunks[] = {
             "x<y<not_a_marker>z"
         };
-        failures += llm_think_test_case("E", chunks, 1,
+        failures += slm_think_test_case("E", chunks, 1,
                                         "x<y<not_a_marker>z", "");
     }
     // F: byte-at-a-time delivery (worst-case for the holdback).
@@ -925,7 +924,7 @@ static int32_t llm_think_test(void) {
             twos[i][1] = '\0';
             chunks[i] = twos[i];
         }
-        failures += llm_think_test_case("F", chunks, n, "ac", "b");
+        failures += slm_think_test_case("F", chunks, n, "ac", "b");
     }
     if (failures == 0) {
         printf("think-test: PASS (6 fixtures)\n");
@@ -936,7 +935,7 @@ static int32_t llm_think_test(void) {
     return failures;
 }
 
-double llm_pp_per_sec(const struct llm_ctx * c) {
+double slm_pp_per_sec(const struct slm_ctx * c) {
     double r = 0.0;
     if (c != NULL && c->t_prefill_s > 0.0) {
         r = (double)c->n_prefill / c->t_prefill_s;
@@ -944,7 +943,7 @@ double llm_pp_per_sec(const struct llm_ctx * c) {
     return r;
 }
 
-double llm_tg_per_sec(const struct llm_ctx * c) {
+double slm_tg_per_sec(const struct slm_ctx * c) {
     double r = 0.0;
     if (c != NULL && c->t_gen_s > 0.0) {
         r = (double)c->n_generated / c->t_gen_s;
@@ -952,23 +951,36 @@ double llm_tg_per_sec(const struct llm_ctx * c) {
     return r;
 }
 
-int32_t llm_n_prefill(const struct llm_ctx * c) {
+int32_t slm_n_prefill(const struct slm_ctx * c) {
     return (c == NULL) ? 0 : c->n_prefill;
 }
 
-int32_t llm_n_generated(const struct llm_ctx * c) {
+int32_t slm_n_generated(const struct slm_ctx * c) {
     return (c == NULL) ? 0 : c->n_generated;
 }
 
 // Convenience wrappers exported for the Swift bridge.
-int  llm_tokenize(struct llm_ctx * c, const char * text,
-                  int32_t * out_ids, int max_ids) {
-    return tokenizer_encode(&c->tok, text, out_ids, max_ids);
+//
+// slm_tokenize allocates the output array sized to a strict
+// worst-case bound (one token per input byte; byte-level BPE never
+// exceeds this). Caller takes ownership; `free()` releases the
+// buffer.
+int  slm_tokenize(struct slm_ctx * c, const char * text,
+                  int32_t ** out_ids) {
+    size_t bytes = (text != NULL) ? strlen(text) : 0;
+    size_t cap   = bytes + 1;        // +1 so an empty input still
+                                      // gets a valid (zero-length)
+                                      // allocation that the caller
+                                      // can free uniformly.
+    int32_t * ids = (int32_t *)oom(calloc(cap, sizeof(int32_t)));
+    int n = tokenizer_encode(&c->tok, text, ids, (int)cap);
+    *out_ids = ids;
+    return n;
 }
 
-int  llm_vocab_size(const struct llm_ctx * c) { return c->cfg.vocab_size; }
-int  llm_eos_id    (const struct llm_ctx * c) { return c->cfg.eos_id; }
-int  llm_bos_id    (const struct llm_ctx * c) { return c->cfg.bos_id; }
+int  slm_vocab_size(const struct slm_ctx * c) { return c->cfg.vocab_size; }
+int  slm_eos_id    (const struct slm_ctx * c) { return c->cfg.eos_id; }
+int  slm_bos_id    (const struct slm_ctx * c) { return c->cfg.bos_id; }
 
 // ---------------------------------------------------------------------------
 // --chunked-test: run the chunked SSM kernel on a 1-real-token chunk
@@ -988,7 +1000,7 @@ int  llm_bos_id    (const struct llm_ctx * c) { return c->cfg.bos_id; }
 #define CHUNKED_TEST_NTOK 8
 
 // Run the autoregressive recurrence (qwen3-next gated delta net) for
-// `n` tokens in sequence, single head. Mirrors llm_forward_ssm step 9
+// `n` tokens in sequence, single head. Mirrors slm_forward_ssm step 9
 // math directly without arena / tensor scaffolding. State starts at
 // zero and updates in place.
 static void autoregressive_ref(int n, int k_hd, int v_hd,
@@ -1112,7 +1124,7 @@ static int32_t chunked_self_test(void) {
     float * sc_key_gdiff  = (float *)oom(calloc((size_t)CHUNK_SIZE * k_hd,       sizeof(float)));
     float * sc_kgd_vnew   = (float *)oom(calloc((size_t)k_hd * v_hd,             sizeof(float)));
     // Run the kernel with the actual N (dynamic chunk size — exercises
-    // the same path that llm_forward_ssm_batch takes for partial tail
+    // the same path that slm_forward_ssm_batch takes for partial tail
     // chunks).
     chunked_ssm_step_f32(N, k_hd, v_hd,
                          q_pad, k_pad, v_pad, g_log_p, beta_p,
@@ -1182,8 +1194,8 @@ static int32_t chunked_self_test(void) {
 }
 
 // Agent helpers (parser + tool dispatcher) — `#include`-d here so
-// llm_generate's embedded agent loop can reach them. agent.c uses
-// llm_ctx + tokenizer_encode + chars / chars_put + tools_*, all of which
+// slm_generate's embedded agent loop can reach them. agent.c uses
+// slm_ctx + tokenizer_encode + chars / chars_put + tools_*, all of which
 // are in scope by this point.
 #include "agent.c"
 
@@ -1203,10 +1215,10 @@ static int32_t chunked_self_test(void) {
 //     tools from turn 1's system frame.
 //
 // Without this, the Swift chat path never advertised tools to the
-// model — the embedded agent loop in llm_generate fires only when
+// model — the embedded agent loop in slm_generate fires only when
 // the model emits `<tool_call>` markers, which only happens when
 // it's been told tools exist.
-char * llm_chat_format_delta(const char * user_message,
+char * slm_chat_format_delta(const char * user_message,
                              const char * system_prefix,
                              int enable_thinking,
                              int enable_tools) {
@@ -1240,10 +1252,10 @@ char * llm_chat_format_delta(const char * user_message,
     return result;
 }
 
-// Public llm_generate. The think + tool-call stream filter (set up
-// via llm_split_box / llm_split_trampoline above) routes the
-// model's bytes through llm_stream_cb. A completed
-// <tool_call>...</tool_call> block stops llm_generate_raw, the
+// Public slm_generate. The think + tool-call stream filter (set up
+// via slm_split_box / slm_split_trampoline above) routes the
+// model's bytes through slm_stream_cb. A completed
+// <tool_call>...</tool_call> block stops slm_generate_raw, the
 // body is parsed, the named tool dispatches synchronously, and
 // the result is tokenized + prefilled back into the KV cache for
 // the next iteration. The loop continues until the model produces
@@ -1261,18 +1273,20 @@ char * llm_chat_format_delta(const char * user_message,
 //                   debug=false those chunks are suppressed; the
 //                   tool still dispatches, the caller just doesn't
 //                   see it.
-#define LLM_GENERATE_TOOL_ITER_CAP 6
-int llm_generate(struct llm_ctx * c,
+#define SLM_GENERATE_TOOL_ITER_CAP 6
+int slm_generate(struct slm_ctx * c,
                  const int32_t * prompt_ids, int prompt_n,
                  int max_new, int min_new,
-                 const struct llm_sampler * sampler_in,
+                 const struct slm_sampler * sampler_in,
                  uint64_t seed,
-                 llm_stream_cb cb,
+                 slm_stream_cb cb,
                  void * user) {
     // Defaults when sampler isn't provided (rare; CLI / Swift
     // always pass one).
-    bool with_tools = (sampler_in != NULL) ? sampler_in->tools : true;
-    bool with_debug = (sampler_in != NULL) ? sampler_in->debug : true;
+    // tools / debug live on the ctx now (via struct slm_ctrl). The
+    // sampler is purely about how-to-pick-the-next-token.
+    bool with_tools = c->ctrl.tools;
+    bool with_debug = (c->ctrl.debug > 0);
     int  total_gen  = 0;
     bool done       = false;
     int32_t * cur_ids =
@@ -1284,13 +1298,13 @@ int llm_generate(struct llm_ctx * c,
     }
     int cur_n = prompt_n;
     int iter  = 0;
-    while (!done && iter < LLM_GENERATE_TOOL_ITER_CAP &&
+    while (!done && iter < SLM_GENERATE_TOOL_ITER_CAP &&
            total_gen < max_new) {
-        // Zero-init the box so llm_think_filter_init can assume the
+        // Zero-init the box so slm_think_filter_init can assume the
         // tool_call accumulator starts cleared (init does NOT
         // chars_free the previous heap buffer — see its header).
-        struct llm_split_box box = {0};
-        llm_think_filter_init(&box.filter);
+        struct slm_split_box box = {0};
+        slm_think_filter_init(&box.filter);
         // Toggle marker recognition + visibility chunk emission per
         // sampler flags. The filter consults these when scanning
         // for markers and when emitting chunk->tool_call.
@@ -1309,13 +1323,13 @@ int llm_generate(struct llm_ctx * c,
                     "[agent] iter=%d pos=%d prefill_n=%d budget=%d\n",
                     iter, c->pos, cur_n, budget);
         }
-        int n = llm_generate_raw(c, cur_ids, cur_n,
+        int n = slm_generate_raw(c, cur_ids, cur_n,
                                  budget, min_new,
                                  sampler_in, seed,
-                                 llm_split_trampoline, &box,
+                                 slm_split_trampoline, &box,
                                  cb, user);
         total_gen += n;
-        llm_think_filter_finish(&box.filter, cb, user);
+        slm_think_filter_finish(&box.filter, cb, user);
         free(cur_ids);
         cur_ids = NULL;
         cur_n   = 0;
@@ -1355,8 +1369,8 @@ int llm_generate(struct llm_ctx * c,
             // chunk — only the framed tool_response below is fed
             // back into KV.
             if (cb != NULL && result.data != NULL && with_debug) {
-                struct llm_stream_chunk ch = {0};
-                ch.tool_response = result.data;
+                struct slm_stream_chunk ch = {0};
+                ch.response = result.data;
                 cb(&ch, user);
             }
             struct chars inject = {0};
@@ -1398,10 +1412,10 @@ int llm_generate(struct llm_ctx * c,
 // ---------------------------------------------------------------------------
 #ifdef LLM_CLI
 
-static int32_t llm_self_test(void) {
+static int32_t slm_self_test(void) {
     // Tiny config: 2 layers, hidden=64, heads=4, head_dim=16, ffn=128,
     // vocab=256. Just enough to exercise every kernel.
-    struct llm_config cfg = {
+    struct slm_config cfg = {
         .n_layers = 2, .n_heads = 4, .n_kv_heads = 2,
         .head_dim = 16, .hidden_dim = 64,
         .ffn_dim = 128, .vocab_size = 256,
@@ -1428,8 +1442,8 @@ static int32_t llm_self_test(void) {
     float * out_norm = (float *)arena_alloc(a, (size_t)hidden * sizeof(float));
     for (int32_t i = 0; i < hidden; i++) out_norm[i] = 1.0f + RNDF();
     // Per-layer weights:
-    struct llm_layer_w * layers = (struct llm_layer_w *)oom(
-        calloc(cfg.n_layers, sizeof(struct llm_layer_w)));
+    struct slm_layer_w * layers = (struct slm_layer_w *)oom(
+        calloc(cfg.n_layers, sizeof(struct slm_layer_w)));
     #define ALLOC_F32(dst, n0, n1) do {                                 \
         size_t _bytes = (size_t)(n0) * (n1) * sizeof(float);           \
         float * _p = (float *)arena_alloc(a, _bytes);                   \
@@ -1454,7 +1468,7 @@ static int32_t llm_self_test(void) {
         ALLOC_F32(layers[L].ffn_up,     hidden, ffn);
         ALLOC_F32(layers[L].ffn_down,   ffn,    hidden);
     }
-    struct llm_weights W = {0};
+    struct slm_weights W = {0};
     W.tok_embd.data = tok_embd; W.tok_embd.type = GGUF_TT_F32;
     W.tok_embd.n_dims = 2; W.tok_embd.shape[0] = hidden;
     W.tok_embd.shape[1] = cfg.vocab_size;
@@ -1465,7 +1479,7 @@ static int32_t llm_self_test(void) {
     W.output_norm.shape[2] = 1; W.output_norm.shape[3] = 1;
     W.output = W.tok_embd;  // tied
     W.layers = layers;
-    struct llm_ctx c = {0};
+    struct slm_ctx c = {0};
     c.cfg = cfg;
     c.W = W;
     c.arena = a;
@@ -1477,7 +1491,7 @@ static int32_t llm_self_test(void) {
            sizeof(prompt) / sizeof(prompt[0]));
     int32_t ok = 1;
     for (size_t i = 0; i < sizeof(prompt) / sizeof(prompt[0]); i++) {
-        struct tensor * logits = llm_forward_step(&c, prompt[i], (int32_t)i);
+        struct tensor * logits = slm_forward_step(&c, prompt[i], (int32_t)i);
         int64_t n = tensor_nelements(logits);
         if (n != cfg.vocab_size) {
             fprintf(stderr, "self-test: logits size mismatch: %lld != %d\n",
@@ -1514,13 +1528,13 @@ static int32_t llm_self_test(void) {
 // block is elided to keep the symbol surface clean.
 // ---------------------------------------------------------------------------
 
-static const char * llm_cli_gguf_path(void) {
+static const char * slm_cli_gguf_path(void) {
     const char * env = getenv("QWEN_GGUF");
     if (env != NULL && env[0] != '\0') { return env; }
-    return LLM_GGUF_PATH_DEFAULT;
+    return SLM_GGUF_PATH_DEFAULT;
 }
 
-static int32_t print_cb(const struct llm_stream_chunk * chunk,
+static int32_t print_cb(const struct slm_stream_chunk * chunk,
                         void * user) {
     (void)user;
     if (chunk->content != NULL) {
@@ -1537,7 +1551,7 @@ static int32_t print_cb(const struct llm_stream_chunk * chunk,
 // Reasoning is the C-side filter's responsibility now — by the time
 // we get here, `<think>...</think>` blocks have already been
 // stripped and routed to chunk->reasoning, which we drop.
-static int32_t capture_cb(const struct llm_stream_chunk * chunk,
+static int32_t capture_cb(const struct slm_stream_chunk * chunk,
                           void * user) {
     struct chars * out = (struct chars *)user;
     if (chunk->content != NULL) {
@@ -1581,24 +1595,24 @@ static void strip_reasoning_for_history(struct chars * s) {
 
 // Multi-turn chat mode. Each --prompt is one user turn. The runner
 // re-prefills the full conversation each turn (KV cache overwrites,
-// SSM cache cleared via llm_reset() between turns). The optional
+// SSM cache cleared via slm_reset() between turns). The optional
 // --system string is prepended to the FIRST user turn's body (no
 // `<|im_start|>system` block), matching im.ai's observed framing.
 static int32_t run_chat(const char ** prompts, int32_t n_prompts,
                         const char * system_prompt,
-                        const struct llm_sampler * sp, uint64_t seed,
+                        const struct slm_sampler * sp, uint64_t seed,
                         int32_t max_new) {
-    struct llm_ctx * c = llm_create(llm_cli_gguf_path());
+    struct slm_ctx * c = slm_create(slm_cli_gguf_path());
     int32_t r = 0;
     if (!c->loaded) {
-        fprintf(stderr, "llm: load failed: %s\n", llm_get_error(c));
+        fprintf(stderr, "llm: load failed: %s\n", slm_get_error(c));
         r = 1;
     } else {
         // Persistent KV: only the DELTA gets tokenized each turn.
         // Turn 0 carries the system prefix inline with the first
         // user message (matches im.ai's framing). Subsequent turns
         // tokenize a bare `<|im_start|>user\n{Q}<|im_end|>\n` +
-        // assistant gen header. llm_generate advances c->pos so the
+        // assistant gen header. slm_generate advances c->pos so the
         // next call's prefill writes into KV at the correct offset.
         int32_t * ids = (int32_t *)oom(calloc(16384, sizeof(int32_t)));
         for (int32_t t = 0; t < n_prompts && r == 0; t++) {
@@ -1615,7 +1629,7 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
             fflush(stdout);
             int32_t nids = tokenizer_encode(&c->tok, delta_str, ids, 16384);
             struct chars reply = {0};
-            llm_generate(c, ids, nids, max_new, g_min_new, sp, seed,
+            slm_generate(c, ids, nids, max_new, g_min_new, sp, seed,
                          capture_cb, &reply);
             chars_put(&reply, "", 0);
             strip_reasoning_for_history(&reply);
@@ -1633,15 +1647,15 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
             fprintf(stderr,
                     "pp: %.2f tok/s (%d tok)  tg: %.2f tok/s (%d tok)  "
                     "kv pos=%d\n",
-                    llm_pp_per_sec(c), (int)llm_n_prefill(c),
-                    llm_tg_per_sec(c), (int)llm_n_generated(c),
+                    slm_pp_per_sec(c), (int)slm_n_prefill(c),
+                    slm_tg_per_sec(c), (int)slm_n_generated(c),
                     (int)c->pos);
             chars_free(&reply);
             free(delta_str);
         }
         free(ids);
     }
-    llm_destroy(c);
+    slm_destroy(c);
     return r;
 }
 
@@ -1663,7 +1677,7 @@ struct chat_test_capture {
 // filter discards). The hash thus captures the same "did the
 // generator behave identically" signal as before; if reasoning
 // shape changes between runs, that's surfaced.
-static int chat_test_cb(const struct llm_stream_chunk * chunk,
+static int chat_test_cb(const struct slm_stream_chunk * chunk,
                         void * user) {
     struct chat_test_capture * cap = (struct chat_test_capture *)user;
     const char * piece = (chunk->content != NULL) ? chunk->content
@@ -1680,10 +1694,10 @@ static int chat_test_cb(const struct llm_stream_chunk * chunk,
 }
 
 // Multi-turn scripted chat test. Runs three deterministic turns
-// twice — once on a fresh context, then again after llm_reset() — and
+// twice — once on a fresh context, then again after slm_reset() — and
 // verifies the reply hashes match across the two passes. This exercises
 // the chat-template state machine, the persistent KV cache, the
-// chunked-SSM prefill, AND the llm_reset() contract that state is
+// chunked-SSM prefill, AND the slm_reset() contract that state is
 // fully cleared between conversations.
 //
 // Fixed inputs (not user-configurable) so a CI run produces a stable
@@ -1696,12 +1710,12 @@ static int32_t run_chat_test(int32_t max_new) {
         "Thanks!"
     };
     enum { N_TURNS = 3 };
-    struct llm_sampler sp = llm_sampler_defaults();
+    struct slm_sampler sp = slm_sampler_defaults();
     uint64_t seed = 42;
-    struct llm_ctx * c = llm_create(llm_cli_gguf_path());
+    struct slm_ctx * c = slm_create(slm_cli_gguf_path());
     int32_t r = 0;
     if (!c->loaded) {
-        fprintf(stderr, "llm: load failed: %s\n", llm_get_error(c));
+        fprintf(stderr, "llm: load failed: %s\n", slm_get_error(c));
         r = 1;
     } else {
         struct chat_test_capture caps_a[N_TURNS] = {0};
@@ -1711,15 +1725,15 @@ static int32_t run_chat_test(int32_t max_new) {
         for (int32_t pass = 0; pass < 2 && r == 0; pass++) {
             struct chat_test_capture * caps = (pass == 0) ? caps_a : caps_b;
             // Reset before pass 1; pass 0 starts from a fresh ctx so
-            // the SSM state and pos are already zeroed by llm_create.
-            if (pass == 1) { llm_reset(c); }
+            // the SSM state and pos are already zeroed by slm_create.
+            if (pass == 1) { slm_reset(c); }
             for (int32_t t = 0; t < N_TURNS && r == 0; t++) {
                 struct chat_test_capture * cap = &caps[t];
                 cap->hash = 0xcbf29ce484222325ULL;
                 char * delta_str = jinja_apply_delta(turns[t], NULL, 0);
                 int32_t nids = tokenizer_encode(&c->tok, delta_str,
                                           ids, 16384);
-                int32_t gen = llm_generate(c, ids, nids, max_new,
+                int32_t gen = slm_generate(c, ids, nids, max_new,
                                            g_min_new, &sp, seed,
                                            chat_test_cb, cap);
                 chars_put(&cap->text, "", 0);
@@ -1739,7 +1753,7 @@ static int32_t run_chat_test(int32_t max_new) {
         }
         if (mismatch < 0) {
             printf("chat-test: PASS (3 turns x 2 passes,"
-                   " hashes match across llm_reset)\n");
+                   " hashes match across slm_reset)\n");
         } else {
             printf("chat-test: FAIL at turn %d\n", (int)(mismatch + 1));
             printf("  user:       %s\n", turns[mismatch]);
@@ -1752,7 +1766,7 @@ static int32_t run_chat_test(int32_t max_new) {
             chars_free(&caps_b[t].text);
         }
     }
-    llm_destroy(c);
+    slm_destroy(c);
     return r;
 }
 
@@ -1761,13 +1775,13 @@ static int32_t run_chat_test(int32_t max_new) {
 // tool calls, print the final answer. --trace dumps per-iteration
 // trace to stderr so the user can watch what the agent does.
 static int32_t run_ask(const char * question,
-                       const struct llm_sampler * sp, uint64_t seed,
+                       const struct slm_sampler * sp, uint64_t seed,
                        int32_t max_iters, int32_t max_new,
                        int32_t trace) {
-    struct llm_ctx * c = llm_create(llm_cli_gguf_path());
+    struct slm_ctx * c = slm_create(slm_cli_gguf_path());
     int32_t rc = 0;
     if (!c->loaded) {
-        fprintf(stderr, "llm: load failed: %s\n", llm_get_error(c));
+        fprintf(stderr, "llm: load failed: %s\n", slm_get_error(c));
         rc = 1;
     } else {
         printf("[user] %s\n", question);
@@ -1777,17 +1791,17 @@ static int32_t run_ask(const char * question,
         printf("\n[assistant] %s\n", answer != NULL ? answer : "");
         free(answer);
     }
-    llm_destroy(c);
+    slm_destroy(c);
     tools_global_cleanup();
     return rc;
 }
 
 static int32_t run_single(const char * prompt, int32_t max_new,
-                          const struct llm_sampler * sp, uint64_t seed) {
-    struct llm_ctx * c = llm_create(llm_cli_gguf_path());
+                          const struct slm_sampler * sp, uint64_t seed) {
+    struct slm_ctx * c = slm_create(slm_cli_gguf_path());
     int32_t r = 0;
     if (!c->loaded) {
-        fprintf(stderr, "llm: load failed: %s\n", llm_get_error(c));
+        fprintf(stderr, "llm: load failed: %s\n", slm_get_error(c));
         r = 1;
     } else {
         printf("model: %d layers, %d heads (%d kv), head_dim=%d, "
@@ -1806,24 +1820,24 @@ static int32_t run_single(const char * prompt, int32_t max_new,
         for (int32_t i = 0; i < n; i++) printf("%d ", (int)ids[i]);
         printf("\n---\n%s", prompt);
         fflush(stdout);
-        llm_generate(c, ids, n, max_new, g_min_new, sp, seed,
+        slm_generate(c, ids, n, max_new, g_min_new, sp, seed,
                      print_cb, NULL);
         printf("\n");
         fprintf(stderr,
                 "pp: %.2f tok/s (%d tok)  tg: %.2f tok/s (%d tok)\n",
-                llm_pp_per_sec(c), (int)llm_n_prefill(c),
-                llm_tg_per_sec(c), (int)llm_n_generated(c));
+                slm_pp_per_sec(c), (int)slm_n_prefill(c),
+                slm_tg_per_sec(c), (int)slm_n_generated(c));
     }
-    llm_destroy(c);
+    slm_destroy(c);
     return r;
 }
 
-static int32_t run_repl(const struct llm_sampler * sp,
+static int32_t run_repl(const struct slm_sampler * sp,
                         uint64_t seed, int32_t max_new) {
-    struct llm_ctx * c = llm_create(llm_cli_gguf_path());
+    struct slm_ctx * c = slm_create(slm_cli_gguf_path());
     int32_t r = 0;
     if (!c->loaded) {
-        fprintf(stderr, "llm: load failed: %s\n", llm_get_error(c));
+        fprintf(stderr, "llm: load failed: %s\n", slm_get_error(c));
         r = 1;
     } else {
         char line[4096];
@@ -1842,14 +1856,14 @@ static int32_t run_repl(const struct llm_sampler * sp,
                 int32_t nids = tokenizer_encode(&c->tok, framed, ids, 2048);
                 printf("\nassistant: ");
                 fflush(stdout);
-                llm_generate(c, ids, nids, max_new, g_min_new, sp, seed,
+                slm_generate(c, ids, nids, max_new, g_min_new, sp, seed,
                              print_cb, NULL);
                 printf("\n\n> ");
                 fflush(stdout);
             }
         }
     }
-    llm_destroy(c);
+    slm_destroy(c);
     return r;
 }
 
@@ -1880,7 +1894,7 @@ int main(int argc, char ** argv) {
     // (temp 0.7, top_k 40, top_p 0.9, min_p 0.05, rep 1.25, win 64).
     // Empirically the best fit for Qwen3.5-0.8B in chat + tools mode.
     // Individual flags below can override any field.
-    struct llm_sampler sp = llm_sampler_defaults();
+    struct slm_sampler sp = slm_sampler_defaults();
     uint64_t seed         = 0;          // 0 = derive from wall clock
     int32_t  max_new      = 64;
     int32_t  max_iters    = 4;          // agent-loop cap (--ask)
@@ -1956,7 +1970,7 @@ int main(int argc, char ** argv) {
     g_trace_tokens = getenv("LLM_TRACE_TOKENS") != NULL;
     int rc = 0;
     if (mode == CLI_SELF_TEST) {
-        rc = llm_self_test();
+        rc = slm_self_test();
     } else if (mode == CLI_CHUNKED_TEST) {
         rc = chunked_self_test();
     } else if (mode == CLI_SINGLE) {
@@ -1974,15 +1988,15 @@ int main(int argc, char ** argv) {
     } else if (mode == CLI_CHAT_TEST) {
         rc = run_chat_test(max_new);
     } else if (mode == CLI_PRINT_TEMPLATE) {
-        struct llm_ctx * c = llm_create(llm_cli_gguf_path());
+        struct slm_ctx * c = slm_create(slm_cli_gguf_path());
         if (!c->loaded) {
-            fprintf(stderr, "llm: load failed: %s\n", llm_get_error(c));
+            fprintf(stderr, "llm: load failed: %s\n", slm_get_error(c));
             rc = 1;
         } else {
-            const char * tpl = llm_chat_template(c);
+            const char * tpl = slm_chat_template(c);
             if (tpl != NULL) { fputs(tpl, stdout); }
         }
-        llm_destroy(c);
+        slm_destroy(c);
     } else if (mode == CLI_JINJA_TEST) {
         rc = jinja_self_test();
     } else if (mode == CLI_TOOLS_TEST) {
@@ -1994,7 +2008,7 @@ int main(int argc, char ** argv) {
         rc = run_ask(prompt, &sp, seed, max_iters,
                      max_new > 0 ? max_new : 256, trace_agent);
     } else if (mode == CLI_THINK_TEST) {
-        rc = llm_think_test();
+        rc = slm_think_test();
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  llm --self-test\n"

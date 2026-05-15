@@ -1,6 +1,6 @@
 // tokenizer.c -- byte-level BPE tokenizer (GPT-2 / Qwen3 style).
 //
-// `#include`-d once from qwen.c, after `struct llm_config` is in
+// `#include`-d once from qwen.c, after `struct slm_config` is in
 // scope (the tokenizer's `tokenizer_load` takes a config pointer
 // and dereferences vocab_size / bos_id / eos_id from it). Holds
 // the vocab + merges tables as two `struct map` instances from
@@ -14,7 +14,7 @@
 //   tokenizer_decode_one- token id → utf-8 piece (single token)
 //
 // Plus `struct tokenizer` itself, which is embedded by value in
-// `struct llm_ctx`. The `tokenizer_match_special` and
+// `struct slm_ctx`. The `tokenizer_match_special` and
 // `tokenizer_encode_bpe` helpers are public-ish too (they're called
 // from `tokenizer_encode` and could be from elsewhere within the
 // TU); `tokenizer_build_byte_maps` is an init helper.
@@ -209,7 +209,7 @@ static void tokenizer_build_byte_maps(struct tokenizer * t) {
 }
 
 static int32_t tokenizer_load(struct tokenizer * t, const struct gguf * g,
-                        const struct llm_config * cfg) {
+                        const struct slm_config * cfg) {
     memset(t, 0, sizeof(*t));
     t->vocab_size = cfg->vocab_size;
     t->bos_id     = cfg->bos_id;

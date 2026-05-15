@@ -1,11 +1,11 @@
-static double llm_monotonic_seconds(void) {
+static double slm_monotonic_seconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
 #ifdef LLM_CLI
-static const char * LLM_GGUF_PATH_DEFAULT =
+static const char * SLM_GGUF_PATH_DEFAULT =
     "/Users/leo/Library/Containers/io.github.leok7v.QwenHaiku/Data/"
     "Library/Application Support/Qwen/Qwen3.5-0.8B-Q4_K_M.gguf";
 #endif
@@ -13,14 +13,14 @@ static const char * LLM_GGUF_PATH_DEFAULT =
 // struct arr / chars and their arr_grow / chars_* helpers live in
 // `utils/arrays.c` + `utils/chars.c`, which llm.c #include's BEFORE
 // this file. Reuse them. The `oom(p)` wrapper there matches the
-// llm_oom semantics qwen used to define inline (warn on stderr,
+// slm_oom semantics qwen used to define inline (warn on stderr,
 // abort on NULL).
 
 // ---------------------------------------------------------------------------
 // Model config
 // ---------------------------------------------------------------------------
 
-struct llm_config {
+struct slm_config {
     int32_t  n_layers;
     int32_t  n_heads;
     int32_t  n_kv_heads;
@@ -48,7 +48,7 @@ struct llm_config {
     int32_t  rope_sections[4];      // see footnote (3)
 };
 
-// llm_config footnotes:
+// slm_config footnotes:
 //
 // (1) rope_dim: partial rotary - rotate only the first rope_dim
 //     entries of each head's vector (64 of 256 for qwen35). 0 means
@@ -76,7 +76,7 @@ struct llm_config {
 //     uses it as the document terminator and emits it readily under
 //     non-chat prompts).
 
-static int32_t llm_load_config(const struct gguf * g, struct llm_config * c) {
+static int32_t slm_load_config(const struct gguf * g, struct slm_config * c) {
     memset(c, 0, sizeof(*c));
     // Detect arch + pick KV prefix.
     const struct gguf_kv * arch_kv = gguf_find_kv(g, "general.architecture");
@@ -184,7 +184,7 @@ static int32_t llm_load_config(const struct gguf * g, struct llm_config * c) {
 // ---------------------------------------------------------------------------
 // Tokenizer (byte-level BPE, simplified). Lives in tokenizer.c so the
 // `tokenizer_*` namespace stays out of qwen.c. Pulled in here, after
-// struct llm_config is defined, because tokenizer_load takes a config
+// struct slm_config is defined, because tokenizer_load takes a config
 // pointer.
 // ---------------------------------------------------------------------------
 #include "tokenizer.c"
@@ -194,50 +194,50 @@ static int32_t llm_load_config(const struct gguf * g, struct llm_config * c) {
 // Model weights - pointers into the mmap'd GGUF, plus type tags.
 // ---------------------------------------------------------------------------
 
-struct llm_tensor_ref {
+struct slm_tensor_ref {
     const void * data;
     int32_t      type;        // GGUF_TT_*
     int32_t      n_dims;
     int64_t      shape[4];
 };
 
-struct llm_layer_w {
+struct slm_layer_w {
     int32_t               is_ssm;       // 1 for qwen35 SSM layer, 0 for attention
     // Common (both attention and SSM):
-    struct llm_tensor_ref attn_norm;    // RMSNorm before mixer
-    struct llm_tensor_ref ffn_norm;     // RMSNorm before FFN (called
+    struct slm_tensor_ref attn_norm;    // RMSNorm before mixer
+    struct slm_tensor_ref ffn_norm;     // RMSNorm before FFN (called
                                         // post_attention_norm in qwen35)
-    struct llm_tensor_ref ffn_gate;
-    struct llm_tensor_ref ffn_up;
-    struct llm_tensor_ref ffn_down;
+    struct slm_tensor_ref ffn_gate;
+    struct slm_tensor_ref ffn_up;
+    struct slm_tensor_ref ffn_down;
     // Attention-only:
-    struct llm_tensor_ref attn_q;
-    struct llm_tensor_ref attn_k;
-    struct llm_tensor_ref attn_v;
-    struct llm_tensor_ref attn_q_norm;
-    struct llm_tensor_ref attn_k_norm;
-    struct llm_tensor_ref attn_out;
+    struct slm_tensor_ref attn_q;
+    struct slm_tensor_ref attn_k;
+    struct slm_tensor_ref attn_v;
+    struct slm_tensor_ref attn_q_norm;
+    struct slm_tensor_ref attn_k_norm;
+    struct slm_tensor_ref attn_out;
     // SSM-only (qwen35 hybrid):
-    struct llm_tensor_ref attn_qkv;     // 1024 -> 6144 input projection
-    struct llm_tensor_ref attn_gate;    // 1024 -> 2048 output gate
-    struct llm_tensor_ref ssm_a;        // (16,) per-group A_log
-    struct llm_tensor_ref ssm_alpha;    // 1024 -> 16 (DeltaNet alpha)
-    struct llm_tensor_ref ssm_beta;     // 1024 -> 16 (DeltaNet beta)
-    struct llm_tensor_ref ssm_conv1d;   // (4, 6144) depthwise causal conv
-    struct llm_tensor_ref ssm_dt_bias;  // (16,) per-group dt bias
-    struct llm_tensor_ref ssm_norm;     // (128,) group-wise RMSNorm
-    struct llm_tensor_ref ssm_out;      // 2048 -> 1024 output projection
+    struct slm_tensor_ref attn_qkv;     // 1024 -> 6144 input projection
+    struct slm_tensor_ref attn_gate;    // 1024 -> 2048 output gate
+    struct slm_tensor_ref ssm_a;        // (16,) per-group A_log
+    struct slm_tensor_ref ssm_alpha;    // 1024 -> 16 (DeltaNet alpha)
+    struct slm_tensor_ref ssm_beta;     // 1024 -> 16 (DeltaNet beta)
+    struct slm_tensor_ref ssm_conv1d;   // (4, 6144) depthwise causal conv
+    struct slm_tensor_ref ssm_dt_bias;  // (16,) per-group dt bias
+    struct slm_tensor_ref ssm_norm;     // (128,) group-wise RMSNorm
+    struct slm_tensor_ref ssm_out;      // 2048 -> 1024 output projection
 };
 
-struct llm_weights {
-    struct llm_tensor_ref tok_embd;
-    struct llm_tensor_ref output_norm;
-    struct llm_tensor_ref output;       // may equal tok_embd (tied)
-    struct llm_layer_w * layers;        // [n_layers]
+struct slm_weights {
+    struct slm_tensor_ref tok_embd;
+    struct slm_tensor_ref output_norm;
+    struct slm_tensor_ref output;       // may equal tok_embd (tied)
+    struct slm_layer_w * layers;        // [n_layers]
 };
 
-static int32_t llm_resolve_tensor(const struct gguf * g, const char * name,
-                                  struct llm_tensor_ref * out,
+static int32_t slm_resolve_tensor(const struct gguf * g, const char * name,
+                                  struct slm_tensor_ref * out,
                                   int32_t required) {
     const struct gguf_tensor * t = gguf_find_tensor(g, name);
     int32_t r = 0;
@@ -257,87 +257,87 @@ static int32_t llm_resolve_tensor(const struct gguf * g, const char * name,
     return r;
 }
 
-static int32_t llm_load_weights(const struct gguf * g,
-                                const struct llm_config * cfg,
-                                struct llm_weights * w) {
+static int32_t slm_load_weights(const struct gguf * g,
+                                const struct slm_config * cfg,
+                                struct slm_weights * w) {
     memset(w, 0, sizeof(*w));
     int32_t r = 0;
-    r |= llm_resolve_tensor(g, "token_embd.weight",   &w->tok_embd,    1);
-    r |= llm_resolve_tensor(g, "output_norm.weight",  &w->output_norm, 1);
+    r |= slm_resolve_tensor(g, "token_embd.weight",   &w->tok_embd,    1);
+    r |= slm_resolve_tensor(g, "output_norm.weight",  &w->output_norm, 1);
     // output.weight is optional; absent => tied embeddings.
-    llm_resolve_tensor(g, "output.weight", &w->output, 0);
+    slm_resolve_tensor(g, "output.weight", &w->output, 0);
     if (w->output.data == NULL) { w->output = w->tok_embd; }
-    w->layers = (struct llm_layer_w *)oom(
-        calloc((size_t)cfg->n_layers, sizeof(struct llm_layer_w)));
+    w->layers = (struct slm_layer_w *)oom(
+        calloc((size_t)cfg->n_layers, sizeof(struct slm_layer_w)));
     char nm[64];
     for (int32_t L = 0; L < cfg->n_layers; L++) {
-        struct llm_layer_w * Lw = &w->layers[L];
+        struct slm_layer_w * Lw = &w->layers[L];
         // Layer-type detection: in qwen35 the SSM layers carry an
         // ssm_a tensor; the attention layers don't. (We could also
         // use full_attn_interval modulo, but probing the GGUF is
         // the safer signal.)
         snprintf(nm, sizeof(nm), "blk.%d.ssm_a", L);
-        struct llm_tensor_ref probe = {0};
+        struct slm_tensor_ref probe = {0};
         Lw->is_ssm = (cfg->is_hybrid
-                      && llm_resolve_tensor(g, nm, &probe, 0) == 0
+                      && slm_resolve_tensor(g, nm, &probe, 0) == 0
                       && probe.data != NULL) ? 1 : 0;
 
         // Shared norms + FFN. qwen35 calls the post-mixer norm
         // "post_attention_norm.weight"; classic Qwen uses
         // "ffn_norm.weight". Try both.
         snprintf(nm, sizeof(nm), "blk.%d.attn_norm.weight", L);
-        r |= llm_resolve_tensor(g, nm, &Lw->attn_norm, 1);
+        r |= slm_resolve_tensor(g, nm, &Lw->attn_norm, 1);
         snprintf(nm, sizeof(nm), "blk.%d.post_attention_norm.weight", L);
-        if (llm_resolve_tensor(g, nm, &Lw->ffn_norm, 0) != 0
+        if (slm_resolve_tensor(g, nm, &Lw->ffn_norm, 0) != 0
             || Lw->ffn_norm.data == NULL) {
             snprintf(nm, sizeof(nm), "blk.%d.ffn_norm.weight", L);
-            r |= llm_resolve_tensor(g, nm, &Lw->ffn_norm, 1);
+            r |= slm_resolve_tensor(g, nm, &Lw->ffn_norm, 1);
         }
         snprintf(nm, sizeof(nm), "blk.%d.ffn_gate.weight", L);
-        r |= llm_resolve_tensor(g, nm, &Lw->ffn_gate, 1);
+        r |= slm_resolve_tensor(g, nm, &Lw->ffn_gate, 1);
         snprintf(nm, sizeof(nm), "blk.%d.ffn_up.weight",   L);
-        r |= llm_resolve_tensor(g, nm, &Lw->ffn_up,   1);
+        r |= slm_resolve_tensor(g, nm, &Lw->ffn_up,   1);
         snprintf(nm, sizeof(nm), "blk.%d.ffn_down.weight", L);
-        r |= llm_resolve_tensor(g, nm, &Lw->ffn_down, 1);
+        r |= slm_resolve_tensor(g, nm, &Lw->ffn_down, 1);
 
         if (Lw->is_ssm) {
             snprintf(nm, sizeof(nm), "blk.%d.attn_qkv.weight",    L);
-            r |= llm_resolve_tensor(g, nm, &Lw->attn_qkv,    1);
+            r |= slm_resolve_tensor(g, nm, &Lw->attn_qkv,    1);
             snprintf(nm, sizeof(nm), "blk.%d.attn_gate.weight",   L);
-            r |= llm_resolve_tensor(g, nm, &Lw->attn_gate,   1);
+            r |= slm_resolve_tensor(g, nm, &Lw->attn_gate,   1);
             snprintf(nm, sizeof(nm), "blk.%d.ssm_a",              L);
-            r |= llm_resolve_tensor(g, nm, &Lw->ssm_a,       1);
+            r |= slm_resolve_tensor(g, nm, &Lw->ssm_a,       1);
             snprintf(nm, sizeof(nm), "blk.%d.ssm_alpha.weight",   L);
-            r |= llm_resolve_tensor(g, nm, &Lw->ssm_alpha,   1);
+            r |= slm_resolve_tensor(g, nm, &Lw->ssm_alpha,   1);
             snprintf(nm, sizeof(nm), "blk.%d.ssm_beta.weight",    L);
-            r |= llm_resolve_tensor(g, nm, &Lw->ssm_beta,    1);
+            r |= slm_resolve_tensor(g, nm, &Lw->ssm_beta,    1);
             snprintf(nm, sizeof(nm), "blk.%d.ssm_conv1d.weight",  L);
-            r |= llm_resolve_tensor(g, nm, &Lw->ssm_conv1d,  1);
+            r |= slm_resolve_tensor(g, nm, &Lw->ssm_conv1d,  1);
             snprintf(nm, sizeof(nm), "blk.%d.ssm_dt.bias",        L);
-            r |= llm_resolve_tensor(g, nm, &Lw->ssm_dt_bias, 1);
+            r |= slm_resolve_tensor(g, nm, &Lw->ssm_dt_bias, 1);
             snprintf(nm, sizeof(nm), "blk.%d.ssm_norm.weight",    L);
-            r |= llm_resolve_tensor(g, nm, &Lw->ssm_norm,    1);
+            r |= slm_resolve_tensor(g, nm, &Lw->ssm_norm,    1);
             snprintf(nm, sizeof(nm), "blk.%d.ssm_out.weight",     L);
-            r |= llm_resolve_tensor(g, nm, &Lw->ssm_out,     1);
+            r |= slm_resolve_tensor(g, nm, &Lw->ssm_out,     1);
         } else {
             snprintf(nm, sizeof(nm), "blk.%d.attn_q.weight",      L);
-            r |= llm_resolve_tensor(g, nm, &Lw->attn_q, 1);
+            r |= slm_resolve_tensor(g, nm, &Lw->attn_q, 1);
             snprintf(nm, sizeof(nm), "blk.%d.attn_k.weight",      L);
-            r |= llm_resolve_tensor(g, nm, &Lw->attn_k, 1);
+            r |= slm_resolve_tensor(g, nm, &Lw->attn_k, 1);
             snprintf(nm, sizeof(nm), "blk.%d.attn_v.weight",      L);
-            r |= llm_resolve_tensor(g, nm, &Lw->attn_v, 1);
+            r |= slm_resolve_tensor(g, nm, &Lw->attn_v, 1);
             snprintf(nm, sizeof(nm), "blk.%d.attn_q_norm.weight", L);
-            llm_resolve_tensor(g, nm, &Lw->attn_q_norm, 0);
+            slm_resolve_tensor(g, nm, &Lw->attn_q_norm, 0);
             snprintf(nm, sizeof(nm), "blk.%d.attn_k_norm.weight", L);
-            llm_resolve_tensor(g, nm, &Lw->attn_k_norm, 0);
+            slm_resolve_tensor(g, nm, &Lw->attn_k_norm, 0);
             snprintf(nm, sizeof(nm), "blk.%d.attn_output.weight", L);
-            r |= llm_resolve_tensor(g, nm, &Lw->attn_out, 1);
+            r |= slm_resolve_tensor(g, nm, &Lw->attn_out, 1);
         }
     }
     return r;
 }
 
-static void llm_free_weights(struct llm_weights * w) {
+static void slm_free_weights(struct slm_weights * w) {
     if (w->layers) {
         free(w->layers);
         w->layers = NULL;
@@ -347,7 +347,7 @@ static void llm_free_weights(struct llm_weights * w) {
 // Dispatch matmul based on weight tensor's quantization type. Weight
 // shape in GGUF is (in_features, out_features) - first dim is the
 // inner dim that contracts with x.
-static struct tensor * matmul_dispatch(const struct llm_tensor_ref * w,
+static struct tensor * matmul_dispatch(const struct slm_tensor_ref * w,
                                        struct tensor * x) {
     int64_t k     = w->shape[0];
     int64_t out_f = w->shape[1];
@@ -396,7 +396,7 @@ static struct tensor * matmul_dispatch(const struct llm_tensor_ref * w,
 
 // Cast an mmap'd weights ref to a struct tensor (read-only view) for
 // RMSNorm weight tensors etc., which GGUF stores as F32.
-static struct tensor weights_as_f32_view(const struct llm_tensor_ref * w,
+static struct tensor weights_as_f32_view(const struct slm_tensor_ref * w,
                                          struct arena * a) {
     struct tensor t;
     memset(&t, 0, sizeof(t));
@@ -417,7 +417,7 @@ static struct tensor weights_as_f32_view(const struct llm_tensor_ref * w,
 // KV cache (fp16 storage; fp32 working buffers for now)
 // ---------------------------------------------------------------------------
 
-struct llm_kv {
+struct slm_kv {
     int32_t    n_layers;
     int32_t    n_kv_heads;
     int32_t    head_dim;
@@ -427,7 +427,7 @@ struct llm_kv {
     _Float16 * v;
 };
 
-static int32_t kv_init(struct llm_kv * c, int32_t n_layers, int32_t n_kv_heads,
+static int32_t kv_init(struct slm_kv * c, int32_t n_layers, int32_t n_kv_heads,
                        int32_t head_dim, int32_t max_position) {
     memset(c, 0, sizeof(*c));
     c->n_layers     = n_layers;
@@ -443,18 +443,18 @@ static int32_t kv_init(struct llm_kv * c, int32_t n_layers, int32_t n_kv_heads,
     return 0;
 }
 
-static void kv_free(struct llm_kv * c) {
+static void kv_free(struct slm_kv * c) {
     free(c->k); c->k = NULL;
     free(c->v); c->v = NULL;
 }
 
-static _Float16 * kv_row_k(struct llm_kv * c, int32_t L, int32_t pos) {
+static _Float16 * kv_row_k(struct slm_kv * c, int32_t L, int32_t pos) {
     size_t per_row = (size_t)c->n_kv_heads * c->head_dim;
     size_t row     = (size_t)L * c->max_position + pos;
     return c->k + row * per_row;
 }
 
-static _Float16 * kv_row_v(struct llm_kv * c, int32_t L, int32_t pos) {
+static _Float16 * kv_row_v(struct slm_kv * c, int32_t L, int32_t pos) {
     size_t per_row = (size_t)c->n_kv_heads * c->head_dim;
     size_t row     = (size_t)L * c->max_position + pos;
     return c->v + row * per_row;
@@ -477,7 +477,7 @@ static _Float16 * kv_row_v(struct llm_kv * c, int32_t L, int32_t pos) {
 // their slots zero and untouched. Cheap enough to skip the bookkeeping.
 // ---------------------------------------------------------------------------
 
-struct llm_ssm_cache {
+struct slm_ssm_cache {
     int32_t   n_layers;
     int32_t   n_channels;     // 6144
     int32_t   conv_kernel;    // 4
@@ -488,8 +488,8 @@ struct llm_ssm_cache {
     float *   ssm_state;      // [n_layers][group_count][state_size]
 };
 
-static int32_t ssm_cache_init(struct llm_ssm_cache * s,
-                              const struct llm_config * cfg) {
+static int32_t ssm_cache_init(struct slm_ssm_cache * s,
+                              const struct slm_config * cfg) {
     memset(s, 0, sizeof(*s));
     if (cfg->is_hybrid) {
         s->n_layers    = cfg->n_layers;
@@ -515,7 +515,7 @@ static int32_t ssm_cache_init(struct llm_ssm_cache * s,
     return 0;
 }
 
-static void ssm_cache_free(struct llm_ssm_cache * s) {
+static void ssm_cache_free(struct slm_ssm_cache * s) {
     free(s->conv_state); s->conv_state = NULL;
     free(s->ssm_state);  s->ssm_state  = NULL;
     free(s->conv_head);  s->conv_head  = NULL;
@@ -524,8 +524,8 @@ static void ssm_cache_free(struct llm_ssm_cache * s) {
 // Reset recurrent state to "fresh conversation". The KV cache is
 // overwritten by the next forward pass so it does not need
 // clearing here; only the SSM/conv recurrent buffers do.
-static void ssm_cache_reset(struct llm_ssm_cache * s,
-                            const struct llm_config * cfg) {
+static void ssm_cache_reset(struct slm_ssm_cache * s,
+                            const struct slm_config * cfg) {
     if (s->conv_state != NULL) {
         size_t cb = (size_t)s->n_layers * s->conv_kernel *
                     s->n_channels * sizeof(float);
@@ -550,13 +550,13 @@ static void ssm_cache_reset(struct llm_ssm_cache * s,
 // by feeding tokens through this same function in sequence.
 // ---------------------------------------------------------------------------
 
-struct llm_ctx {
+struct slm_ctx {
     struct gguf            gguf;
-    struct llm_config      cfg;
-    struct llm_weights     W;
+    struct slm_config      cfg;
+    struct slm_weights     W;
     struct tokenizer       tok;
-    struct llm_kv          kv;
-    struct llm_ssm_cache   ssm;
+    struct slm_kv          kv;
+    struct slm_ssm_cache   ssm;
     struct arena *         arena;
     int32_t                loaded;
     char                   err[256];
@@ -567,14 +567,15 @@ struct llm_ctx {
     int32_t                n_prefill;
     int32_t                n_generated;
     int32_t                pos;             // see footnote (4)
+    struct slm_ctrl        ctrl;            // see footnote (5)
 };
 
-// llm_ctx footnotes:
+// slm_ctx footnotes:
 //
 // (1) chat_template: Jinja string from GGUF KV
 //     `tokenizer.chat_template`, copied as a NUL-terminated heap
 //     string (GGUF stores it length-prefixed). NULL if the GGUF lacks
-//     the KV (base completion models). Freed in llm_destroy.
+//     the KV (base completion models). Freed in slm_destroy.
 //
 // (2) dump_layer: --dump-layer L diagnostic. When >= 0, the forward
 //     path prints the first 8 values of selected intermediate
@@ -583,20 +584,28 @@ struct llm_ctx {
 //     llama-eval-callback.
 //
 // (3) t_prefill_s / t_gen_s / n_prefill / n_generated: filled by
-//     llm_generate's prefill and decode loops, read back via the
-//     llm_pp_per_sec / llm_tg_per_sec / llm_n_* accessors. Zero
+//     slm_generate's prefill and decode loops, read back via the
+//     slm_pp_per_sec / slm_tg_per_sec / slm_n_* accessors. Zero
 //     before any call has completed.
 //
 // (4) pos: next free position in the KV cache. Carries across
-//     consecutive llm_generate calls so multi-turn chat does not
+//     consecutive slm_generate calls so multi-turn chat does not
 //     need to reformat and re-prefill prior turns - tokenize only
 //     the new delta (e.g. `<|im_start|>user\nQ<|im_end|>\n` +
-//     gen header) and call llm_generate again. llm_reset() zeroes
+//     gen header) and call slm_generate again. slm_reset() zeroes
 //     this back to 0 along with the SSM/conv recurrent state.
+//
+// (5) ctrl: per-conversation behavior knobs (tools / think / effort
+//     / debug). Initialized to slm_ctrl_defaults() in slm_create;
+//     callers can override via slm_set_ctrl(). slm_generate reads
+//     tools and debug from here on every call. think + effort feed
+//     into slm_chat_format_delta on the first turn; once committed
+//     to KV they are locked in for the rest of the conversation
+//     (changing them mid-stream produces a mixed history).
 
 static int g_dump_layer = -1;
 int g_no_q8k_rt = 0;
-// Token-level trace: when set, llm_generate prints each sampled
+// Token-level trace: when set, slm_generate prints each sampled
 // token ID to stderr as "[tok] %d\n". Used by tools/bench.sh's
 // token-level parity mode, which survives ULP drift across
 // perf rewrites that change the underlying logits but keep the
@@ -605,14 +614,14 @@ static int g_trace_tokens = 1;
 __attribute__((unused)) static int g_min_new = 0;
 
 // DUMP(label, data, n) - one-line dump-when-this-layer-is-selected.
-// Captures `c` (the llm_ctx) and `L` (the current layer index) from
+// Captures `c` (the slm_ctx) and `L` (the current layer index) from
 // the calling scope; both are in scope at every dump site in
-// llm_forward_ssm / llm_forward_attn / llm_forward_step's layer loop.
+// slm_forward_ssm / slm_forward_attn / slm_forward_step's layer loop.
 // Off (no fprintf, no read of `data`) when c->dump_layer != L.
 #define DUMP(label, data, n) \
     do { \
         if (c->dump_layer == L) { \
-            llm_dump_row((label), (data), (n)); \
+            slm_dump_row((label), (data), (n)); \
         } \
     } while (0)
 
@@ -753,7 +762,7 @@ static inline void qwen_trace_batch(const char * name, const char * op,
     qwen_trace_f32(name, op, data, dim, n_tokens, 1, 1);
 }
 
-static void llm_dump_row(const char * label, const float * data, int32_t n) {
+static void slm_dump_row(const char * label, const float * data, int32_t n) {
     // Mirror llama-eval-callback's format: head + tail + sum. The
     // sum across the whole tensor is the cheapest single number that
     // exposes drift in middle elements (head/tail can be identical
@@ -836,11 +845,11 @@ static void llm_dump_row(const char * label, const float * data, int32_t n) {
 // Reference: NVlabs/GatedDeltaNet (ICLR'25) + qwen3_next paper.
 // ---------------------------------------------------------------------------
 
-static struct tensor * llm_forward_ssm(struct llm_ctx * c,
+static struct tensor * slm_forward_ssm(struct slm_ctx * c,
                                        int32_t L,
                                        struct tensor * h) {
     struct arena * a = c->arena;
-    struct llm_layer_w * Lw = &c->W.layers[L];
+    struct slm_layer_w * Lw = &c->W.layers[L];
     int32_t n_heads  = c->cfg.linear_n_heads;     // 16
     int32_t k_hd     = c->cfg.linear_k_head_dim;  // 128
     int32_t v_hd     = c->cfg.linear_v_head_dim;  // 128
@@ -1182,12 +1191,12 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
 //
 // `h` is [hidden_dim, n] - the input residual stream for these n
 // tokens. The SSM layer reads h as-is; the embedding lookup is
-// done by the caller (llm_forward_batch).
-static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
+// done by the caller (slm_forward_batch).
+static struct tensor * slm_forward_ssm_batch(struct slm_ctx * c,
                                               int32_t L, int32_t n,
                                               struct tensor * h) {
     struct arena * a = c->arena;
-    struct llm_layer_w * Lw = &c->W.layers[L];
+    struct slm_layer_w * Lw = &c->W.layers[L];
     int32_t n_heads  = c->cfg.linear_n_heads;
     int32_t k_hd     = c->cfg.linear_k_head_dim;
     int32_t v_hd     = c->cfg.linear_v_head_dim;
@@ -1439,12 +1448,12 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
 
 // Attention block for one transformer layer (non-SSM). Returns the
 // post-output-projection tensor; the caller is responsible for the
-// residual add. Mirrors llm_forward_ssm's contract.
-static struct tensor * llm_forward_attn(struct llm_ctx * c,
+// residual add. Mirrors slm_forward_ssm's contract.
+static struct tensor * slm_forward_attn(struct slm_ctx * c,
                                         int32_t L, int32_t pos,
                                         struct tensor * h) {
     struct arena * a = c->arena;
-    struct llm_layer_w * Lw = &c->W.layers[L];
+    struct slm_layer_w * Lw = &c->W.layers[L];
     int32_t hd         = c->cfg.head_dim;
     int32_t n_h        = c->cfg.n_heads;
     int32_t n_kvh      = c->cfg.n_kv_heads;
@@ -1482,14 +1491,14 @@ static struct tensor * llm_forward_attn(struct llm_ctx * c,
         qwen_trace_row(nm, "MUL_MAT", v->data, kv_hidden);
     }
     if (c->dump_layer == L) {
-        llm_dump_row("[A]Qfull  ", q_raw->data, attn_inner * 2);
-        llm_dump_row("[A]Kcur   ", k->data, n_kvh * hd);
-        llm_dump_row("[A]Vcur   ", v->data, n_kvh * hd);
+        slm_dump_row("[A]Qfull  ", q_raw->data, attn_inner * 2);
+        slm_dump_row("[A]Kcur   ", k->data, n_kvh * hd);
+        slm_dump_row("[A]Vcur   ", v->data, n_kvh * hd);
         // One-shot diagnostics for attn_v block 0.
         float dqv[QK_K];
         const q6k_block * vrow0 = (const q6k_block *)Lw->attn_v.data;
         q6k_dequant_block(vrow0, dqv);
-        llm_dump_row("[A]Vw[0]  ", dqv, 16);
+        slm_dump_row("[A]Vw[0]  ", dqv, 16);
         const uint8_t * raw = (const uint8_t *)vrow0;
         fprintf(stderr, "[dump] Vw[0] block bytes: d=0x%02x%02x"
                 " scales[0..3]=%d %d %d %d  qh[0]=0x%02x  ql[0]=0x%02x\n",
@@ -1642,7 +1651,7 @@ static struct tensor * llm_forward_attn(struct llm_ctx * c,
 // tokens against the existing KV cache (rows 0..pos_start-1) plus
 // the n new rows written by this call (rows pos_start..pos_start+n-1).
 //
-// Mirrors llm_forward_attn's contract: input is the (hidden_dim, n)
+// Mirrors slm_forward_attn's contract: input is the (hidden_dim, n)
 // residual stream, output is the (hidden_dim, n) post-projection
 // tensor; caller does the residual add. State writes:
 //   - KV cache rows pos_start..pos_start+n-1 (k_rope/v, cast to fp16)
@@ -1650,13 +1659,13 @@ static struct tensor * llm_forward_attn(struct llm_ctx * c,
 // Causal masking is handled by tensor_attention, which uses
 // k_offset = pos_start so each query t attends only to keys
 // 0..(pos_start + t).
-static struct tensor * llm_forward_attn_batch(struct llm_ctx * c,
+static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
                                               int32_t L,
                                               int32_t pos_start,
                                               int32_t n,
                                               struct tensor * h) {
     struct arena * a = c->arena;
-    struct llm_layer_w * Lw = &c->W.layers[L];
+    struct slm_layer_w * Lw = &c->W.layers[L];
     int32_t hd         = c->cfg.head_dim;
     int32_t n_h        = c->cfg.n_heads;
     int32_t n_kvh      = c->cfg.n_kv_heads;
@@ -1824,7 +1833,7 @@ static struct tensor * llm_forward_attn_batch(struct llm_ctx * c,
     return attn_out_t;
 }
 
-static struct tensor * llm_forward_step(struct llm_ctx * c,
+static struct tensor * slm_forward_step(struct slm_ctx * c,
                                         int32_t tok_id, int32_t pos) {
     struct arena * a = c->arena;
     arena_reset(a);
@@ -1866,7 +1875,7 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
         use_ssm_batch = (getenv("LLM_USE_SSM_BATCH") != NULL) ? 1 : 0;
     }
     for (int32_t L = 0; L < c->cfg.n_layers; L++) {
-        struct llm_layer_w * Lw = &c->W.layers[L];
+        struct slm_layer_w * Lw = &c->W.layers[L];
         struct tensor * mix;
         if (Lw->is_ssm) {
             // Single-token forward: route to the chunked-SSM batched
@@ -1875,10 +1884,10 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
             // autoregressive path; this gate exists so we can run
             // `--single "Hello"` with both paths and diff the traces.
             mix = use_ssm_batch
-                ? llm_forward_ssm_batch(c, L, 1, h)
-                : llm_forward_ssm(c, L, h);
+                ? slm_forward_ssm_batch(c, L, 1, h)
+                : slm_forward_ssm(c, L, h);
         } else {
-            mix = llm_forward_attn(c, L, pos, h);
+            mix = slm_forward_attn(c, L, pos, h);
         }
         {
             char nm[48];
@@ -1951,12 +1960,12 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
 // single call, returning the logits for the LAST token. Used for
 // prefill of multi-token prompts where the SSM layers benefit from
 // the chunked Gated DeltaNet kernel (~10x throughput vs n calls to
-// the autoregressive `llm_forward_step` for long prompts).
+// the autoregressive `slm_forward_step` for long prompts).
 //
 // Per-layer routing:
-//   - SSM layer: llm_forward_ssm_batch (chunked, all n tokens in one
+//   - SSM layer: slm_forward_ssm_batch (chunked, all n tokens in one
 //                call; internal multi-chunk loop for n > CHUNK_SIZE).
-//   - Attention layer: llm_forward_attn_batch (batched-queries-vs-
+//   - Attention layer: slm_forward_attn_batch (batched-queries-vs-
 //                full-KV-cache kernel; causal mask via k_offset =
 //                pos_start so query t attends only to keys
 //                0..pos_start+t).
@@ -1966,7 +1975,7 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
 //
 // Caller invariants:
 //   - Caller is responsible for advancing `c->pos` (mirrors
-//     llm_forward_step semantics; we just compute, no state pointer).
+//     slm_forward_step semantics; we just compute, no state pointer).
 //   - SSM state (`c->ssm.ssm_state`, `c->ssm.conv_state`,
 //     `c->ssm.conv_head`) and KV cache rows for
 //     pos_start..pos_start+n-1 are written by the two batch helpers.
@@ -1974,7 +1983,7 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
 // Returns logits for the LAST token (shape [vocab_size, 1]). Earlier
 // tokens' logits are discarded (we only need them for prefill
 // state-building; the first sample-able token is pos_start + n - 1).
-static struct tensor * llm_forward_batch(struct llm_ctx * c,
+static struct tensor * slm_forward_batch(struct slm_ctx * c,
                                          const int32_t * tok_ids,
                                          int32_t n,
                                          int32_t pos_start) {
@@ -1993,7 +2002,7 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
                               + (size_t)tok_id * hidden_dim;
             memcpy(dst, src, (size_t)hidden_dim * sizeof(float));
         } else {
-            // Q6_K dequant per row, same as llm_forward_step.
+            // Q6_K dequant per row, same as slm_forward_step.
             assert(hidden_dim % QK_K == 0);
             int32_t blocks_per_row = hidden_dim / QK_K;
             const q6k_block * row_blocks =
@@ -2007,18 +2016,18 @@ static struct tensor * llm_forward_batch(struct llm_ctx * c,
     qwen_trace_batch("inp_embd", "GET_ROWS", h->data, hidden_dim, n);
     // 2. Per-layer.
     for (int32_t L = 0; L < c->cfg.n_layers; L++) {
-        struct llm_layer_w * Lw = &c->W.layers[L];
+        struct slm_layer_w * Lw = &c->W.layers[L];
         struct tensor * mix;
         if (Lw->is_ssm) {
             // SSM: process all n tokens via chunked kernel. Internal
             // multi-chunk loop handles n > CHUNK_SIZE.
-            mix = llm_forward_ssm_batch(c, L, n, h);
+            mix = slm_forward_ssm_batch(c, L, n, h);
         } else {
             // Attention: batched-queries kernel. Processes all n
             // tokens against the KV cache in one pass; tensor_attention
             // applies the causal mask via k_offset = pos_start so
             // query t attends only to keys 0..(pos_start+t).
-            mix = llm_forward_attn_batch(c, L, pos_start, n, h);
+            mix = slm_forward_attn_batch(c, L, pos_start, n, h);
         }
         {
             char nm[48];

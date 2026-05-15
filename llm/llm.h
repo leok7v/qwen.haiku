@@ -9,23 +9,36 @@
 // internal.
 //
 // Lifecycle:
-//   1. llm_create(path)         - mmap the GGUF, allocate all KV/SSM
+//   1. slm_create(path)         - mmap the GGUF, allocate all KV/SSM
 //                                 caches, parse weights. Returns NULL
 //                                 only on out-of-memory; check
-//                                 llm_loaded(ctx) for parse success.
-//   2. llm_tokenize(...)        - byte-level BPE encode UTF-8 text
+//                                 slm_loaded(ctx) for parse success.
+//   2. slm_tokenize(...)        - byte-level BPE encode UTF-8 text
 //                                 into token IDs.
-//   3. llm_generate(...)        - streaming generation. The callback
+//   3. slm_generate(...)        - streaming generation. The callback
 //                                 fires once per generated token with
 //                                 the decoded UTF-8 piece.
-//   4. llm_destroy(ctx)         - free everything; safe on NULL.
+//   4. slm_destroy(ctx)         - free everything; safe on NULL.
 //
-// Thread-safety: a single llm_ctx is NOT thread-safe. It holds a
+// Thread-safety: a single slm_ctx is NOT thread-safe. It holds a
 // streaming KV cache and per-layer SSM state that mutates on every
 // forward pass. Use one ctx per concurrent inference stream.
 
-#ifndef LLM_H
-#define LLM_H
+// Roadmap (still TODO):
+//   1. Split `struct slm_ctx` into `slm_model` (mmap + weights +
+//      tokenizer, immutable post-load, shareable across ctxs) and
+//      `slm_ctx` (KV / SSM / pos / ctrl, one per conversation).
+//   2. Replace slm_create / slm_destroy / slm_reset with
+//      `slm_model_load / _unload` + `slm_ctx_create / _destroy`.
+//      slm_ctx_create takes (model, system_prompt, slm_ctrl *).
+//
+// Done in the current pass: `struct slm_ctrl` exists (tools / think
+// / effort / debug); the latter three pieces are stored on the ctx
+// and consulted by slm_generate, so the API change above is purely
+// a lifecycle refactor — the data is already in place.
+
+#ifndef SLM_H
+#define SLM_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -37,53 +50,66 @@ extern "C" {
 
 // Opaque handle. Callers should never dereference; treat it as
 // `void *` with type safety.
-struct llm_ctx;
+struct slm_ctx;
 
-// Token streaming callback. `utf8` is a NUL-terminated UTF-8 piece
-// (single token's decoded text, may be a partial Unicode codepoint
-// for BBPE; concatenating successive pieces always yields valid
-// UTF-8). Return non-zero to abort generation.
-typedef int (*llm_token_cb)(const char * utf8, void * user);
+// (`slm_token_cb`, the raw per-token callback, used to live here
+// but was internal-only. It now lives as a private typedef in llm.c
+// — every public caller goes through `slm_stream_cb` below.)
 
 // Open a GGUF and prepare the context. `path` is a filesystem path
 // to a qwen35 architecture Q4_K_M GGUF (e.g. unsloth's release).
-// On failure to parse, returns a non-NULL ctx with llm_loaded() == 0
-// and an error string available via llm_get_error().
-struct llm_ctx * llm_create(const char * path);
+// On failure to parse, returns a non-NULL ctx with slm_loaded() == 0
+// and an error string available via slm_get_error().
+struct slm_ctx * slm_create(const char * path);
 
 // Free ctx and all owned resources. Safe to call with NULL.
-void llm_destroy(struct llm_ctx * ctx);
+void slm_destroy(struct slm_ctx * ctx);
 
 // Clear the per-context recurrent state (SSM + conv1d rings) so the
 // next generate() starts as if from a fresh conversation. The KV
 // cache is naturally overwritten by the next forward pass and does
 // not need explicit clearing. Use before re-feeding a cumulative
 // conversation prompt in CLI multi-turn mode.
-void llm_reset(struct llm_ctx * ctx);
+void slm_reset(struct slm_ctx * ctx);
 
 // 1 if the GGUF was successfully parsed and weights are usable.
-// 0 if anything during load failed; call llm_get_error() to find
+// 0 if anything during load failed; call slm_get_error() to find
 // out what.
-int llm_loaded(const struct llm_ctx * ctx);
+int slm_loaded(const struct slm_ctx * ctx);
 
 // Returns a NUL-terminated error message describing why load or a
 // previous call failed. Empty string if no error. Lifetime is tied
 // to the ctx; do not free.
-const char * llm_get_error(const struct llm_ctx * ctx);
+const char * slm_get_error(const struct slm_ctx * ctx);
 
-// Encode `text` into token IDs. Writes up to `max_ids` ids into
-// `out_ids`. Returns the number of tokens written, or a negative
-// value on overflow / error.
-int llm_tokenize(struct llm_ctx * ctx, const char * text,
-                 int32_t * out_ids, int max_ids);
+// Encode `text` into token IDs. Allocates an int32_t array sized to
+// the worst-case bound (strlen(text), since byte-level BPE never
+// produces more tokens than input bytes); caller takes ownership and
+// frees with `free()`. Returns the number of tokens actually written.
+// Aborts via `oom()` on allocation failure — there is no error path
+// to recover from here.
+//
+// Callers commonly want the array AND its length, so the count comes
+// back via the return value and the pointer via the out-param:
+//
+//     int32_t * ids = NULL;
+//     int n = slm_tokenize(ctx, text, &ids);
+//     // use ids[0..n) ...
+//     free(ids);
+int slm_tokenize(struct slm_ctx * ctx, const char * text,
+                 int32_t ** out_ids);
 
 // Sampler parameters. Mirrors llama.cpp's `common_params_sampling`
-// for the subset we care about, plus three feature flags that
-// control llm_generate's behaviour (tool dispatch / reasoning /
-// debug visibility chunks). Zero-initialized struct = greedy
-// (argmax) + tools off + no reasoning + no debug. Prefer
-// llm_sampler_defaults() below for the chat-tuned defaults.
-struct llm_sampler {
+// for the subset we care about. Zero-initialized struct = greedy
+// (argmax). Prefer slm_sampler_defaults() below for the chat-tuned
+// defaults.
+//
+// Feature toggles (tool dispatch / reasoning / debug verbosity)
+// used to live here. They moved to `struct slm_ctrl` below — the
+// sampler stays purely about how-to-pick-the-next-token; tools /
+// think / debug describe conversation-level behaviour, set once
+// per ctx and consulted by slm_generate.
+struct slm_sampler {
     float    temperature;        // 0 = greedy; >0 = softmax temperature
     int      top_k;              // 0 or 1 = greedy; >1 = keep top k
     float    top_p;              // 0 or 1 = off; (0,1) = nucleus sampling
@@ -96,28 +122,49 @@ struct llm_sampler {
     int      repetition_window;  // 0 = penalize against all tokens
                                  // emitted in this generate() call so
                                  // far; >0 = only the last N.
-    // Feature toggles (additional controls, default true / false /
-    // true via llm_sampler_defaults()):
-    bool     tools;              // enable embedded agent dispatch in
-                                 // llm_generate. With false, the
+};
+
+// Per-context behavior knobs. Stored on slm_ctx; slm_generate reads
+// them on every call. Conceptually:
+//   - `tools` / `think` / `effort` are "what kind of conversation
+//      is this" — set once at conversation start (the eventual
+//      slm_ctx_create call) and left alone. Changing them mid-
+//      conversation works mechanically but produces a mixed history
+//      (the KV cache already holds the first-turn framing).
+//   - `debug` is a verbosity level (0 = quiet, 9 = chatty,
+//     intermediate values reserved). Free to flip on the fly.
+struct slm_ctrl {
+    bool         tools;          // enable embedded agent dispatch in
+                                 // slm_generate. With false, the
                                  // <tool_call> / </tool_call> markers
                                  // are NOT recognised — model output
                                  // streams as plain content.
-    bool     think;              // enable reasoning. Passed to the
-                                 // chat-template formatter to leave
-                                 // `<think>\n` open in the gen
-                                 // prompt; with false the gen prompt
-                                 // pre-fills the empty
-                                 // `<think>\n\n</think>\n\n` block
-                                 // and the model jumps to content.
-    bool     debug;              // emit chunk->tool_call /
-                                 // chunk->tool_response visibility
-                                 // chunks so the UI can render the
-                                 // raw tool-call body and tool
-                                 // response. With false these chunks
-                                 // are suppressed (dispatch still
-                                 // happens; user only sees content).
+    bool         think;          // enable reasoning. Hooked into
+                                 // slm_chat_format_delta: with true,
+                                 // the generation prompt opens
+                                 // <think>\n; with false, it pre-fills
+                                 // <think>\n\n</think>\n\n and the
+                                 // model jumps to content.
+    const char * effort;         // "low" / "medium" / "high" / NULL.
+                                 // slm_chat_format_delta prepends a
+                                 // hint to the first-turn system
+                                 // prompt accordingly. NULL == "medium"
+                                 // == no hint.
+    int32_t      debug;          // verbosity. > 0 enables chunk->call
+                                 // / chunk->response visibility chunks
+                                 // from slm_generate. Future levels
+                                 // can carry richer trace.
 };
+
+// Default ctrl: tools on, think off, effort = medium (no hint),
+// debug = 1 (visibility chunks on).
+struct slm_ctrl slm_ctrl_defaults(void);
+
+// Set / get the ctrl currently stored on `ctx`. `set` copies the
+// struct; the caller's storage can go out of scope immediately.
+void            slm_set_ctrl(struct slm_ctx * ctx,
+                             const struct slm_ctrl * ctrl);
+struct slm_ctrl slm_get_ctrl(const struct slm_ctx * ctx);
 
 // Default chat sampler: T=0.7, top_k=40, top_p=0.9, min_p=0.05,
 // rep=1.25, win=64, tools=true, think=false, debug=true. Lifted
@@ -126,13 +173,14 @@ struct llm_sampler {
 // callers can override individual fields.
 //
 // Function name intentionally differs from the struct tag: when
-// the C struct and a function share a name, Clang imports BOTH
-// into Swift under the same identifier, and `llm_sampler(field:
-// value, ...)` at a Swift call site silently resolves to the C
-// function (which takes no args and returns hard-coded defaults
-// — including `tools = true`) instead of the struct's memberwise
-// init. The defaults then overrode whatever the caller passed.
-struct llm_sampler llm_sampler_defaults(void);
+// the C struct and a function share a name (C allows it — tag and
+// ordinary namespaces are separate), Clang imports BOTH into Swift
+// under the same identifier and `slm_sampler(field: value, ...)`
+// at a Swift call site silently resolved to the no-arg getter
+// (`tools = true`, ignoring what the caller passed). Different
+// names side-steps the importer collision; this stays even after
+// the eventual slm_ rename (see top-of-file TODO).
+struct slm_sampler slm_sampler_defaults(void);
 
 // ---------------------------------------------------------------------------
 // <think>...</think> stream filter (C side, server-side state machine)
@@ -141,7 +189,7 @@ struct llm_sampler llm_sampler_defaults(void);
 // `</think>` markers BEFORE producing visible content. Most chat
 // surfaces want to render the two streams differently — reasoning
 // muted / collapsible, content prominent. This filter is a small
-// byte-stream state machine that splits one llm_generate stream
+// byte-stream state machine that splits one slm_generate stream
 // into two callbacks: `content_cb` (outside think blocks) and
 // `reasoning_cb` (inside). Marker bytes themselves are NOT
 // emitted to either callback.
@@ -155,40 +203,39 @@ struct llm_sampler llm_sampler_defaults(void);
 //
 // One emission from the split-stream callback. Exactly one of
 // these fields is non-NULL per call; the others are NULL.
-// NUL-terminated UTF-8 pieces, same semantics as llm_token_cb's
-// `utf8`.
+// NUL-terminated UTF-8 pieces — concatenating successive pieces
+// always yields valid UTF-8 (the C side holds back partial codepoints
+// across calls).
 //
 // content        - visible reply text. Display in the chat bubble.
 // reasoning      - text inside a `<think>...</think>` block. Hide
 //                  or render muted; do not feed back into history.
-// tool_call      - text inside a `<tool_call>...</tool_call>` block
+// call           - text inside a `<tool_call>...</tool_call>` block
 //                  the model emitted. Display as a "tool: …"
 //                  indicator while the C side dispatches.
-// tool_response  - text the C-side tool returned for that call.
+// response       - text the C-side tool returned for that call.
 //                  Display as a "result: …" indicator. After this
 //                  chunk fires, the C side automatically continues
 //                  generation with the tool's response prefilled
 //                  into the model's context — the caller stays a
 //                  pure stream consumer; no agent-loop wiring.
-struct llm_stream_chunk {
+// prefilled      - signal-only flag. Set to true on the one chunk
+//                  fired when prompt prefill finishes (the four
+//                  string fields above are NULL on that emission).
+//                  Useful for hiding a "thinking…" spinner / loading
+//                  bar once decode starts. There is no granular
+//                  prefill progress — for Qwen3.5-0.8B prefill takes
+//                  ~1s and a per-token bar is more noise than value.
+struct slm_stream_chunk {
     const char * content;
     const char * reasoning;
-    const char * tool_call;
-    const char * tool_response;
-    // Prefill progress signal. When prefill_total > 0 this chunk
-    // represents prompt-prefill progress and the four string fields
-    // above are NULL. prefill_done is the count of prompt tokens
-    // already in the model's KV; prefill_total is the prompt length.
-    // Fires every ~16 prefill tokens plus once at end. Returning
-    // non-zero from the callback aborts the prefill the same way it
-    // aborts decode (the public llm_generate honours both signals).
-    int prefill_done;
-    int prefill_total;
+    const char * call;
+    const char * response;
+    bool         prefilled;
 };
 
-// Return non-zero to abort generation (same convention as
-// llm_token_cb).
-typedef int (*llm_stream_cb)(const struct llm_stream_chunk * chunk,
+// Return non-zero to abort generation.
+typedef int (*slm_stream_cb)(const struct slm_stream_chunk * chunk,
                              void * user);
 
 // Run inference: prefill the prompt token ids, then sample up to
@@ -202,7 +249,7 @@ typedef int (*llm_stream_cb)(const struct llm_stream_chunk * chunk,
 // `cb` to discard the stream while still advancing the model.
 //
 // `sampler` controls how each token is chosen. Pass NULL for the
-// zero-initialized (greedy) default. See `struct llm_sampler`.
+// zero-initialized (greedy) default. See `struct slm_sampler`.
 // `seed` initializes a per-call PRNG (xoroshiro128**) used by the
 // stochastic sampler paths; pass 0 to derive from the wall clock.
 // Greedy sampling (temperature == 0) ignores the seed entirely.
@@ -214,29 +261,29 @@ typedef int (*llm_stream_cb)(const struct llm_stream_chunk * chunk,
 // bubble.
 //
 // Returns the number of tokens actually generated.
-int llm_generate(struct llm_ctx * ctx,
+int slm_generate(struct slm_ctx * ctx,
                  const int32_t * prompt_ids, int prompt_n,
                  int max_new, int min_new,
-                 const struct llm_sampler * sampler,
+                 const struct slm_sampler * sampler,
                  uint64_t seed,
-                 llm_stream_cb cb, void * user);
+                 slm_stream_cb cb, void * user);
 
 // Model metadata accessors. Cheap (O(1)).
-int llm_vocab_size(const struct llm_ctx * ctx);
-int llm_eos_id    (const struct llm_ctx * ctx);
-int llm_bos_id    (const struct llm_ctx * ctx);
+int slm_vocab_size(const struct slm_ctx * ctx);
+int slm_eos_id    (const struct slm_ctx * ctx);
+int slm_bos_id    (const struct slm_ctx * ctx);
 
-// Timing stats from the most recent llm_generate() call.
+// Timing stats from the most recent slm_generate() call.
 // pp_per_sec: prompt-prefill throughput, tokens / second (wall time
 //   of the prefill loop divided by prompt_n).
 // tg_per_sec: token-generation throughput, tokens / second (wall
 //   time of the decode loop divided by tokens generated).
 // n_prefill, n_generated: token counts from the most recent call.
 // All return 0 before any generate call has completed.
-double  llm_pp_per_sec (const struct llm_ctx * ctx);
-double  llm_tg_per_sec (const struct llm_ctx * ctx);
-int32_t llm_n_prefill  (const struct llm_ctx * ctx);
-int32_t llm_n_generated(const struct llm_ctx * ctx);
+double  slm_pp_per_sec (const struct slm_ctx * ctx);
+double  slm_tg_per_sec (const struct slm_ctx * ctx);
+int32_t slm_n_prefill  (const struct slm_ctx * ctx);
+int32_t slm_n_generated(const struct slm_ctx * ctx);
 
 // The chat template Jinja string as stored in the GGUF under the
 // `tokenizer.chat_template` KV. NULL if the file has no such KV
@@ -247,7 +294,7 @@ int32_t llm_n_generated(const struct llm_ctx * ctx);
 // caller is expected to apply it, either by piping into a Jinja
 // engine, or (recommended for this repo) by using the state machine
 // in docs/DESIGN.md whose structure mirrors this template.
-const char * llm_chat_template(const struct llm_ctx * ctx);
+const char * slm_chat_template(const struct slm_ctx * ctx);
 
 // ---------------------------------------------------------------------------
 // Chat-template formatting (hand-translated Qwen3.5 Jinja, see
@@ -256,17 +303,17 @@ const char * llm_chat_template(const struct llm_ctx * ctx);
 // state machine on their side. Returned strings are heap-allocated;
 // callers free with `free()` from <stdlib.h>.
 
-// Roles for llm_chat_message.role. Numbers match jinja-template.c
+// Roles for slm_chat_message.role. Numbers match jinja-template.c
 // internals but are part of the public API contract.
-enum llm_chat_role {
-    LLM_CHAT_ROLE_SYSTEM    = 0,
-    LLM_CHAT_ROLE_USER      = 1,
-    LLM_CHAT_ROLE_ASSISTANT = 2,
-    LLM_CHAT_ROLE_TOOL      = 3,
+enum slm_chat_role {
+    SLM_CHAT_ROLE_SYSTEM    = 0,
+    SLM_CHAT_ROLE_USER      = 1,
+    SLM_CHAT_ROLE_ASSISTANT = 2,
+    SLM_CHAT_ROLE_TOOL      = 3,
 };
 
-struct llm_chat_message {
-    int          role;     // one of llm_chat_role
+struct slm_chat_message {
+    int          role;     // one of slm_chat_role
     const char * content;  // NUL-terminated UTF-8, may be NULL
 };
 
@@ -278,13 +325,13 @@ struct llm_chat_message {
 // before producing content) or pre-fills the empty
 // `<think>\n\n</think>\n\n` block (skip-reasoning default).
 // Returns NULL if `messages` is NULL or `n_messages <= 0`.
-char * llm_chat_format(const struct llm_chat_message * messages,
+char * slm_chat_format(const struct slm_chat_message * messages,
                        int n_messages,
                        int add_generation_prompt,
                        int enable_thinking);
 
 // Render ONE new user turn for persistent-KV chat. Produces the
-// bytes you tokenize and feed into the next llm_generate() call,
+// bytes you tokenize and feed into the next slm_generate() call,
 // given an already-warm context. `system_prefix` is rendered INLINE
 // with the user message (no separate <|im_start|>system block) and
 // should be passed only on the FIRST turn of a conversation, NULL
@@ -292,17 +339,17 @@ char * llm_chat_format(const struct llm_chat_message * messages,
 // frame advertises the websearch / fetch / distill tools to the
 // model (the Jinja `# Tools` system block). With 0, no tools are
 // listed and the model produces plain content; pairs with
-// `llm_sampler.tools = false` so the runtime's embedded agent loop
+// `slm_sampler.tools = false` so the runtime's embedded agent loop
 // is also dormant. Subsequent turns (system_prefix NULL) carry no
 // tool advertisement either way — KV holds whatever was advertised
 // on turn 1. Returns NULL if `user_message` is NULL.
-char * llm_chat_format_delta(const char * user_message,
+char * slm_chat_format_delta(const char * user_message,
                              const char * system_prefix,
-                             int enable_thinking,
-                             int enable_tools);
+                             int enable_thinking, // bool think
+                             int enable_tools); // bool tools
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // LLM_H
+#endif // SLM_H

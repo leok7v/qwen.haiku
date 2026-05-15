@@ -9,7 +9,7 @@ SWIFTC   = swiftc
 ROOT     = ..
 LLM      = $(ROOT)/llm/llm.c
 SWIFT_SRCS = main.swift \
-             $(ROOT)/app/Qwen.swift \
+             $(ROOT)/app/SLM.swift \
              $(ROOT)/app/Chat.swift
 BRIDGE   = $(ROOT)/app/bridge.h
 

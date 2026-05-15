@@ -11,7 +11,7 @@
 //                            / tool messages, generation prompt)
 //   - tools.c               does the actual work (websearch / fetch
 //                            / distill via libcurl)
-//   - llm_generate          drives the model
+//   - slm_generate          drives the model
 //
 // What this file owns: parsing `<tool_call>` blocks out of the
 // model's streamed output, dispatching the named tool with the
@@ -554,13 +554,13 @@ static void agent_dispatch(const struct agent_call * call,
     }
 }
 
-// Streaming-capture callback for the agent's llm_generate calls.
+// Streaming-capture callback for the agent's slm_generate calls.
 // We only care about CONTENT bytes for tool-call parsing —
 // <tool_call> blocks emitted by the model live in content, never
 // inside <think>...</think>. The C-side filter already routes
 // reasoning to chunk->reasoning, which the agent drops (or could
 // surface as trace if needed).
-static int agent_capture_cb(const struct llm_stream_chunk * chunk,
+static int agent_capture_cb(const struct slm_stream_chunk * chunk,
                             void * user) {
     struct chars * out = (struct chars *)user;
     if (chunk->content != NULL) {
@@ -582,12 +582,12 @@ static int agent_capture_cb(const struct llm_stream_chunk * chunk,
 // produced in its last turn, with the <tool_call> blocks stripped
 // out so the user reads only the natural-language answer.
 __attribute__((unused))
-static char * agent_run(struct llm_ctx * ctx,
+static char * agent_run(struct slm_ctx * ctx,
                         const char * question,
-                        const struct llm_sampler * sp, uint64_t seed,
+                        const struct slm_sampler * sp, uint64_t seed,
                         int max_iters, int max_new,
                         int print_trace) {
-    llm_reset(ctx);
+    slm_reset(ctx);
     struct jinja_tool tools[] = {
         { AGENT_TOOL_WEBSEARCH },
         { AGENT_TOOL_FETCH },
@@ -635,14 +635,14 @@ static char * agent_run(struct llm_ctx * ctx,
             // history is re-fed (KV cache rebuilds). Simple and
             // robust; persistent-KV delta mode is a future
             // optimisation.
-            llm_reset(ctx);
+            slm_reset(ctx);
             struct chars reply = {0};
             if (print_trace) {
                 fprintf(stderr,
                         "agent: iter %d/%d prompt_tokens=%d\n",
                         iter, max_iters, (int)n_ids);
             }
-            llm_generate(ctx, ids, n_ids, max_new, 0, sp, seed,
+            slm_generate(ctx, ids, n_ids, max_new, 0, sp, seed,
                          agent_capture_cb, &reply);
             chars_put(&reply, "", 0);
             free(prompt);

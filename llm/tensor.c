@@ -776,7 +776,7 @@ typedef struct {
 // Pure scalar fp32 reference port of `build_delta_net_chunking` from
 // llama.cpp src/models/qwen3next.cpp. Not yet wired into the forward
 // path - currently a draft to be exercised against the multi-token
-// reference trace once `llm_forward_batch` lands.
+// reference trace once `slm_forward_batch` lands.
 #include "chunked.c"
 
 // Unpack 8 * (6-bit scale, 6-bit min) from the 12-byte `scales` field.

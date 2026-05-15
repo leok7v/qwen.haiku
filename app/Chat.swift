@@ -4,7 +4,7 @@
 //
 // The Qwen3 GGUF stores its chat template as a ~5 KB Jinja string
 // under the KV `tokenizer.chat_template`; the C runner exposes it
-// through `llm_chat_template(ctx)`. Rather than embed a Jinja parser
+// through `slm_chat_template(ctx)`. Rather than embed a Jinja parser
 // we mirror the template as a small Swift state machine here, where
 // the conversation model lives anyway. The structural form is the
 // `<|im_start|>role\n...content...<|im_end|>\n` envelope; the file
@@ -15,7 +15,7 @@
 // model jumps straight to content.
 //
 // The streaming side is symmetric: `ChatStreamFilter` watches the
-// token stream coming back from `llm_generate`, strips the
+// token stream coming back from `slm_generate`, strips the
 // `<|im_end|>` / `<|endoftext|>` marker once it appears, and signals
 // end-of-turn so the view model can stop generation cleanly without
 // the marker leaking into the visible bubble.
@@ -63,7 +63,7 @@ public enum ChatTemplate {
     /// opens a `<think>\n` block instead so the model emits its
     /// reasoning before content. `effort` prepends a hint to the
     /// system message; `addGenerationPrompt` appends the trailing
-    /// `<|im_start|>assistant\n` so `llm_generate` continues from
+    /// `<|im_start|>assistant\n` so `slm_generate` continues from
     /// the assistant's slot.
     public static func apply(messages: [ChatMessage],
                              reasoning: Bool = false,
@@ -123,7 +123,7 @@ public enum ChatTemplate {
     /// is rendered inline with the user message (no
     /// `<|im_start|>system` block) matching im.ai's framing.
     ///
-    /// Delegates to the C side (`llm_chat_format_delta` in llm.c,
+    /// Delegates to the C side (`slm_chat_format_delta` in llm.c,
     /// implemented in llm/jinja-template.c). One source of truth for
     /// the framing — when llama.cpp's upstream chat template changes
     /// (and the GGUF's tokenizer.chat_template KV changes), update
@@ -135,7 +135,7 @@ public enum ChatTemplate {
         var result = ""
         let think: Int32 = reasoning ? 1 : 0
         let toolsFlag: Int32 = tools ? 1 : 0
-        if let raw = llm_chat_format_delta(userMessage,
+        if let raw = slm_chat_format_delta(userMessage,
                                            systemPrefix,
                                            think,
                                            toolsFlag) {
@@ -156,7 +156,7 @@ public enum ChatTemplate {
 }
 
 /// Streaming-side companion to `ChatTemplate`. Accepts UTF-8 pieces
-/// emitted by `llm_generate`'s token callback and produces clean
+/// emitted by `slm_generate`'s token callback and produces clean
 /// user-visible text:
 ///
 /// 1. Skip an optional leading `<think>...</think>` block (Qwen3.5

@@ -7,7 +7,7 @@
 //   1. Compiles llm/llm.c (which #include-s tensor.c + neon.c +
 //      chunked.c) as a single C TU without LLM_CLI, producing the
 //      library-half of the bridge.
-//   2. Imports app/bridge.h so every llm_* symbol is visible in Swift.
+//   2. Imports app/bridge.h so every slm_* symbol is visible in Swift.
 //   3. Compiles app/Qwen.swift + app/Chat.swift (the exact files
 //      Xcode builds for the GUI app) alongside this main.swift.
 //
@@ -32,23 +32,23 @@ let modelPath: URL = {
     return URL(fileURLWithPath: env)
 }()
 
-// im.ai conversational preset (mirrors llm_sampler_defaults() in llm.c).
+// im.ai conversational preset (mirrors slm_sampler_defaults() in llm.c).
 // Kept in sync by hand for now; if these ever drift, --chat-test
 // hashes will diverge between this binary and the C binary.
-let imAi = Qwen.Options(temperature:       0.7,
-                        topK:              40,
-                        topP:              0.9,
-                        minP:              0.05,
-                        repetitionPenalty: 1.25,
-                        repetitionWindow:  64,
-                        maxNew:            30,
-                        minNew:            0,
-                        seed:              42)
+let imAi = SLM.Sampler(temperature:       0.7,
+                       topK:              40,
+                       topP:              0.9,
+                       minP:              0.05,
+                       repetitionPenalty: 1.25,
+                       repetitionWindow:  64,
+                       maxNew:            30,
+                       minNew:            0,
+                       seed:              42)
 
 func runSingle(prompt: String) -> Int32 {
     var rc: Int32 = 0
     do {
-        let q = try Qwen(modelPath: modelPath, options: imAi)
+        let q = try SLM(modelPath: modelPath, sampler: imAi)
         let framed = ChatTemplate.applyDelta(userMessage: prompt)
         var filter = ChatStreamFilter()
         try q.generate(prompt: framed) { piece in
@@ -95,7 +95,7 @@ func fnv1a64(_ s: String) -> UInt64 {
 func runChatTest() -> Int32 {
     var rc: Int32 = 0
     do {
-        let q = try Qwen(modelPath: modelPath, options: imAi)
+        let q = try SLM(modelPath: modelPath, sampler: imAi)
         var passA = [UInt64](repeating: 0, count: chatTestTurns.count)
         var passB = [UInt64](repeating: 0, count: chatTestTurns.count)
         var textsA = [String](repeating: "", count: chatTestTurns.count)

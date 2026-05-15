@@ -4,7 +4,7 @@
 //
 // Port of llama.cpp src/models/qwen3next.cpp build_delta_net_chunking
 // (~lines 97-356), scalar fp32. Selected over the recurrent
-// (autoregressive) path when llm_forward_batch sees n_tokens > 1;
+// (autoregressive) path when slm_forward_batch sees n_tokens > 1;
 // produces the same algebra but with ~10x throughput because every
 // chunk's intra-token attention becomes a small matmul instead of
 // k_hd sequential mul-adds.

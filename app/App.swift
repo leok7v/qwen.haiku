@@ -39,7 +39,7 @@ struct App: SwiftUI.App {
 
 @Observable
 @MainActor
-final class QwenViewModel {
+final class SLMViewModel {
 
     enum State: Equatable {
         case idle                                    // initial, nothing checked yet
@@ -65,13 +65,14 @@ final class QwenViewModel {
     var lastNPrefill:  Int    = 0
     var lastNGen:      Int    = 0
 
-    // Live prefill progress for the in-flight turn. Updated by the
-    // chunk callback; UI shows a progress bar while prefillTotal > 0
-    // and prefillDone < prefillTotal. Reset to 0/0 once decode starts.
-    var prefillDone:   Int = 0
-    var prefillTotal:  Int = 0
+    // True between the moment a turn starts and the C side fires
+    // its `.prefilled` chunk (prompt prefill done, decode begins).
+    // Used to show a "thinking..." indicator in the status line.
+    // No granular per-token progress — at this model size prefill
+    // is ~1s and a fine-grained bar is more noise than value.
+    var prefilling:    Bool = false
 
-    @ObservationIgnored private var qwen:       Qwen?
+    @ObservationIgnored private var slm:        SLM?
     @ObservationIgnored private var downloader: Downloader?
     @ObservationIgnored
     nonisolated(unsafe) private var stopRequested = false
@@ -112,22 +113,23 @@ final class QwenViewModel {
     private func loadModel() async {
         if let dl = self.downloader {
             let path = dl.localURL
-            let opts = Qwen.Options(temperature:       0.7,
-                                    topK:              40,
-                                    topP:              0.9,
-                                    minP:              0.05,
-                                    repetitionPenalty: 1.25,
-                                    repetitionWindow:  64,
-                                    tools:             self.tools,
-                                    think:             false,
-                                    debug:             self.debug,
-                                    maxNew:            512,
-                                    minNew:            8)
+            let sampler = SLM.Sampler(temperature:       0.7,
+                                      topK:              40,
+                                      topP:              0.9,
+                                      minP:              0.05,
+                                      repetitionPenalty: 1.25,
+                                      repetitionWindow:  64,
+                                      maxNew:            512,
+                                      minNew:            8)
+            let ctrl    = SLM.Ctrl(tools:  self.tools,
+                                   think:  self.think,
+                                   effort: "medium",
+                                   debug:  self.debug ? 1 : 0)
             do {
                 let loaded = try await Task.detached(priority: .userInitiated) {
-                    try Qwen(modelPath: path, options: opts)
+                    try SLM(modelPath: path, sampler: sampler, ctrl: ctrl)
                 }.value
-                self.qwen  = loaded
+                self.slm   = loaded
                 self.state = .ready
             } catch {
                 self.state = .error(String(describing: error))
@@ -140,7 +142,7 @@ final class QwenViewModel {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedUser = text
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if qwen != nil, state == .ready, !trimmedUser.isEmpty {
+        if slm != nil, state == .ready, !trimmedUser.isEmpty {
             let isFirstTurn = !self.messages.contains(
                 where: { $0.role == .user })
             self.messages.append(
@@ -155,23 +157,25 @@ final class QwenViewModel {
                 tools: self.tools)
             self.state         = .generating
             self.stopRequested = false
-            self.prefillDone   = 0
-            self.prefillTotal  = 0
-            self.qwen?.options.debug = self.debug
-            self.qwen?.options.tools = self.tools
-            self.qwen?.options.think = self.think
+            self.prefilling    = true
+            // Sync per-turn ctrl knobs onto the live SLM ctx so the
+            // next generate() reads the current toggle state.
+            self.slm?.ctrl = SLM.Ctrl(tools:  self.tools,
+                                      think:  self.think,
+                                      effort: "medium",
+                                      debug:  self.debug ? 1 : 0)
             await self.streamAssistant(prompt: delta, at: assistantIdx)
         }
     }
 
     private func streamAssistant(prompt: String, at idx: Int) async {
-        if let qwen = self.qwen {
+        if let slm = self.slm {
             let debugOn = self.debug
             let thinkOn = self.think
             await Task.detached(priority: .userInitiated) { [weak self] in
                 var filter = ChatStreamFilter()
                 do {
-                    try qwen.generate(prompt: prompt) { chunk in
+                    try slm.generate(prompt: prompt) { chunk in
                         var keepGoing = true
                         switch chunk {
                         case .content(let s):
@@ -208,11 +212,14 @@ final class QwenViewModel {
                                                           at: idx)
                                 }
                             }
-                        case .prefill(let done, let total):
-                            let isDone = (done >= total)
+                        case .prefilled:
+                            // Prefill finished, decode starts — drop
+                            // the "thinking…" indicator if the view
+                            // model tracks one. (The boolean swap is
+                            // intentionally minimal: at this model
+                            // size prefill is ~1s so no progress bar.)
                             Task { @MainActor in
-                                self?.prefillDone  = isDone ? 0 : done
-                                self?.prefillTotal = isDone ? 0 : total
+                                self?.prefilling = false
                             }
                         }
                         if keepGoing {
@@ -226,10 +233,10 @@ final class QwenViewModel {
                             self?.appendAssistant(tail, at: idx)
                         }
                     }
-                    let pp = qwen.ppPerSec
-                    let tg = qwen.tgPerSec
-                    let np = qwen.nPrefill
-                    let ng = qwen.nGenerated
+                    let pp = slm.ppPerSec
+                    let tg = slm.tgPerSec
+                    let np = slm.nPrefill
+                    let ng = slm.nGenerated
                     Task { @MainActor in
                         self?.cleanCommittedAssistant(at: idx)
                         self?.finishTurn(pp: pp, tg: tg, np: np, ng: ng)
@@ -278,14 +285,14 @@ final class QwenViewModel {
 
     func clearChat() {
         self.messages.removeAll()
-        self.qwen?.reset()
+        self.slm?.reset()
     }
 
 }
 
 struct ContentView: View {
 
-    @State private var vm    = QwenViewModel()
+    @State private var vm    = SLMViewModel()
     @State private var input: String = ""
     @State private var showSystem    = false
 
@@ -527,11 +534,8 @@ struct ContentView: View {
                 Text("ready  |  \(rss)")
             }
         case .generating:
-            if vm.prefillTotal > 0 {
-                let pct = Int(Double(vm.prefillDone) /
-                              Double(max(vm.prefillTotal, 1)) * 100.0)
-                Text(String(format: "prefill %d/%d (%d%%)  |  %@",
-                            vm.prefillDone, vm.prefillTotal, pct, rss))
+            if vm.prefilling {
+                Text("prefilling...  |  \(rss)")
             } else {
                 Text("generating...  |  \(rss)")
             }
