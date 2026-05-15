@@ -232,6 +232,7 @@ static void map_free(struct map * m) {
     m->capacity = 0;
 }
 
+__attribute__((unused))
 static void map_for_each(struct map * m,
                          void (*fn)(const void * k, void * v, void * ctx),
                          void * ctx) {

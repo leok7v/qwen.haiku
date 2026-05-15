@@ -58,165 +58,20 @@
 // project (struct arr / chars + arr_grow / oom / chars_put / ...).
 // Brought in here so qwen.c below can use them; the duplicates that
 // used to live at the top of qwen.c are gone.
-#include "utils/chars.c"      // transitively pulls in utils/arrays.c
+// utils/maps.c transitively pulls in utils/chars.c and
+// utils/arrays.c, so one include brings the whole utility cluster
+// (struct arr / chars / map, oom, chars_put, map_put / map_get).
+#include "utils/maps.c"
 
+#include "gguf.c"             // GGUF v3 reader; used by qwen.c below
 #include "qwen.c"
-#include "jinja-template.c"
+#include "utils/jinja.c"     // renamed from llm/jinja-template.c
 #include "tools.c"
 
-
-// Sampler chain order (sample_with below): penalties -> temperature
-// (softmax-with-T on top-K logits) -> top-P -> min-P -> distribution.
-// Matches im.ai's `Sampler.swift` ordering (see comment block at
-// im.ai/src/model/Sampler.swift:19-32 for the rationale). One subtle
-// difference: im.ai normalizes the softmax over the FULL vocabulary
-// before top-K filtering, while we normalize over the top-K survivors
-// (which represent ~99% of probability mass for typical Qwen logits,
-// so the top-P cutoff shifts by <1% in practice).
-struct llm_sampler llm_sampler_defaults(void) {
-    struct llm_sampler s;
-    s.temperature        = 0.7f;
-    s.top_k              = 40;
-    s.top_p              = 0.9f;
-    s.min_p              = 0.05f;
-    s.repetition_penalty = 1.25f;
-    s.repetition_window  = 64;
-    s.tools              = true;   // agent dispatch on by default
-    s.think              = false;  // reasoning off (gen prompt skips
-                                   // the <think> block)
-    s.debug              = true;   // surface tool_call /
-                                   // tool_response chunks to UI
-    return s;
-}
-
-// Apply repetition penalty in-place to `logits`: any token id that
-// appears in the recent-history window is scaled by /penalty
-// (positive logits become less likely) or *penalty (negative logits
-// become MORE negative). Standard llama.cpp convention.
-static void apply_rep_penalty(struct tensor * logits,
-                              const int32_t * history, int32_t hist_n,
-                              float penalty, int32_t window) {
-    if (penalty == 1.0f || hist_n == 0) { return; }
-    int32_t start = (window > 0 && window < hist_n) ? hist_n - window : 0;
-    int64_t vlen  = tensor_nelements(logits);
-    for (int32_t i = start; i < hist_n; i++) {
-        int32_t t = history[i];
-        if (t >= 0 && (int64_t)t < vlen) {
-            float lv = logits->data[t];
-            logits->data[t] = (lv > 0.0f) ? (lv / penalty) : (lv * penalty);
-        }
-    }
-}
-
-// Top-k filter into parallel arrays (idx, val) of length filled.
-// Linear scan; k is capped to LLM_SAMPLE_TOPK_MAX so the working set
-// fits in a stack buffer.
-#define LLM_SAMPLE_TOPK_MAX 256
-
-static int32_t topk_collect(const struct tensor * logits, int32_t k,
-                            int32_t * idx, float * val) {
-    int64_t n      = tensor_nelements(logits);
-    if (k <= 0 || k > LLM_SAMPLE_TOPK_MAX) { k = LLM_SAMPLE_TOPK_MAX; }
-    int32_t filled = 0;
-    for (int64_t i = 0; i < n; i++) {
-        float lv = logits->data[i];
-        if (filled < k) {
-            idx[filled] = (int32_t)i;
-            val[filled] = lv;
-            filled++;
-        } else {
-            int32_t worst = 0;
-            for (int32_t j = 1; j < k; j++) {
-                if (val[j] < val[worst]) { worst = j; }
-            }
-            if (lv > val[worst]) {
-                idx[worst] = (int32_t)i;
-                val[worst] = lv;
-            }
-        }
-    }
-    return filled;
-}
-
-// Softmax over `filled` candidates with temperature; writes the
-// normalized probability into `val` (replacing logits).
-static void topk_softmax(float * val, int32_t filled, float temperature) {
-    float m = val[0];
-    for (int32_t j = 1; j < filled; j++) {
-        if (val[j] > m) { m = val[j]; }
-    }
-    float sum = 0.0f;
-    for (int32_t j = 0; j < filled; j++) {
-        val[j] = expf((val[j] - m) / temperature);
-        sum   += val[j];
-    }
-    if (sum > 0.0f) {
-        for (int32_t j = 0; j < filled; j++) { val[j] /= sum; }
-    }
-}
-
-// Sort (idx, val) pairs by val descending using insertion sort
-// (filled <= 256 in practice; cheaper than qsort overhead).
-static void topk_sort_desc(int32_t * idx, float * val, int32_t filled) {
-    for (int32_t i = 1; i < filled; i++) {
-        float   v = val[i];
-        int32_t k = idx[i];
-        int32_t j = i - 1;
-        while (j >= 0 && val[j] < v) {
-            val[j + 1] = val[j];
-            idx[j + 1] = idx[j];
-            j--;
-        }
-        val[j + 1] = v;
-        idx[j + 1] = k;
-    }
-}
-
-static int32_t sample_with(struct tensor * logits,
-                           const struct llm_sampler * sp,
-                           struct rng * rng,
-                           const int32_t * history, int32_t hist_n) {
-    apply_rep_penalty(logits, history, hist_n,
-                      sp->repetition_penalty, sp->repetition_window);
-    if (sp->temperature <= 0.0f) {
-        return sample_argmax(logits);
-    }
-    int32_t idx[LLM_SAMPLE_TOPK_MAX];
-    float   val[LLM_SAMPLE_TOPK_MAX];
-    int32_t k = sp->top_k > 0 ? sp->top_k : LLM_SAMPLE_TOPK_MAX;
-    if (k > LLM_SAMPLE_TOPK_MAX) { k = LLM_SAMPLE_TOPK_MAX; }
-    int32_t filled = topk_collect(logits, k, idx, val);
-    topk_softmax(val, filled, sp->temperature);
-    topk_sort_desc(idx, val, filled);
-    // Top-p (nucleus): keep the smallest prefix whose cumulative
-    // probability >= top_p. Effective only when 0 < top_p < 1.
-    int32_t cutoff = filled;
-    if (sp->top_p > 0.0f && sp->top_p < 1.0f) {
-        float acc = 0.0f;
-        for (int32_t j = 0; j < filled; j++) {
-            acc += val[j];
-            if (acc >= sp->top_p) { cutoff = j + 1; j = filled; }
-        }
-    }
-    // Min-p: drop tokens whose probability < min_p * top_prob.
-    if (sp->min_p > 0.0f) {
-        float thresh = sp->min_p * val[0];
-        int32_t j2   = 1;
-        while (j2 < cutoff && val[j2] >= thresh) { j2++; }
-        cutoff = j2;
-    }
-    // Re-normalize and roulette-wheel sample from the surviving set.
-    float sum = 0.0f;
-    for (int32_t j = 0; j < cutoff; j++) { sum += val[j]; }
-    float u = rng_uniform(rng) * sum;
-    float c = 0.0f;
-    int32_t picked = 0;
-    for (int32_t j = 0; j < cutoff; j++) {
-        c += val[j];
-        if (u <= c) { picked = j; j = cutoff; }
-    }
-    return idx[picked];
-}
+// Sampler chain (llm_sampler_defaults + sample_with + helpers).
+// Pulled in AFTER qwen.c so it can use struct rng / rng_uniform /
+// sample_argmax defined there.
+#include "sampler.c"
 
 // ---------------------------------------------------------------------------
 // Public-ish API used by Swift bridge AND by main()
@@ -237,7 +92,7 @@ struct llm_ctx * llm_create(const char * path) {
         snprintf(c->err, sizeof(c->err), "weights resolve failed");
         return c;
     }
-    if (tok_load(&c->tok, &c->gguf, &c->cfg) != 0) {
+    if (tokenizer_load(&c->tok, &c->gguf, &c->cfg) != 0) {
         snprintf(c->err, sizeof(c->err), "tokenizer load failed");
         return c;
     }
@@ -294,7 +149,7 @@ void llm_destroy(struct llm_ctx * c) {
     if (c != NULL) {
         ssm_cache_free(&c->ssm);
         kv_free(&c->kv);
-        tok_free(&c->tok);
+        tokenizer_free(&c->tok);
         llm_free_weights(&c->W);
         if (c->chat_template) { free(c->chat_template); }
         if (c->arena)         { arena_free(c->arena); c->arena = NULL; }
@@ -488,7 +343,7 @@ static int llm_generate_raw(struct llm_ctx * c,
             stop = 1;
         } else {
             struct chars piece = {0};
-            tok_decode_one(&c->tok, next, &piece);
+            tokenizer_decode_one(&c->tok, next, &piece);
             chars_put(&piece, "", 0);  // ensure null-term
             if (cb != NULL && piece.data != NULL) {
                 if (cb(piece.data, user) != 0) { stop = 1; }
@@ -1097,7 +952,7 @@ int32_t llm_n_generated(const struct llm_ctx * c) {
 // Convenience wrappers exported for the Swift bridge.
 int  llm_tokenize(struct llm_ctx * c, const char * text,
                   int32_t * out_ids, int max_ids) {
-    return tok_encode(&c->tok, text, out_ids, max_ids);
+    return tokenizer_encode(&c->tok, text, out_ids, max_ids);
 }
 
 int  llm_vocab_size(const struct llm_ctx * c) { return c->cfg.vocab_size; }
@@ -1317,7 +1172,7 @@ static int32_t chunked_self_test(void) {
 
 // Agent helpers (parser + tool dispatcher) — `#include`-d here so
 // llm_generate's embedded agent loop can reach them. agent.c uses
-// llm_ctx + tok_encode + chars / chars_put + tools_*, all of which
+// llm_ctx + tokenizer_encode + chars / chars_put + tools_*, all of which
 // are in scope by this point.
 #include "agent.c"
 
@@ -1504,7 +1359,7 @@ int llm_generate(struct llm_ctx * c,
             chars_put(&inject, "", 0);
             int32_t * ids = (int32_t *)oom(
                 calloc(16384, sizeof(int32_t)));
-            int n_ids = tok_encode(&c->tok, inject.data,
+            int n_ids = tokenizer_encode(&c->tok, inject.data,
                                    ids, 16384);
             cur_ids = ids;
             cur_n   = n_ids;
@@ -1741,7 +1596,7 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
             }
             printf("[user] %s\n[assistant] ", prompts[t]);
             fflush(stdout);
-            int32_t nids = tok_encode(&c->tok, delta_str, ids, 16384);
+            int32_t nids = tokenizer_encode(&c->tok, delta_str, ids, 16384);
             struct chars reply = {0};
             llm_generate(c, ids, nids, max_new, g_min_new, sp, seed,
                          capture_cb, &reply);
@@ -1845,7 +1700,7 @@ static int32_t run_chat_test(int32_t max_new) {
                 struct chat_test_capture * cap = &caps[t];
                 cap->hash = 0xcbf29ce484222325ULL;
                 char * delta_str = jinja_apply_delta(turns[t], NULL, 0);
-                int32_t nids = tok_encode(&c->tok, delta_str,
+                int32_t nids = tokenizer_encode(&c->tok, delta_str,
                                           ids, 16384);
                 int32_t gen = llm_generate(c, ids, nids, max_new,
                                            g_min_new, &sp, seed,
@@ -1929,7 +1784,7 @@ static int32_t run_single(const char * prompt, int32_t max_new,
                (int)c->cfg.rope_sections[0], (int)c->cfg.rope_sections[1],
                (int)c->cfg.rope_sections[2], (int)c->cfg.rope_sections[3]);
         int32_t ids[2048];
-        int32_t n = tok_encode(&c->tok, prompt, ids, 2048);
+        int32_t n = tokenizer_encode(&c->tok, prompt, ids, 2048);
         printf("prompt tokens (%d): ", (int)n);
         for (int32_t i = 0; i < n; i++) printf("%d ", (int)ids[i]);
         printf("\n---\n%s", prompt);
@@ -1967,7 +1822,7 @@ static int32_t run_repl(const struct llm_sampler * sp,
                          "<|im_start|>user\n%s<|im_end|>\n"
                          "<|im_start|>assistant\n", line);
                 int32_t ids[2048];
-                int32_t nids = tok_encode(&c->tok, framed, ids, 2048);
+                int32_t nids = tokenizer_encode(&c->tok, framed, ids, 2048);
                 printf("\nassistant: ");
                 fflush(stdout);
                 llm_generate(c, ids, nids, max_new, g_min_new, sp, seed,

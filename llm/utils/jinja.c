@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// jinja-template.c - hand-translated Qwen3.5 chat template (full).
+// utils/jinja.c - hand-translated Qwen3.5 chat template (full).
+// (Renamed from llm/jinja-template.c on 2026-05-15 and moved under
+// utils/; the internal `jt_buf` was replaced with `struct chars`
+// from utils/chars.c. All symbols now share the `jinja_` prefix.)
 //
 // Source of truth: the Jinja string stored in the GGUF under
 // `tokenizer.chat_template`, dumped to tmp/jinja.txt (~155 lines).
@@ -131,52 +134,26 @@ struct jinja_tool {
     const char * json;
 };
 
-// Internal grow-as-needed string buffer.
-struct jt_buf {
-    char * data;
-    size_t count;
-    size_t capacity;
-};
+// Grow-as-needed string buffer comes from utils/chars.c: `struct
+// chars` + `chars_put` (data, count, capacity, NUL-terminated).
+// We use it directly here; the file used to ship its own jt_buf /
+// chars_put / chars_puts reimplementation.
 
-static void jt_grow(struct jt_buf * b, size_t need) {
-    size_t cap = b->capacity == 0 ? 256 : b->capacity;
-    while (cap < need + 1) { cap *= 2; }
-    if (cap > b->capacity) {
-        char * nd = (char *)realloc(b->data, cap);
-        assert(nd != NULL);
-        b->data = nd;
-        b->capacity = cap;
-    }
-}
-
-static void jt_put(struct jt_buf * b, const char * s, size_t n) {
-    if (n > 0) {
-        jt_grow(b, b->count + n);
-        memcpy(b->data + b->count, s, n);
-        b->count += n;
-        b->data[b->count] = '\0';
-    }
-}
-
-static void jt_puts(struct jt_buf * b, const char * s) {
-    if (s != NULL && s[0] != '\0') { jt_put(b, s, strlen(s)); }
-}
-
-// Emit `s` with leading and trailing ASCII whitespace stripped
-// (mirrors the `|trim` filter the Jinja applies to content and to
-// the inline system prefix). Empty / all-whitespace input emits
-// nothing. Whitespace set: space, \n, \r, \t.
+// `|trim` filter: emit `s` with leading and trailing ASCII whitespace
+// stripped (Jinja applies this to content and to the inline system
+// prefix). Empty / all-whitespace input emits nothing. Whitespace
+// set: space, \n, \r, \t.
 static int jinja_is_ws(char c) {
     return c == ' ' || c == '\n' || c == '\r' || c == '\t';
 }
 
-static void jt_puts_trimmed(struct jt_buf * b, const char * s) {
+static void jinja_puts_trimmed(struct chars * b, const char * s) {
     if (s != NULL) {
         const char * start = s;
         while (*start != '\0' && jinja_is_ws(*start)) { start++; }
         const char * end = s + strlen(s);
         while (end > start && jinja_is_ws(*(end - 1))) { end--; }
-        if (end > start) { jt_put(b, start, (size_t)(end - start)); }
+        if (end > start) { chars_put(b, start, (size_t)(end - start)); }
     }
 }
 
@@ -340,47 +317,47 @@ static const char K_TOOL_INSTRUCTIONS[] =
     " calls\n</IMPORTANT>";
 
 // Tools system prelude (Jinja lines 45-60).
-static void jinja_emit_tools_prelude(struct jt_buf * b,
+static void jinja_emit_tools_prelude(struct chars * b,
                                      const struct jinja_tool * tools,
                                      int n_tools,
                                      const struct jinja_message * msgs,
                                      int n_msgs) {
-    jt_puts(b, "<|im_start|>system\n");
-    jt_puts(b, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+    chars_puts(b, "<|im_start|>system\n");
+    chars_puts(b, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
     for (int i = 0; i < n_tools; i++) {
-        jt_puts(b, "\n");
-        jt_puts(b, tools[i].json);
+        chars_puts(b, "\n");
+        chars_puts(b, tools[i].json);
     }
-    jt_puts(b, "\n</tools>");
-    jt_puts(b, K_TOOL_INSTRUCTIONS);
+    chars_puts(b, "\n</tools>");
+    chars_puts(b, K_TOOL_INSTRUCTIONS);
     if (n_msgs > 0 && msgs[0].role == JINJA_ROLE_SYSTEM) {
         // Inline the (trimmed) system content after the instructions.
         // The Jinja's `if content` check on line 56 only emits the
         // separator + content if the trimmed content is non-empty.
         if (jinja_content_visible(msgs[0].content)) {
-            jt_puts(b, "\n\n");
-            jt_puts_trimmed(b, msgs[0].content);
+            chars_puts(b, "\n\n");
+            jinja_puts_trimmed(b, msgs[0].content);
         }
     }
-    jt_puts(b, "<|im_end|>\n");
+    chars_puts(b, "<|im_end|>\n");
 }
 
 // No-tools system prelude (Jinja lines 62-66). Only emits when the
 // first message is a system message.
-static void jinja_emit_simple_system(struct jt_buf * b,
+static void jinja_emit_simple_system(struct chars * b,
                                      const struct jinja_message * msgs,
                                      int n_msgs) {
     if (n_msgs > 0 && msgs[0].role == JINJA_ROLE_SYSTEM) {
-        jt_puts(b, "<|im_start|>system\n");
-        jt_puts_trimmed(b, msgs[0].content);
-        jt_puts(b, "<|im_end|>\n");
+        chars_puts(b, "<|im_start|>system\n");
+        jinja_puts_trimmed(b, msgs[0].content);
+        chars_puts(b, "<|im_end|>\n");
     }
 }
 
 // Per-message tool-calls render (Jinja lines 105-130). Called from
 // within the assistant message body, AFTER the assistant role frame
 // has been opened and the body content emitted.
-static void jinja_emit_tool_calls(struct jt_buf * b,
+static void jinja_emit_tool_calls(struct chars * b,
                                   const struct jinja_tool_call * tcs,
                                   int n_tcs,
                                   int body_visible) {
@@ -388,23 +365,23 @@ static void jinja_emit_tool_calls(struct jt_buf * b,
         const struct jinja_tool_call * tc = &tcs[j];
         if (j == 0) {
             if (body_visible) {
-                jt_puts(b, "\n\n<tool_call>\n<function=");
+                chars_puts(b, "\n\n<tool_call>\n<function=");
             } else {
-                jt_puts(b, "<tool_call>\n<function=");
+                chars_puts(b, "<tool_call>\n<function=");
             }
         } else {
-            jt_puts(b, "\n<tool_call>\n<function=");
+            chars_puts(b, "\n<tool_call>\n<function=");
         }
-        jt_puts(b, tc->name);
-        jt_puts(b, ">\n");
+        chars_puts(b, tc->name);
+        chars_puts(b, ">\n");
         for (int k = 0; k < tc->n_params; k++) {
-            jt_puts(b, "<parameter=");
-            jt_puts(b, tc->params[k].name);
-            jt_puts(b, ">\n");
-            jt_puts(b, tc->params[k].value);
-            jt_puts(b, "\n</parameter>\n");
+            chars_puts(b, "<parameter=");
+            chars_puts(b, tc->params[k].name);
+            chars_puts(b, ">\n");
+            chars_puts(b, tc->params[k].value);
+            chars_puts(b, "\n</parameter>\n");
         }
-        jt_puts(b, "</function>\n</tool_call>");
+        chars_puts(b, "</function>\n</tool_call>");
     }
 }
 
@@ -412,7 +389,7 @@ static void jinja_emit_tool_calls(struct jt_buf * b,
 // 81-147). Takes the surrounding context (i, n_msgs, msgs,
 // last_query_index) because some branches consult previtem /
 // nextitem and the last_query_index.
-static void jinja_emit_message(struct jt_buf * b,
+static void jinja_emit_message(struct chars * b,
                                const struct jinja_message * msgs,
                                int i, int n_msgs,
                                int last_query_index) {
@@ -421,9 +398,9 @@ static void jinja_emit_message(struct jt_buf * b,
         // Already emitted by the prelude; non-first system is an
         // error per the Jinja (line 85). No-op here.
     } else if (m->role == JINJA_ROLE_USER) {
-        jt_puts(b, "<|im_start|>user\n");
-        jt_puts_trimmed(b, m->content);
-        jt_puts(b, "<|im_end|>\n");
+        chars_puts(b, "<|im_start|>user\n");
+        jinja_puts_trimmed(b, m->content);
+        chars_puts(b, "<|im_end|>\n");
     } else if (m->role == JINJA_ROLE_ASSISTANT) {
         // Derive reasoning / body. If caller supplied
         // reasoning_content explicitly, use the content as-is.
@@ -441,19 +418,19 @@ static void jinja_emit_message(struct jt_buf * b,
         // (Jinja's `content|trim` on line 111).
         int body_visible = jinja_content_visible(body);
         if (i > last_query_index) {
-            jt_puts(b, "<|im_start|>assistant\n<think>\n");
-            jt_puts_trimmed(b, reason);
-            jt_puts(b, "\n</think>\n\n");
-            jt_puts_trimmed(b, body);
+            chars_puts(b, "<|im_start|>assistant\n<think>\n");
+            jinja_puts_trimmed(b, reason);
+            chars_puts(b, "\n</think>\n\n");
+            jinja_puts_trimmed(b, body);
         } else {
-            jt_puts(b, "<|im_start|>assistant\n");
-            jt_puts_trimmed(b, body);
+            chars_puts(b, "<|im_start|>assistant\n");
+            jinja_puts_trimmed(b, body);
         }
         if (m->tool_calls != NULL && m->n_tool_calls > 0) {
             jinja_emit_tool_calls(b, m->tool_calls,
                                   m->n_tool_calls, body_visible);
         }
-        jt_puts(b, "<|im_end|>\n");
+        chars_puts(b, "<|im_end|>\n");
         free(derived_reason);
     } else if (m->role == JINJA_ROLE_TOOL) {
         int prev_is_tool = (i > 0) &&
@@ -461,13 +438,13 @@ static void jinja_emit_message(struct jt_buf * b,
         int next_is_tool = (i + 1 < n_msgs) &&
                            (msgs[i + 1].role == JINJA_ROLE_TOOL);
         if (!prev_is_tool) {
-            jt_puts(b, "<|im_start|>user");
+            chars_puts(b, "<|im_start|>user");
         }
-        jt_puts(b, "\n<tool_response>\n");
-        jt_puts_trimmed(b, m->content);
-        jt_puts(b, "\n</tool_response>");
+        chars_puts(b, "\n<tool_response>\n");
+        jinja_puts_trimmed(b, m->content);
+        chars_puts(b, "\n</tool_response>");
         if (!next_is_tool) {
-            jt_puts(b, "<|im_end|>\n");
+            chars_puts(b, "<|im_end|>\n");
         }
     }
     // No `else` raise — the caller is trusted not to pass garbage
@@ -476,12 +453,12 @@ static void jinja_emit_message(struct jt_buf * b,
 }
 
 // Emit the generation prompt. Mirrors Jinja lines 148-154.
-static void jinja_emit_gen_prompt(struct jt_buf * b, int enable_thinking) {
-    jt_puts(b, "<|im_start|>assistant\n");
+static void jinja_emit_gen_prompt(struct chars * b, int enable_thinking) {
+    chars_puts(b, "<|im_start|>assistant\n");
     if (enable_thinking) {
-        jt_puts(b, "<think>\n");
+        chars_puts(b, "<think>\n");
     } else {
-        jt_puts(b, "<think>\n\n</think>\n\n");
+        chars_puts(b, "<think>\n\n</think>\n\n");
     }
 }
 
@@ -499,7 +476,7 @@ static char * jinja_apply(const struct jinja_message * msgs, int n_msgs,
                           int enable_thinking) {
     char * result = NULL;
     if (msgs != NULL && n_msgs > 0) {
-        struct jt_buf b = {0};
+        struct chars b = {0};
         if (tools != NULL && n_tools > 0) {
             jinja_emit_tools_prelude(&b, tools, n_tools, msgs, n_msgs);
         } else {
@@ -530,14 +507,14 @@ static char * jinja_apply_delta(const char * user_msg,
                                 int enable_thinking) {
     char * result = NULL;
     if (user_msg != NULL) {
-        struct jt_buf b = {0};
-        jt_puts(&b, "<|im_start|>user\n");
+        struct chars b = {0};
+        chars_puts(&b, "<|im_start|>user\n");
         if (system_prefix != NULL && system_prefix[0] != '\0') {
-            jt_puts(&b, system_prefix);
-            jt_puts(&b, "\n\n");
+            chars_puts(&b, system_prefix);
+            chars_puts(&b, "\n\n");
         }
-        jt_puts(&b, user_msg);
-        jt_puts(&b, "<|im_end|>\n");
+        chars_puts(&b, user_msg);
+        chars_puts(&b, "<|im_end|>\n");
         jinja_emit_gen_prompt(&b, enable_thinking);
         result = b.data;
     }

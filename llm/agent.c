@@ -626,7 +626,7 @@ static char * agent_run(struct llm_ctx * ctx,
             rc_ok = 0;
         } else {
             int32_t n_ids =
-                tok_encode(&ctx->tok, prompt, ids, 16384);
+                tokenizer_encode(&ctx->tok, prompt, ids, 16384);
             // Always reset before each iteration so the cumulative
             // history is re-fed (KV cache rebuilds). Simple and
             // robust; persistent-KV delta mode is a future
