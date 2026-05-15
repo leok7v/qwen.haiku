@@ -32,7 +32,7 @@ let modelPath: URL = {
     return URL(fileURLWithPath: env)
 }()
 
-// im.ai conversational preset (mirrors llm_sampler_im_ai in llm.c).
+// im.ai conversational preset (mirrors llm_sampler() in llm.c).
 // Kept in sync by hand for now; if these ever drift, --chat-test
 // hashes will diverge between this binary and the C binary.
 let imAi = Qwen.Options(temperature:       0.7,

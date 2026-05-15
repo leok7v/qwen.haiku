@@ -27,6 +27,7 @@
 #ifndef LLM_H
 #define LLM_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -77,9 +78,11 @@ int llm_tokenize(struct llm_ctx * ctx, const char * text,
                  int32_t * out_ids, int max_ids);
 
 // Sampler parameters. Mirrors llama.cpp's `common_params_sampling`
-// for the subset we care about. Zero-initialized struct = greedy
-// (argmax), no filters, no penalty. See `llm_sampler_im_ai` for the
-// chat-tuned preset that the CLI / agent surface uses by default.
+// for the subset we care about, plus three feature flags that
+// control llm_generate's behaviour (tool dispatch / reasoning /
+// debug visibility chunks). Zero-initialized struct = greedy
+// (argmax) + tools off + no reasoning + no debug. Prefer
+// llm_sampler() below for the chat-tuned defaults.
 struct llm_sampler {
     float    temperature;        // 0 = greedy; >0 = softmax temperature
     int      top_k;              // 0 or 1 = greedy; >1 = keep top k
@@ -93,13 +96,35 @@ struct llm_sampler {
     int      repetition_window;  // 0 = penalize against all tokens
                                  // emitted in this generate() call so
                                  // far; >0 = only the last N.
+    // Feature toggles (additional controls, default true / false /
+    // true via llm_sampler()):
+    bool     tools;              // enable embedded agent dispatch in
+                                 // llm_generate. With false, the
+                                 // <tool_call> / </tool_call> markers
+                                 // are NOT recognised — model output
+                                 // streams as plain content.
+    bool     think;              // enable reasoning. Passed to the
+                                 // chat-template formatter to leave
+                                 // `<think>\n` open in the gen
+                                 // prompt; with false the gen prompt
+                                 // pre-fills the empty
+                                 // `<think>\n\n</think>\n\n` block
+                                 // and the model jumps to content.
+    bool     debug;              // emit chunk->tool_call /
+                                 // chunk->tool_response visibility
+                                 // chunks so the UI can render the
+                                 // raw tool-call body and tool
+                                 // response. With false these chunks
+                                 // are suppressed (dispatch still
+                                 // happens; user only sees content).
 };
 
 // Default chat sampler: T=0.7, top_k=40, top_p=0.9, min_p=0.05,
-// rep=1.25, win=64. Lifted from im.ai's Sampler.swift defaults —
-// empirically the best fit for Qwen3.5-0.8B in chat + tools mode.
-// The CLI hardcodes this; callers can override individual fields.
-struct llm_sampler llm_sampler_im_ai(void);
+// rep=1.25, win=64, tools=true, think=false, debug=true. Lifted
+// from im.ai's Sampler.swift defaults — empirically the best fit
+// for Qwen3.5-0.8B in chat + tools mode. The CLI hardcodes this;
+// callers can override individual fields.
+struct llm_sampler llm_sampler(void);
 
 // ---------------------------------------------------------------------------
 // <think>...</think> stream filter (C side, server-side state machine)
@@ -148,24 +173,6 @@ struct llm_stream_chunk {
 // llm_token_cb).
 typedef int (*llm_stream_cb)(const struct llm_stream_chunk * chunk,
                              void * user);
-
-// Like llm_generate, but the raw model output is run through an
-// internal <think>...</think> state machine and emitted to `cb` in
-// two streams. `cb` is invoked once per chunk with exactly one of
-// `chunk->content` / `chunk->reasoning` set (the marker bytes
-// themselves are not emitted). Pass NULL for `cb` to discard the
-// stream while still advancing the model.
-//
-// The filter internals (push/finish/state struct) intentionally
-// stay file-static in llm.c — callers don't need that surface, and
-// hiding it keeps the public ABI small.
-int llm_generate_split(struct llm_ctx * ctx,
-                       const int32_t * prompt_ids, int prompt_n,
-                       int max_new, int min_new,
-                       const struct llm_sampler * sampler,
-                       uint64_t seed,
-                       llm_stream_cb cb,
-                       void * user);
 
 // Run inference: prefill the prompt token ids, then sample up to
 // `max_new` tokens, calling `cb(chunk, user)` once per emitted

@@ -91,6 +91,14 @@ final class QwenViewModel {
     var systemPrompt: String       =
         "You are a helpful assistant.\n"
     var messages:     [ChatMessage] = []
+    // Debug toggle drives both (a) the sampler's debug flag — i.e.
+    // whether llm_generate emits chunk->tool_call / tool_response
+    // visibility chunks — and (b) the UI rendering: when on, those
+    // chunks land as muted bracketed lines in the assistant bubble
+    // ("[tool: …]" / "[result: …]") so you can watch the agent
+    // poking the network. Default true while we iterate; later this
+    // becomes a settings toggle the user controls.
+    var debug:        Bool          = true
 
     // Throughput from the most recent completed generation.
     // Zero before the first one finishes.
@@ -168,6 +176,9 @@ final class QwenViewModel {
                                     minP:              0.05,
                                     repetitionPenalty: 1.25,
                                     repetitionWindow:  64,
+                                    tools:             true,
+                                    think:             false,
+                                    debug:             self.debug,
                                     maxNew:            512,
                                     minNew:            8)
             do {
@@ -219,26 +230,64 @@ final class QwenViewModel {
                 systemPrefix: isFirstTurn ? trimmedSys : nil)
             self.state         = .generating
             self.stopRequested = false
+            // Sync per-turn flags onto the live Qwen ctx so the next
+            // generate() reads the current Debug toggle state.
+            self.qwen?.options.debug = self.debug
             await self.streamAssistant(prompt: delta, at: assistantIdx)
         }
     }
 
     /// Detached generation; appends streamed pieces (filtered for
     /// turn markers) into `messages[idx].content` on the main actor.
+    /// Listens to the full typed-chunk stream so debug tool_call /
+    /// tool_response pieces can also reach the UI when the Debug
+    /// toggle is on.
     private func streamAssistant(prompt: String, at idx: Int) async {
         if let qwen = self.qwen {
+            let debugOn = self.debug
             await Task.detached(priority: .userInitiated) { [weak self] in
                 var filter = ChatStreamFilter()
                 do {
-                    try qwen.generate(prompt: prompt) { piece in
-                        let visible = filter.push(piece)
-                        if !visible.isEmpty {
-                            Task { @MainActor in
-                                self?.appendAssistant(visible, at: idx)
+                    try qwen.generate(prompt: prompt) { chunk in
+                        var keepGoing = true
+                        switch chunk {
+                        case .content(let s):
+                            let visible = filter.push(s)
+                            if !visible.isEmpty {
+                                Task { @MainActor in
+                                    self?.appendAssistant(visible,
+                                                          at: idx)
+                                }
+                            }
+                            if filter.done { keepGoing = false }
+                        case .reasoning(_):
+                            // Drop — could go to a thinking pane
+                            // in a future iteration.
+                            break
+                        case .toolCall(let body):
+                            if debugOn {
+                                let line = "\n[tool: " + body + "]\n"
+                                Task { @MainActor in
+                                    self?.appendAssistant(line,
+                                                          at: idx)
+                                }
+                            }
+                        case .toolResponse(let body):
+                            if debugOn {
+                                let n = min(body.count, 400)
+                                let prefix = String(body.prefix(n))
+                                let line = "\n[result: "
+                                         + prefix + "]\n"
+                                Task { @MainActor in
+                                    self?.appendAssistant(line,
+                                                          at: idx)
+                                }
                             }
                         }
-                        if filter.done { return false }
-                        return !(self?.stopRequested ?? true)
+                        if keepGoing {
+                            keepGoing = !(self?.stopRequested ?? true)
+                        }
+                        return keepGoing
                     }
                     let tail = filter.finish()
                     if !tail.isEmpty {
@@ -400,6 +449,12 @@ struct ContentView: View {
             Button(showSystem ? "done" : "edit") { showSystem.toggle() }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+            // Debug toggle: when on, agent tool_call / tool_response
+            // chunks land as bracketed lines in the assistant bubble
+            // so the user can watch the model's web activity.
+            Toggle("Debug", isOn: $vm.debug)
+                .toggleStyle(.checkbox)
+                .font(.caption.monospaced())
         }
     }
 

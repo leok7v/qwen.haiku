@@ -3020,7 +3020,7 @@ static inline float rng_uniform(struct rng * r) {
 // before top-K filtering, while we normalize over the top-K survivors
 // (which represent ~99% of probability mass for typical Qwen logits,
 // so the top-P cutoff shifts by <1% in practice).
-struct llm_sampler llm_sampler_im_ai(void) {
+struct llm_sampler llm_sampler(void) {
     struct llm_sampler s;
     s.temperature        = 0.7f;
     s.top_k              = 40;
@@ -3028,6 +3028,11 @@ struct llm_sampler llm_sampler_im_ai(void) {
     s.min_p              = 0.05f;
     s.repetition_penalty = 1.25f;
     s.repetition_window  = 64;
+    s.tools              = true;   // agent dispatch on by default
+    s.think              = false;  // reasoning off (gen prompt skips
+                                   // the <think> block)
+    s.debug              = true;   // surface tool_call /
+                                   // tool_response chunks to UI
     return s;
 }
 
@@ -3459,6 +3464,14 @@ struct llm_think_filter {
     // generate_raw call returns to dispatch the tool + re-feed the
     // model. Reset by init().
     int  tool_call_ready;
+    // Per-call configuration (set by llm_generate from sampler
+    // flags before kicking the trampoline). recognize_tool_calls=0
+    // makes find_marker ignore <tool_call> / </tool_call> entries
+    // so the body streams as plain content. emit_visibility=0
+    // suppresses chunk->tool_call emission (tool dispatch still
+    // happens; the UI just doesn't see the trace).
+    int  recognize_tool_calls;
+    int  emit_visibility;
 };
 
 struct llm_think_marker {
@@ -3484,6 +3497,8 @@ static void llm_think_filter_init(struct llm_think_filter * f) {
     f->tool_call_n = 0;
     f->tool_call_data[0] = '\0';
     f->tool_call_ready = 0;
+    f->recognize_tool_calls = 1;  // default on; llm_generate overrides
+    f->emit_visibility      = 1;
 }
 
 // Emit `[start, end)` bytes through `cb`, tagging the chunk's text
@@ -3539,18 +3554,28 @@ static int llm_think_find_marker(const struct llm_think_filter * f,
     int best  = -1;
     int best_pos = f->hold_n;
     for (int m = 0; m < LLM_THINK_N_MARKERS; m++) {
-        const char * tag = THINK_MARKERS[m].tag;
-        int tlen = THINK_MARKERS[m].len;
-        if (tlen <= f->hold_n) {
-            int last_start = f->hold_n - tlen;
-            for (int i = 0; i <= last_start; i++) {
-                int match = 1;
-                for (int k = 0; k < tlen && match; k++) {
-                    if (f->hold_data[i + k] != tag[k]) { match = 0; }
-                }
-                if (match && i < best_pos) {
-                    best = m;
-                    best_pos = i;
+        int marker_mode = THINK_MARKERS[m].mode;
+        // Skip the tool_call markers when the sampler turned tools
+        // off — their bytes will stream as plain content instead.
+        int is_tool_call = (marker_mode == 2) ||
+                           (m == 3);  // </tool_call> closes mode 2
+        int skip = (!f->recognize_tool_calls && is_tool_call);
+        if (!skip) {
+            const char * tag = THINK_MARKERS[m].tag;
+            int tlen = THINK_MARKERS[m].len;
+            if (tlen <= f->hold_n) {
+                int last_start = f->hold_n - tlen;
+                for (int i = 0; i <= last_start; i++) {
+                    int match = 1;
+                    for (int k = 0; k < tlen && match; k++) {
+                        if (f->hold_data[i + k] != tag[k]) {
+                            match = 0;
+                        }
+                    }
+                    if (match && i < best_pos) {
+                        best = m;
+                        best_pos = i;
+                    }
                 }
             }
         }
@@ -3667,9 +3692,11 @@ int llm_think_filter_push(struct llm_think_filter * f,
                     }
                     // 2 -> non-2: tool_call block just finished.
                     // Emit chunk->tool_call with the buffered body
-                    // and signal the outer loop to dispatch + inject.
+                    // (debug only) and signal the outer loop to
+                    // dispatch + inject.
                     if (prev_mode == 2 && f->mode != 2) {
-                        if (cb != NULL && f->tool_call_n > 0) {
+                        if (cb != NULL && f->tool_call_n > 0 &&
+                            f->emit_visibility) {
                             struct llm_stream_chunk chunk =
                                 { NULL, NULL, f->tool_call_data, NULL };
                             int r3 = cb(&chunk, user);
@@ -4250,10 +4277,18 @@ char * llm_chat_format_delta(const char * user_message,
 // the next iteration. The loop continues until the model produces
 // content without another tool_call or an iteration cap kicks in.
 //
-// Tools are always linked into llm.c — a future per-llm_ctx flag
-// (e.g. ctx->enable_tools / enable_thinking) will gate runtime
-// activation; for now they're on whenever the model emits the
-// markers.
+// Behaviour is controlled by sampler->tools / sampler->debug:
+//   - tools=false : the agent loop is bypassed entirely. The
+//                   <tool_call> markers are still scanned by the
+//                   filter (cheap), but the body emits as content
+//                   so the caller sees raw model output rather
+//                   than dispatched results.
+//   - debug=true  : emit chunk->tool_call and chunk->tool_response
+//                   visibility chunks alongside content / reasoning
+//                   so the UI can render the agent trace. With
+//                   debug=false those chunks are suppressed; the
+//                   tool still dispatches, the caller just doesn't
+//                   see it.
 #define LLM_GENERATE_TOOL_ITER_CAP 6
 int llm_generate(struct llm_ctx * c,
                  const int32_t * prompt_ids, int prompt_n,
@@ -4262,6 +4297,10 @@ int llm_generate(struct llm_ctx * c,
                  uint64_t seed,
                  llm_stream_cb cb,
                  void * user) {
+    // Defaults when sampler isn't provided (rare; CLI / Swift
+    // always pass one).
+    int with_tools = (sampler_in != NULL) ? sampler_in->tools : 1;
+    int with_debug = (sampler_in != NULL) ? sampler_in->debug : 1;
     int total_gen = 0;
     int done      = 0;
     int32_t * cur_ids =
@@ -4277,6 +4316,11 @@ int llm_generate(struct llm_ctx * c,
            total_gen < max_new) {
         struct llm_split_box box;
         llm_think_filter_init(&box.filter);
+        // Toggle marker recognition + visibility chunk emission per
+        // sampler flags. The filter consults these when scanning
+        // for markers and when emitting chunk->tool_call.
+        box.filter.recognize_tool_calls = with_tools;
+        box.filter.emit_visibility      = with_debug;
         box.cb   = cb;
         box.user = user;
         int budget = max_new - total_gen;
@@ -4289,7 +4333,8 @@ int llm_generate(struct llm_ctx * c,
         free(cur_ids);
         cur_ids = NULL;
         cur_n   = 0;
-        if (box.filter.tool_call_ready && total_gen < max_new) {
+        if (with_tools && box.filter.tool_call_ready &&
+            total_gen < max_new) {
             // Rewrap the buffered body in <tool_call>...</tool_call>
             // since the parser scans for those markers.
             struct chars wrapped = {0};
@@ -4320,9 +4365,10 @@ int llm_generate(struct llm_ctx * c,
             chars_put(&result, "", 0);
             agent_free_calls(calls, nc);
             // Visibility chunk: tell the caller what the tool
-            // returned. The model never sees this chunk — only
-            // the framed tool_response below is fed back into KV.
-            if (cb != NULL && result.data != NULL) {
+            // returned (debug only). The model never sees this
+            // chunk — only the framed tool_response below is fed
+            // back into KV.
+            if (cb != NULL && result.data != NULL && with_debug) {
                 struct llm_stream_chunk ch =
                     { NULL, NULL, NULL, result.data };
                 cb(&ch, user);
@@ -4661,7 +4707,7 @@ static int32_t run_chat_test(int32_t max_new) {
         "Thanks!"
     };
     enum { N_TURNS = 3 };
-    struct llm_sampler sp = llm_sampler_im_ai();
+    struct llm_sampler sp = llm_sampler();
     uint64_t seed = 42;
     struct llm_ctx * c = llm_create(llm_cli_gguf_path());
     int32_t r = 0;
@@ -4845,7 +4891,7 @@ int main(int argc, char ** argv) {
     // (temp 0.7, top_k 40, top_p 0.9, min_p 0.05, rep 1.25, win 64).
     // Empirically the best fit for Qwen3.5-0.8B in chat + tools mode.
     // Individual flags below can override any field.
-    struct llm_sampler sp = llm_sampler_im_ai();
+    struct llm_sampler sp = llm_sampler();
     uint64_t seed         = 0;          // 0 = derive from wall clock
     int32_t  max_new      = 64;
     int32_t  max_iters    = 4;          // agent-loop cap (--ask)

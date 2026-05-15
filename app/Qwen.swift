@@ -43,15 +43,22 @@ public final class Qwen: @unchecked Sendable {
         public var minP:              Float
         public var repetitionPenalty: Float
         public var repetitionWindow:  Int
+        public var tools:             Bool  // enable agent dispatch
+        public var think:             Bool  // enable <think> in gen prompt
+        public var debug:             Bool  // surface tool_call /
+                                            // tool_response chunks
         public var maxNew:            Int
         public var minNew:            Int
         public var seed:              UInt64
-        public init(temperature:       Float  = 0.0,
+        public init(temperature:       Float  = 0.7,
                     topK:              Int    = 40,
-                    topP:              Float  = 0.0,
-                    minP:              Float  = 0.0,
-                    repetitionPenalty: Float  = 1.0,
+                    topP:              Float  = 0.9,
+                    minP:              Float  = 0.05,
+                    repetitionPenalty: Float  = 1.25,
                     repetitionWindow:  Int    = 64,
+                    tools:             Bool   = true,
+                    think:             Bool   = false,
+                    debug:             Bool   = true,
                     maxNew:            Int    = 256,
                     minNew:            Int    = 0,
                     seed:              UInt64 = 0) {
@@ -61,14 +68,34 @@ public final class Qwen: @unchecked Sendable {
             self.minP              = minP
             self.repetitionPenalty = repetitionPenalty
             self.repetitionWindow  = repetitionWindow
+            self.tools             = tools
+            self.think             = think
+            self.debug             = debug
             self.maxNew            = maxNew
             self.minNew            = minNew
             self.seed              = seed
         }
     }
 
+    /// One streamed piece from llm_generate. Exactly one of the four
+    /// associated values is non-empty per emission. UI callers route
+    /// each case to the appropriate render target:
+    ///   .content        — visible chat bubble
+    ///   .reasoning      — muted "thinking" panel (when shown)
+    ///   .toolCall       — debug-only "tool: …" trace line
+    ///   .toolResponse   — debug-only "result: …" trace line
+    public enum Chunk {
+        case content(String)
+        case reasoning(String)
+        case toolCall(String)
+        case toolResponse(String)
+    }
+
     public let modelPath: URL
-    public let options:   Options
+    // `var` so callers can flip per-generate flags (debug / think /
+    // tools) without rebuilding the Qwen instance. Costs nothing —
+    // the next generate() call just reads the current value.
+    public var options:   Options
 
     // `struct llm_ctx;` in llm.h is forward-declared (opaque), so the
     // Clang importer maps `struct llm_ctx *` to OpaquePointer here.
@@ -111,11 +138,24 @@ public final class Qwen: @unchecked Sendable {
         return collected
     }
 
-    /// Streaming: call `onToken` once per generated UTF-8 piece.
-    /// Return false from the callback to stop early. Concatenating
-    /// all pieces yields the full completion text.
+    /// Streaming (content-only): call `onToken` once per generated
+    /// UTF-8 piece of visible reply text. Reasoning, tool_call, and
+    /// tool_response chunks are silently dropped. Convenience for
+    /// callers that just want the bubble text.
     public func generate(prompt: String,
                          onToken: @escaping (String) -> Bool) throws {
+        try generate(prompt: prompt) { chunk in
+            var keepGoing = true
+            if case .content(let s) = chunk { keepGoing = onToken(s) }
+            return keepGoing
+        }
+    }
+
+    /// Streaming (typed): call `onChunk` once per emission. The
+    /// chunk's case identifies the stream (content / reasoning /
+    /// toolCall / toolResponse). Return false to abort generation.
+    public func generate(prompt: String,
+                         onChunk: @escaping (Chunk) -> Bool) throws {
         let bufSize = 4096
         var ids = [Int32](repeating: 0, count: bufSize)
         let n = ids.withUnsafeMutableBufferPointer { buf -> Int32 in
@@ -128,7 +168,7 @@ public final class Qwen: @unchecked Sendable {
         // Bridge the Swift closure across the C callback boundary
         // through an Unmanaged box so the callback `user` pointer
         // stays alive for the duration of llm_generate().
-        let box = ContinuationBox(onToken: onToken)
+        let box = ContinuationBox(onChunk: onChunk)
         let boxRef = Unmanaged.passRetained(box)
         defer { boxRef.release() }
         var sampler = llm_sampler(
@@ -137,7 +177,10 @@ public final class Qwen: @unchecked Sendable {
             top_p:              options.topP,
             min_p:              options.minP,
             repetition_penalty: options.repetitionPenalty,
-            repetition_window:  Int32(options.repetitionWindow))
+            repetition_window:  Int32(options.repetitionWindow),
+            tools:              options.tools,
+            think:              options.think,
+            debug:              options.debug)
         _ = ids.withUnsafeBufferPointer { buf -> Int32 in
             return withUnsafePointer(to: &sampler) { sp in
                 Int32(llm_generate(
@@ -147,7 +190,7 @@ public final class Qwen: @unchecked Sendable {
                     Int32(options.minNew),
                     sp,
                     options.seed,
-                    qwenTokenTrampoline,
+                    qwenChunkTrampoline,
                     UnsafeMutableRawPointer(boxRef.toOpaque())))
             }
         }
@@ -170,11 +213,13 @@ public final class Qwen: @unchecked Sendable {
 // Bridge helpers, extracted so the call-site stays readable.
 
 private final class ContinuationBox {
-    let onToken: (String) -> Bool
-    init(onToken: @escaping (String) -> Bool) { self.onToken = onToken }
+    let onChunk: (Qwen.Chunk) -> Bool
+    init(onChunk: @escaping (Qwen.Chunk) -> Bool) {
+        self.onChunk = onChunk
+    }
 }
 
-private func qwenTokenTrampoline(
+private func qwenChunkTrampoline(
     chunk: UnsafePointer<llm_stream_chunk>?,
     user: UnsafeMutableRawPointer?
 ) -> Int32 {
@@ -182,20 +227,20 @@ private func qwenTokenTrampoline(
     if let chunk = chunk, let user = user {
         let box = Unmanaged<ContinuationBox>.fromOpaque(user)
                        .takeUnretainedValue()
-        // For the existing single-stream Swift API we only surface
-        // `chunk.content`. Reasoning (chunk.reasoning) is currently
-        // discarded — a future onToken-with-reasoning variant can
-        // expose it directly if Chat.swift wants to render the
-        // scratchpad separately.
         let c = chunk.pointee
-        var rcSwift = true
-        if let cPtr = c.content {
-            let piece = String(cString: cPtr)
-            rcSwift = box.onToken(piece)
+        var keepGoing = true
+        // Exactly one of these four pointers is non-NULL per
+        // emission per llm.h contract. We route accordingly.
+        if let p = c.content {
+            keepGoing = box.onChunk(.content(String(cString: p)))
+        } else if let p = c.reasoning {
+            keepGoing = box.onChunk(.reasoning(String(cString: p)))
+        } else if let p = c.tool_call {
+            keepGoing = box.onChunk(.toolCall(String(cString: p)))
+        } else if let p = c.tool_response {
+            keepGoing = box.onChunk(.toolResponse(String(cString: p)))
         }
-        // Reasoning piece — silently drop (still iterate so the
-        // generator advances normally).
-        rc = rcSwift ? 0 : 1
+        rc = keepGoing ? 0 : 1
     }
     return rc
 }
