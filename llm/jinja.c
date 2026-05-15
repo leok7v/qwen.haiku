@@ -157,15 +157,15 @@ static void jinja_puts_trimmed(struct chars * b, const char * s) {
     }
 }
 
-// Returns 1 iff `content` (after `|trim`) is non-empty. Used by the
-// tool_calls block to decide whether to prepend "\n\n" before the
-// first <tool_call> (Jinja lines 110-115).
-static int jinja_content_visible(const char * content) {
-    int visible = 0;
+// Returns true iff `content` (after `|trim`) is non-empty. Used by
+// the tool_calls block to decide whether to prepend "\n\n" before
+// the first <tool_call> (Jinja lines 110-115).
+static bool jinja_content_visible(const char * content) {
+    bool visible = false;
     if (content != NULL) {
         const char * p = content;
         while (*p != '\0' && !visible) {
-            if (!jinja_is_ws(*p)) { visible = 1; }
+            if (!jinja_is_ws(*p)) { visible = true; }
             p++;
         }
     }
@@ -281,14 +281,14 @@ static int jinja_is_tool_response(const char * content) {
 // handle weird conversations gracefully).
 static int jinja_find_last_query_index(const struct jinja_message * msgs,
                                        int n_msgs) {
-    int last = n_msgs - 1;
-    int found = 0;
-    int i = n_msgs - 1;
+    int  last  = n_msgs - 1;
+    bool found = false;
+    int  i     = n_msgs - 1;
     while (i >= 0 && !found) {
         if (msgs[i].role == JINJA_ROLE_USER &&
             !jinja_is_tool_response(msgs[i].content)) {
             last = i;
-            found = 1;
+            found = true;
         }
         i--;
     }
@@ -656,8 +656,8 @@ static int32_t jinja_self_test(void) {
         // instruction text is in K_TOOL_INSTRUCTIONS; we check
         // for its sentinel substrings rather than the entire body
         // (the body is ~600 bytes, fixed verbatim from Jinja line 53).
-        int ok = (out != NULL) &&
-                 (strstr(out, "<|im_start|>system\n# Tools") != NULL) &&
+        bool ok = (out != NULL) &&
+                  (strstr(out, "<|im_start|>system\n# Tools") != NULL) &&
                  (strstr(out, "<tools>\n"
                               "{\"name\":\"echo\",\"parameters\":{}}\n"
                               "</tools>") != NULL) &&

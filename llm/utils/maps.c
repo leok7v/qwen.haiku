@@ -60,9 +60,9 @@ static inline uint64_t map_hash(const struct map * m, const void * k) {
     return h;
 }
 
-static inline int map_eq(const struct map * m, const void * a,
-                         const void * b) {
-    int r = 0;
+static inline bool map_eq(const struct map * m, const void * a,
+                          const void * b) {
+    bool r = false;
     if (m->key_kind == MAP_KEY_INT) {
         r = *(const int64_t *)a == *(const int64_t *)b;
     } else {
@@ -148,7 +148,7 @@ static void * map_put(struct map * m, const void * k, const void * v) {
     size_t mask = m->capacity - 1;
     size_t j = (size_t)map_hash(m, k) & mask;
     size_t tomb = (size_t)-1;
-    int done = 0;
+    bool done = false;
     while (!done && m->states[j] != MAP_EMPTY) {
         if (m->states[j] == MAP_TOMBSTONE) {
             if (tomb == (size_t)-1) { tomb = j; }
@@ -158,7 +158,7 @@ static void * map_put(struct map * m, const void * k, const void * v) {
             if (m->value_free) { m->value_free(vs); }
             memcpy(vs, v, m->value_size);
             r = vs;
-            done = 1;
+            done = true;
         } else {
             j = (j + 1) & mask;
         }
@@ -179,12 +179,12 @@ static void * map_get(struct map * m, const void * k) {
     if (m->capacity > 0) {
         size_t mask = m->capacity - 1;
         size_t j = (size_t)map_hash(m, k) & mask;
-        int done = 0;
+        bool done = false;
         while (!done && m->states[j] != MAP_EMPTY) {
             if (m->states[j] == MAP_LIVE
                 && map_eq(m, map_k(m, j), k)) {
                 r = map_v(m, j);
-                done = 1;
+                done = true;
             } else {
                 j = (j + 1) & mask;
             }
@@ -197,7 +197,7 @@ static void map_remove(struct map * m, const void * k) {
     if (m->capacity > 0) {
         size_t mask = m->capacity - 1;
         size_t j = (size_t)map_hash(m, k) & mask;
-        int done = 0;
+        bool done = false;
         while (!done && m->states[j] != MAP_EMPTY) {
             if (m->states[j] == MAP_LIVE
                 && map_eq(m, map_k(m, j), k)) {
@@ -205,7 +205,7 @@ static void map_remove(struct map * m, const void * k) {
                 map_key_free(m, map_k(m, j));
                 m->states[j] = MAP_TOMBSTONE;
                 m->count--;
-                done = 1;
+                done = true;
             } else {
                 j = (j + 1) & mask;
             }

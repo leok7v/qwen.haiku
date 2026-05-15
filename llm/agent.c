@@ -170,14 +170,14 @@ static char * agent_json_string(const char ** pp) {
                 } else if (e == 'u') {
                     p++;
                     unsigned cp = 0;
-                    int ok = 1;
+                    bool ok = true;
                     for (int k = 0; ok && k < 4; k++) {
                         char h = *p;
                         int d = -1;
                         if (h >= '0' && h <= '9') { d = h - '0'; }
                         else if (h >= 'a' && h <= 'f') { d = h - 'a' + 10; }
                         else if (h >= 'A' && h <= 'F') { d = h - 'A' + 10; }
-                        else { ok = 0; }
+                        else { ok = false; }
                         if (ok) { cp = cp * 16 + (unsigned)d; p++; }
                     }
                     if (!ok) { err = 1; }
@@ -277,13 +277,13 @@ static char * agent_json_value(const char ** pp) {
 
 // Try parsing the OpenAI-style JSON tool-call shape:
 //   <tool_call>{"name":"<fn>","arguments":{"k1":"v1","k2":"v2",...}}</tool_call>
-// Returns 1 on success (call populated), 0 if the body doesn't look
-// like JSON or the parse failed. Used as a fallback by
+// Returns true on success (call populated), false if the body
+// doesn't look like JSON or the parse failed. Used as a fallback by
 // agent_parse_tool_calls when small models emit the OpenAI shape
 // instead of the Qwen <function=...><parameter=...> verbose shape.
-static int agent_parse_json_call(const char * body, const char * end,
-                                 struct agent_call * call) {
-    int ok = 0;
+static bool agent_parse_json_call(const char * body, const char * end,
+                                  struct agent_call * call) {
+    bool ok = false;
     const char * p = body;
     agent_json_skip_ws(&p);
     if (p < end && *p == '{') {
@@ -293,17 +293,17 @@ static int agent_parse_json_call(const char * body, const char * end,
         struct agent_param tmp[16];
         int np = 0;
         agent_json_skip_ws(&p);
-        int err = 0;
-        int finished = 0;
+        bool err = false;
+        bool finished = false;
         while (!finished && !err && p < end) {
             char c = *p;
-            if (c == '}') { finished = 1; p++; }
+            if (c == '}') { finished = true; p++; }
             else if (c == '"') {
                 char * key = agent_json_string(&p);
-                if (key == NULL) { err = 1; }
+                if (key == NULL) { err = true; }
                 else {
                     agent_json_skip_ws(&p);
-                    if (*p != ':') { err = 1; }
+                    if (*p != ':') { err = true; }
                     else {
                         p++;
                         if (strcmp(key, "name") == 0 ||
@@ -320,17 +320,17 @@ static int agent_parse_json_call(const char * body, const char * end,
                             } else {
                                 p++;
                                 agent_json_skip_ws(&p);
-                                int args_done = 0;
+                                bool args_done = false;
                                 while (!args_done && !err &&
                                        np < 16 && p < end) {
                                     if (*p == '}') {
-                                        args_done = 1; p++;
+                                        args_done = true; p++;
                                     } else if (*p == '"') {
                                         char * ak = agent_json_string(&p);
-                                        if (ak == NULL) { err = 1; }
+                                        if (ak == NULL) { err = true; }
                                         else {
                                             agent_json_skip_ws(&p);
-                                            if (*p != ':') { err = 1; }
+                                            if (*p != ':') { err = true; }
                                             else {
                                                 p++;
                                                 char * av =
@@ -347,7 +347,7 @@ static int agent_parse_json_call(const char * body, const char * end,
                                             if (err) { free(ak); }
                                         }
                                     } else {
-                                        err = 1;
+                                        err = true;
                                     }
                                 }
                             }
@@ -363,7 +363,7 @@ static int agent_parse_json_call(const char * body, const char * end,
                     free(key);
                 }
             } else {
-                err = 1;
+                err = true;
             }
         }
         if (!err && fn_name != NULL) {
@@ -377,7 +377,7 @@ static int agent_parse_json_call(const char * body, const char * end,
             } else {
                 call->params = NULL;
             }
-            ok = 1;
+            ok = true;
         } else {
             free(fn_name);
             for (int k = 0; k < np; k++) {
@@ -433,7 +433,7 @@ static int agent_parse_tool_calls(const char * text,
             } else {
                 const char * body = gt + 1;
                 const char * fn = strstr(body, "<function=");
-                int parsed_ok = 0;
+                bool parsed_ok = false;
                 struct agent_call call = {0};
                 if (fn != NULL && fn < end) {
                     // Qwen verbose shape.
@@ -446,24 +446,24 @@ static int agent_parse_tool_calls(const char * text,
                         struct agent_param tmp[16];
                         int np = 0;
                         const char * pp = name_end + 1;
-                        int more = 1;
+                        bool more = true;
                         while (more && np < 16) {
                             const char * pm = strstr(pp, "<parameter=");
                             if (pm == NULL || pm >= end) {
-                                more = 0;
+                                more = false;
                             } else {
                                 const char * ks = pm + 11;
                                 const char * ke = (const char *)memchr(
                                     ks, '>', (size_t)(end - ks));
                                 if (ke == NULL) {
-                                    more = 0;
+                                    more = false;
                                 } else {
                                     const char * vs = ke + 1;
                                     if (*vs == '\n') { vs++; }
                                     const char * ve =
                                         strstr(vs, "</parameter>");
                                     if (ve == NULL || ve >= end) {
-                                        more = 0;
+                                        more = false;
                                     } else {
                                         const char * v_trim = ve;
                                         while (v_trim > vs &&
@@ -610,9 +610,9 @@ static char * agent_run(struct llm_ctx * ctx,
     int n_owned = 0;
     memset(owned, 0, sizeof(owned));
     char * final_text = NULL;
-    int done = 0;
-    int iter = 0;
-    int rc_ok = 1;
+    bool done  = false;
+    int  iter  = 0;
+    bool rc_ok = true;
     int32_t * ids =
         (int32_t *)oom(calloc(16384, sizeof(int32_t)));
     while (!done && iter < max_iters && rc_ok) {
@@ -623,7 +623,7 @@ static char * agent_run(struct llm_ctx * ctx,
                         /*add_generation_prompt=*/1,
                         /*enable_thinking=*/0);
         if (prompt == NULL) {
-            rc_ok = 0;
+            rc_ok = false;
         } else {
             int32_t n_ids =
                 tokenizer_encode(&ctx->tok, prompt, ids, 16384);
@@ -669,7 +669,7 @@ static char * agent_run(struct llm_ctx * ctx,
                 // saw none, so just hand the bytes back.
                 final_text = reply.data;
                 reply.data = NULL;
-                done = 1;
+                done = true;
             } else {
                 // Echo the assistant turn into history (verbatim;
                 // the Jinja's content-after-</think> rule strips

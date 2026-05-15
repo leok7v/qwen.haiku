@@ -240,7 +240,7 @@ static int llm_generate_raw(struct llm_ctx * c,
     qh_trace_open();
     int32_t   generated = 0;
     int32_t   pos       = c->pos;        // resume after previous call
-    int32_t   stop      = 0;
+    bool      stop      = false;
     double    t0        = llm_monotonic_seconds();
     // Repetition-penalty history: include the full prompt so the
     // model is discouraged from immediately echoing the input back,
@@ -286,7 +286,7 @@ static int llm_generate_raw(struct llm_ctx * c,
                 struct llm_stream_chunk ch = {0};
                 ch.prefill_done  = i + 1;
                 ch.prefill_total = prompt_n;
-                if (progress_cb(&ch, progress_user) != 0) { stop = 1; }
+                if (progress_cb(&ch, progress_user) != 0) { stop = true; }
             }
         }
     }
@@ -311,7 +311,7 @@ static int llm_generate_raw(struct llm_ctx * c,
         // generated >= min_new.
         float saved_eos = 0.0f;
         float saved_eot = 0.0f;
-        int32_t mask    = (generated < min_new);
+        bool  mask      = (generated < min_new);
         if (mask) {
             if (c->cfg.eos_id >= 0 && c->cfg.eos_id < (int32_t)tensor_nelements(logits)) {
                 saved_eos = logits->data[c->cfg.eos_id];
@@ -335,18 +335,18 @@ static int llm_generate_raw(struct llm_ctx * c,
         pos++;
         generated++;
         if (g_trace_tokens) { fprintf(stderr, "[tok] %d\n", (int)next); }
-        int32_t is_stop = (next == c->cfg.eos_id || next == c->cfg.eot_id);
+        bool is_stop = (next == c->cfg.eos_id || next == c->cfg.eot_id);
         for (int32_t si = 0; !is_stop && si < c->cfg.n_stop_ids; si++) {
-            if (next == c->cfg.stop_ids[si]) { is_stop = 1; }
+            if (next == c->cfg.stop_ids[si]) { is_stop = true; }
         }
         if (is_stop) {
-            stop = 1;
+            stop = true;
         } else {
             struct chars piece = {0};
             tokenizer_decode_one(&c->tok, next, &piece);
             chars_put(&piece, "", 0);  // ensure null-term
             if (cb != NULL && piece.data != NULL) {
-                if (cb(piece.data, user) != 0) { stop = 1; }
+                if (cb(piece.data, user) != 0) { stop = true; }
             }
             chars_free(&piece);
             last = next;
@@ -414,19 +414,19 @@ struct llm_think_filter {
     int                 hold_n;
     char                tool_call_data[4096];  // body of <tool_call>
     int                 tool_call_n;
-    // Set to 1 by the filter the moment a </tool_call> marker is
-    // consumed. The public llm_generate loop reads this after the
-    // generate_raw call returns to dispatch the tool + re-feed the
-    // model. Reset by init().
-    int                 tool_call_ready;
+    // Flipped true by the filter the moment a </tool_call> marker
+    // is consumed. The public llm_generate loop reads this after
+    // the generate_raw call returns to dispatch the tool + re-feed
+    // the model. Reset by init().
+    bool                tool_call_ready;
     // Per-call configuration (set by llm_generate from sampler
-    // flags before kicking the trampoline). recognize_tool_calls=0
-    // makes find_marker ignore <tool_call> / </tool_call> entries
-    // so the body streams as plain content. emit_visibility=0
-    // suppresses chunk->tool_call emission (tool dispatch still
-    // happens; the UI just doesn't see the trace).
-    int                 recognize_tool_calls;
-    int                 emit_visibility;
+    // flags before kicking the trampoline). recognize_tool_calls
+    // = false makes find_marker ignore <tool_call> / </tool_call>
+    // entries so the body streams as plain content. emit_visibility
+    // = false suppresses chunk->tool_call emission (tool dispatch
+    // still happens; the UI just doesn't see the trace).
+    bool                recognize_tool_calls;
+    bool                emit_visibility;
 };
 
 struct llm_think_marker {
@@ -452,9 +452,9 @@ static void llm_think_filter_init(struct llm_think_filter * f) {
     f->hold_data[0] = '\0';
     f->tool_call_n = 0;
     f->tool_call_data[0] = '\0';
-    f->tool_call_ready = 0;
-    f->recognize_tool_calls = 1;  // default on; llm_generate overrides
-    f->emit_visibility      = 1;
+    f->tool_call_ready = false;
+    f->recognize_tool_calls = true;  // default on; llm_generate overrides
+    f->emit_visibility      = true;
 }
 
 // Emit `[start, end)` bytes through `cb`, tagging the chunk's text
@@ -512,19 +512,19 @@ static int llm_think_find_marker(const struct llm_think_filter * f,
     for (int m = 0; m < LLM_THINK_N_MARKERS; m++) {
         // Skip the tool_call markers when the sampler turned tools
         // off — their bytes will stream as plain content instead.
-        int is_tool_call = (m == LLM_MARKER_TOOL_OPEN) ||
-                           (m == LLM_MARKER_TOOL_CLOSE);
-        int skip = (!f->recognize_tool_calls && is_tool_call);
+        bool is_tool_call = (m == LLM_MARKER_TOOL_OPEN) ||
+                            (m == LLM_MARKER_TOOL_CLOSE);
+        bool skip = (!f->recognize_tool_calls && is_tool_call);
         if (!skip) {
             const char * tag = THINK_MARKERS[m].tag;
             int tlen = THINK_MARKERS[m].len;
             if (tlen <= f->hold_n) {
                 int last_start = f->hold_n - tlen;
                 for (int i = 0; i <= last_start; i++) {
-                    int match = 1;
+                    bool match = true;
                     for (int k = 0; k < tlen && match; k++) {
                         if (f->hold_data[i + k] != tag[k]) {
-                            match = 0;
+                            match = false;
                         }
                     }
                     if (match && i < best_pos) {
@@ -561,24 +561,24 @@ static int llm_think_safe_utf8(const char * buf, int hold_n, int safe) {
     return safe;
 }
 
-// Returns 1 if hold[]'s last `tail_n` bytes could be a strict prefix
-// of any marker (i.e. we should hold them back rather than emit).
-static int llm_think_could_be_prefix(const struct llm_think_filter * f,
-                                     int tail_start) {
-    int possible = 0;
+// Returns true if hold[]'s last `tail_n` bytes could be a strict
+// prefix of any marker (i.e. we should hold them back rather than emit).
+static bool llm_think_could_be_prefix(const struct llm_think_filter * f,
+                                      int tail_start) {
+    bool possible = false;
     int tail_n = f->hold_n - tail_start;
     if (tail_n > 0) {
         for (int m = 0; m < LLM_THINK_N_MARKERS && !possible; m++) {
             const char * tag = THINK_MARKERS[m].tag;
             int tlen = THINK_MARKERS[m].len;
             if (tail_n < tlen) {
-                int match = 1;
+                bool match = true;
                 for (int k = 0; k < tail_n && match; k++) {
                     if (f->hold_data[tail_start + k] != tag[k]) {
-                        match = 0;
+                        match = false;
                     }
                 }
-                if (match) { possible = 1; }
+                if (match) { possible = true; }
             }
         }
     }
@@ -629,12 +629,12 @@ int llm_think_filter_push(struct llm_think_filter * f,
             src   += chunk_len;
             avail -= chunk_len;
             // Drain as many complete markers as we can.
-            int more = 1;
+            bool more = true;
             while (more && rc == 0) {
                 int pos = 0;
                 int m   = llm_think_find_marker(f, &pos);
                 if (m < 0) {
-                    more = 0;
+                    more = false;
                 } else {
                     // Emit prefix in current mode.
                     int r2 = llm_think_emit(f, f->hold_data, pos,
@@ -658,13 +658,13 @@ int llm_think_filter_push(struct llm_think_filter * f,
                             int r3 = cb(&chunk, user);
                             if (r3 != 0) { rc = r3; }
                         }
-                        f->tool_call_ready = 1;
+                        f->tool_call_ready = true;
                         // Force llm_generate_raw's decode loop to
                         // exit so the public llm_generate can run
                         // the dispatch + inject step before any
                         // further sampling.
                         rc = 1;
-                        more = 0;
+                        more = false;
                     }
                     // other -> tool_call: entering a tool_call block;
                     // reset the accumulator.
@@ -727,12 +727,12 @@ int llm_think_filter_finish(struct llm_think_filter * f,
     // No-more-data flush: any pending markers won't get longer, so
     // emit one last pass through the marker scan, then dump the
     // residue in current mode.
-    int more = 1;
+    bool more = true;
     while (more && rc == 0) {
         int pos = 0;
         int m   = llm_think_find_marker(f, &pos);
         if (m < 0) {
-            more = 0;
+            more = false;
         } else {
             int r2 = llm_think_emit(f, f->hold_data, pos, cb, user);
             if (r2 != 0) { rc = r2; }
@@ -1260,10 +1260,10 @@ int llm_generate(struct llm_ctx * c,
                  void * user) {
     // Defaults when sampler isn't provided (rare; CLI / Swift
     // always pass one).
-    int with_tools = (sampler_in != NULL) ? sampler_in->tools : 1;
-    int with_debug = (sampler_in != NULL) ? sampler_in->debug : 1;
-    int total_gen = 0;
-    int done      = 0;
+    bool with_tools = (sampler_in != NULL) ? sampler_in->tools : true;
+    bool with_debug = (sampler_in != NULL) ? sampler_in->debug : true;
+    int  total_gen  = 0;
+    bool done       = false;
     int32_t * cur_ids =
         (int32_t *)oom(calloc((size_t)(prompt_n > 0 ? prompt_n : 1),
                                   sizeof(int32_t)));
@@ -1366,7 +1366,7 @@ int llm_generate(struct llm_ctx * c,
             chars_free(&inject);
             chars_free(&result);
         } else {
-            done = 1;
+            done = true;
         }
         iter++;
     }

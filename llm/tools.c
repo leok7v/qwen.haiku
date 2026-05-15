@@ -286,22 +286,22 @@ static void tools_html_strip(const char * s, size_t n,
 static void tools_collapse_ws(const struct ts_buf * in,
                               struct ts_buf * out) {
     size_t i = 0;
-    int    in_ws    = 1;  // start as "just saw ws" so leading is dropped
+    bool   in_ws    = true;  // start as "just saw ws" so leading is dropped
     size_t emitted  = 0;
     while (i < in->count) {
         unsigned char c = (unsigned char)in->data[i];
-        int is_ws = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+        bool is_ws = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
         if (is_ws) {
             if (!in_ws && emitted > 0) {
                 ts_put(out, " ", 1);
                 emitted++;
             }
-            in_ws = 1;
+            in_ws = true;
         } else {
             char ch = (char)c;
             ts_put(out, &ch, 1);
             emitted++;
-            in_ws = 0;
+            in_ws = false;
         }
         i++;
     }
@@ -458,15 +458,15 @@ static int tools_http_get(const char * url, long timeout_ms,
 // years, but if it does, this is the one function to update.
 static int tools_ddg_parse(const char * h, size_t n, int max_results,
                            struct ts_buf * out) {
-    int seen = 0;
-    size_t i = 0;
-    int more = 1;
+    int  seen = 0;
+    size_t i  = 0;
+    bool more = true;
     // First pass: titles. Each result link carries rel="nofollow".
     while (more && seen < max_results && i < n) {
         const char * p = (const char *)memmem(h + i, n - i,
                                               "rel=\"nofollow\"", 14);
         if (p == NULL) {
-            more = 0;
+            more = false;
         } else {
             size_t pos = (size_t)(p - h);
             size_t gt = pos;
@@ -476,7 +476,7 @@ static int tools_ddg_parse(const char * h, size_t n, int max_results,
                                        "</a>", 4)
                 : NULL;
             if (gt >= n || pe == NULL) {
-                more = 0;
+                more = false;
             } else {
                 size_t end = (size_t)(pe - h);
                 struct ts_buf title = {0};
@@ -499,31 +499,31 @@ static int tools_ddg_parse(const char * h, size_t n, int max_results,
     // as the links above, so we emit them interleaved-by-position
     // (each snippet block immediately after its title).
     i = 0;
-    more = 1;
+    more = true;
     int snip_emitted = 0;
     while (more && snip_emitted < max_results && i < n) {
         const char * p = (const char *)memmem(h + i, n - i,
                                               "result-snippet", 14);
         if (p == NULL) {
-            more = 0;
+            more = false;
         } else {
             size_t pos = (size_t)(p - h);
             size_t gt = pos;
             while (gt < n && h[gt] != '>') { gt++; }
             if (gt >= n) {
-                more = 0;
+                more = false;
             } else {
                 size_t end = gt + 1;
-                int found_close = 0;
+                bool found_close = false;
                 while (!found_close && end + 1 < n) {
                     if (h[end] == '<' && h[end + 1] == '/') {
-                        found_close = 1;
+                        found_close = true;
                     } else {
                         end++;
                     }
                 }
                 if (!found_close) {
-                    more = 0;
+                    more = false;
                 } else {
                     struct ts_buf snip = {0};
                     tools_html_strip(h + gt + 1, end - gt - 1, &snip);
