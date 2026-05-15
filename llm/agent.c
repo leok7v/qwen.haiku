@@ -555,11 +555,17 @@ static void agent_dispatch(const struct agent_call * call,
 }
 
 // Streaming-capture callback for the agent's llm_generate calls.
-// Appends each UTF-8 piece into a chars buffer; the buffer holds
-// the model's full output for one turn, ready for tool-call parsing.
-static int agent_capture_cb(const char * utf8, void * user) {
+// We only care about CONTENT bytes for tool-call parsing —
+// <tool_call> blocks emitted by the model live in content, never
+// inside <think>...</think>. The C-side filter already routes
+// reasoning to chunk->reasoning, which the agent drops (or could
+// surface as trace if needed).
+static int agent_capture_cb(const struct llm_stream_chunk * chunk,
+                            void * user) {
     struct chars * out = (struct chars *)user;
-    chars_put(out, utf8, strlen(utf8));
+    if (chunk->content != NULL) {
+        chars_put(out, chunk->content, strlen(chunk->content));
+    }
     return 0;
 }
 

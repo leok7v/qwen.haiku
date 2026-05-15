@@ -3316,9 +3316,13 @@ char * llm_chat_format_delta(const char * user_message,
                              enable_thinking);
 }
 
+// File-internal token-stream callback. llm_generate_raw emits one
+// utf8 piece per generated token to this; the public llm_generate
+// trampolines into the <think>-filter on top of this (see further
+// down in this file).
 typedef int (*llm_token_cb)(const char * utf8, void * user);
 
-int llm_generate(struct llm_ctx * c,
+static int llm_generate_raw(struct llm_ctx * c,
                  const int32_t * prompt_ids, int prompt_n,
                  int max_new, int min_new,
                  const struct llm_sampler * sampler_in,
@@ -3431,6 +3435,484 @@ int llm_generate(struct llm_ctx * c,
     free(history);
     qh_trace_close();
     return generated;
+}
+
+// ---------------------------------------------------------------------------
+// <think> stream filter. State machine that splits llm_generate's
+// single output stream into two: content (outside `<think>`...
+// `</think>` blocks) and reasoning (inside). Marker bytes are NOT
+// emitted; both streams are routed through ONE llm_stream_cb
+// callback with a struct llm_stream_chunk that carries exactly one
+// non-NULL pointer per call.
+//
+// The model emits both streams interleaved; we hold back the last
+// few bytes (up to a marker's length) so a marker split across two
+// callback invocations is still detected before any of its bytes
+// leak as visible output.
+//
+// Markers we currently recognise (Qwen3 family):
+//   - "<think>"   (7 bytes) -> enter reasoning
+//   - "</think>"  (8 bytes) -> leave reasoning back to content
+//
+// Adding a new model is a marker-table edit (see THINK_MARKERS
+// below). The state machine is otherwise marker-agnostic.
+//
+// Public surface (llm.h) is just `llm_generate_split`. The filter
+// struct + push/finish helpers are file-static here: clients should
+// not need the streaming pieces directly because llm_generate_split
+// already drives one filter end-to-end per generate call.
+// ---------------------------------------------------------------------------
+
+struct llm_think_filter {
+    int  mode;             // 0 = content, 1 = reasoning
+    char hold_data[64];    // partial-marker holdback buffer
+    int  hold_n;
+};
+
+struct llm_think_marker {
+    const char * tag;   // null-terminated literal
+    int          len;   // strlen(tag), cached
+    int          mode;  // 0 = content, 1 = reasoning, -1 = no-op (skip tag)
+};
+
+static const struct llm_think_marker THINK_MARKERS[] = {
+    { "<think>",   7,  1 },
+    { "</think>",  8,  0 },
+};
+#define LLM_THINK_N_MARKERS \
+    ((int)(sizeof(THINK_MARKERS) / sizeof(THINK_MARKERS[0])))
+#define LLM_THINK_MAX_MARKER 8  // strlen("</think>")
+
+static void llm_think_filter_init(struct llm_think_filter * f) {
+    f->mode = 0;
+    f->hold_n = 0;
+    f->hold_data[0] = '\0';
+}
+
+// Emit `[start, end)` bytes through `cb`, tagging the chunk's text
+// as content or reasoning per the filter's current mode. Returns
+// the callback's return value, or 0 when there's no work / no
+// callback. Internal helper.
+static int llm_think_emit(struct llm_think_filter * f,
+                          const char * start, int n,
+                          llm_stream_cb cb, void * user) {
+    int rc = 0;
+    if (n > 0 && cb != NULL) {
+        char tmp[80];
+        int  copy = n < (int)sizeof(tmp) - 1 ? n : (int)sizeof(tmp) - 1;
+        memcpy(tmp, start, (size_t)copy);
+        tmp[copy] = '\0';
+        struct llm_stream_chunk chunk = { NULL, NULL };
+        if (f->mode == 1) { chunk.reasoning = tmp; }
+        else              { chunk.content   = tmp; }
+        rc = cb(&chunk, user);
+        // If the chunk overflowed our temp buffer, recurse on the
+        // remainder. Keeps the stack-only design.
+        if (n > copy && rc == 0) {
+            int rc2 = llm_think_emit(f, start + copy, n - copy,
+                                     cb, user);
+            if (rc2 != 0) { rc = rc2; }
+        }
+    }
+    return rc;
+}
+
+// Try to find the earliest complete marker fully present in hold[].
+// Returns marker index (0..N-1) and writes the start offset to *pos,
+// or -1 if no complete marker is in hold[].
+static int llm_think_find_marker(const struct llm_think_filter * f,
+                                 int * pos) {
+    int best  = -1;
+    int best_pos = f->hold_n;
+    for (int m = 0; m < LLM_THINK_N_MARKERS; m++) {
+        const char * tag = THINK_MARKERS[m].tag;
+        int tlen = THINK_MARKERS[m].len;
+        if (tlen <= f->hold_n) {
+            int last_start = f->hold_n - tlen;
+            for (int i = 0; i <= last_start; i++) {
+                int match = 1;
+                for (int k = 0; k < tlen && match; k++) {
+                    if (f->hold_data[i + k] != tag[k]) { match = 0; }
+                }
+                if (match && i < best_pos) {
+                    best = m;
+                    best_pos = i;
+                }
+            }
+        }
+    }
+    if (best >= 0) { *pos = best_pos; }
+    return best;
+}
+
+// Walk `safe` back to the nearest UTF-8 codepoint boundary. A
+// multibyte codepoint starts at a byte with high bits != 10xxxxxx
+// (i.e. 0xxxxxxx or 11xxxxxx) and continues with 10xxxxxx
+// continuation bytes; we must not split that sequence across a
+// callback, or the receiver sees a half-decoded grapheme and the UI
+// renders garbage / a replacement glyph.
+//
+// We DO emit at codepoint boundaries but do NOT delay across
+// zero-width joiners (U+200D, three bytes 0xE2 0x80 0x8D). A ZWJ
+// sequence (e.g. man + ZWJ + woman + ZWJ + girl as a family glyph)
+// can be split across callback emissions; the renderer sees the
+// component glyphs briefly until the next chunk lands, then they
+// regroup. Full grapheme-cluster awareness would need ICU and is
+// scope creep for a small chat surface.
+static int llm_think_safe_utf8(const char * buf, int hold_n, int safe) {
+    while (safe > 0 && safe < hold_n &&
+           ((unsigned char)buf[safe] & 0xC0) == 0x80) {
+        safe--;
+    }
+    return safe;
+}
+
+// Returns 1 if hold[]'s last `tail_n` bytes could be a strict prefix
+// of any marker (i.e. we should hold them back rather than emit).
+static int llm_think_could_be_prefix(const struct llm_think_filter * f,
+                                     int tail_start) {
+    int possible = 0;
+    int tail_n = f->hold_n - tail_start;
+    if (tail_n > 0) {
+        for (int m = 0; m < LLM_THINK_N_MARKERS && !possible; m++) {
+            const char * tag = THINK_MARKERS[m].tag;
+            int tlen = THINK_MARKERS[m].len;
+            if (tail_n < tlen) {
+                int match = 1;
+                for (int k = 0; k < tail_n && match; k++) {
+                    if (f->hold_data[tail_start + k] != tag[k]) {
+                        match = 0;
+                    }
+                }
+                if (match) { possible = 1; }
+            }
+        }
+    }
+    return possible;
+}
+
+int llm_think_filter_push(struct llm_think_filter * f,
+                          const char * utf8,
+                          llm_stream_cb cb,
+                          void * user) {
+    int rc = 0;
+    if (utf8 != NULL) {
+        // Append the new chunk to the holdback. The hold buffer is
+        // sized generously (64 bytes) so multi-token streaming
+        // never overflows; if a stray giant piece does arrive we
+        // flush the surplus first.
+        int avail = (int)sizeof(f->hold_data) - 1 - f->hold_n;
+        const char * src = utf8;
+        while (*src != '\0' && rc == 0) {
+            if (avail <= 0) {
+                // Hold is full; emit the front (keeping last
+                // LLM_THINK_MAX_MARKER-1 bytes as potential prefix).
+                // Same UTF-8 safety as the per-iter safe-emit below.
+                int keep = LLM_THINK_MAX_MARKER - 1;
+                int emit_n = f->hold_n - keep;
+                emit_n = llm_think_safe_utf8(f->hold_data, f->hold_n,
+                                             emit_n);
+                if (emit_n > 0) {
+                    int r2 = llm_think_emit(f, f->hold_data,
+                                            emit_n, cb, user);
+                    if (r2 != 0) { rc = r2; }
+                    int remain = f->hold_n - emit_n;
+                    memmove(f->hold_data, f->hold_data + emit_n,
+                            (size_t)remain);
+                    f->hold_n = remain;
+                    f->hold_data[f->hold_n] = '\0';
+                }
+                avail = (int)sizeof(f->hold_data) - 1 - f->hold_n;
+            }
+            // Copy as many bytes as fit, then look for markers.
+            int chunk_len = 0;
+            while (src[chunk_len] != '\0' && chunk_len < avail) {
+                chunk_len++;
+            }
+            memcpy(f->hold_data + f->hold_n, src, (size_t)chunk_len);
+            f->hold_n += chunk_len;
+            f->hold_data[f->hold_n] = '\0';
+            src   += chunk_len;
+            avail -= chunk_len;
+            // Drain as many complete markers as we can.
+            int more = 1;
+            while (more && rc == 0) {
+                int pos = 0;
+                int m   = llm_think_find_marker(f, &pos);
+                if (m < 0) {
+                    more = 0;
+                } else {
+                    // Emit prefix in current mode.
+                    int r2 = llm_think_emit(f, f->hold_data, pos,
+                                            cb, user);
+                    if (r2 != 0) { rc = r2; }
+                    // Flip mode (or no-op for mode==-1 markers).
+                    if (THINK_MARKERS[m].mode >= 0) {
+                        f->mode = THINK_MARKERS[m].mode;
+                    }
+                    int after = pos + THINK_MARKERS[m].len;
+                    int remain = f->hold_n - after;
+                    if (remain > 0) {
+                        memmove(f->hold_data, f->hold_data + after,
+                                (size_t)remain);
+                    }
+                    f->hold_n = remain;
+                    f->hold_data[f->hold_n] = '\0';
+                }
+            }
+            // Emit the part of hold that's safely past any partial
+            // marker. The trailing (LLM_THINK_MAX_MARKER-1) bytes
+            // stay as potential prefix.
+            int safe = f->hold_n - (LLM_THINK_MAX_MARKER - 1);
+            if (safe > 0 && rc == 0) {
+                // Trim the safe region further: don't emit bytes
+                // that could still extend into a marker tail (i.e.
+                // if the LAST byte we'd emit is a '<', keep it).
+                while (safe > 0 &&
+                       llm_think_could_be_prefix(f, safe)) {
+                    safe--;
+                }
+                // Also don't split a multibyte UTF-8 codepoint —
+                // hold continuation bytes back until the codepoint
+                // is complete (next push() will bring the tail).
+                safe = llm_think_safe_utf8(f->hold_data, f->hold_n,
+                                           safe);
+                if (safe > 0) {
+                    int r2 = llm_think_emit(f, f->hold_data, safe,
+                                            cb, user);
+                    if (r2 != 0) { rc = r2; }
+                    int remain = f->hold_n - safe;
+                    if (remain > 0) {
+                        memmove(f->hold_data,
+                                f->hold_data + safe,
+                                (size_t)remain);
+                    }
+                    f->hold_n = remain;
+                    f->hold_data[f->hold_n] = '\0';
+                }
+            }
+            avail = (int)sizeof(f->hold_data) - 1 - f->hold_n;
+        }
+    }
+    return rc;
+}
+
+int llm_think_filter_finish(struct llm_think_filter * f,
+                            llm_stream_cb cb,
+                            void * user) {
+    int rc = 0;
+    // No-more-data flush: any pending markers won't get longer, so
+    // emit one last pass through the marker scan, then dump the
+    // residue in current mode.
+    int more = 1;
+    while (more && rc == 0) {
+        int pos = 0;
+        int m   = llm_think_find_marker(f, &pos);
+        if (m < 0) {
+            more = 0;
+        } else {
+            int r2 = llm_think_emit(f, f->hold_data, pos, cb, user);
+            if (r2 != 0) { rc = r2; }
+            if (THINK_MARKERS[m].mode >= 0) {
+                f->mode = THINK_MARKERS[m].mode;
+            }
+            int after = pos + THINK_MARKERS[m].len;
+            int remain = f->hold_n - after;
+            if (remain > 0) {
+                memmove(f->hold_data, f->hold_data + after,
+                        (size_t)remain);
+            }
+            f->hold_n = remain;
+            f->hold_data[f->hold_n] = '\0';
+        }
+    }
+    if (f->hold_n > 0 && rc == 0) {
+        rc = llm_think_emit(f, f->hold_data, f->hold_n, cb, user);
+        f->hold_n = 0;
+        f->hold_data[0] = '\0';
+    }
+    return rc;
+}
+
+// Trampoline box for llm_generate_split.
+struct llm_split_box {
+    struct llm_think_filter filter;
+    llm_stream_cb           cb;
+    void *                  user;
+};
+
+static int llm_split_trampoline(const char * utf8, void * user) {
+    struct llm_split_box * b = (struct llm_split_box *)user;
+    return llm_think_filter_push(&b->filter, utf8, b->cb, b->user);
+}
+
+int llm_generate(struct llm_ctx * c,
+                 const int32_t * prompt_ids, int prompt_n,
+                 int max_new, int min_new,
+                 const struct llm_sampler * sampler_in,
+                 uint64_t seed,
+                 llm_stream_cb cb,
+                 void * user) {
+    struct llm_split_box box;
+    llm_think_filter_init(&box.filter);
+    box.cb   = cb;
+    box.user = user;
+    int n = llm_generate_raw(c, prompt_ids, prompt_n,
+                             max_new, min_new,
+                             sampler_in, seed,
+                             llm_split_trampoline, &box);
+    llm_think_filter_finish(&box.filter, cb, user);
+    return n;
+}
+
+// Self-test for the think filter. Feeds known streams through it
+// piece-by-piece (mimicking llm_generate's per-token callback) and
+// asserts the routed content / reasoning outputs match hand-traced
+// goldens. Returns 0 on PASS.
+struct llm_think_test_capture {
+    char content  [512];
+    int  content_n;
+    char reasoning[512];
+    int  reasoning_n;
+};
+
+static int llm_think_test_cb(const struct llm_stream_chunk * chunk,
+                             void * user) {
+    struct llm_think_test_capture * cap =
+        (struct llm_think_test_capture *)user;
+    if (chunk->content != NULL) {
+        int n = (int)strlen(chunk->content);
+        int avail = (int)sizeof(cap->content) - cap->content_n - 1;
+        int copy = n < avail ? n : avail;
+        if (copy > 0) {
+            memcpy(cap->content + cap->content_n,
+                   chunk->content, (size_t)copy);
+            cap->content_n += copy;
+            cap->content[cap->content_n] = '\0';
+        }
+    }
+    if (chunk->reasoning != NULL) {
+        int n = (int)strlen(chunk->reasoning);
+        int avail = (int)sizeof(cap->reasoning) - cap->reasoning_n - 1;
+        int copy = n < avail ? n : avail;
+        if (copy > 0) {
+            memcpy(cap->reasoning + cap->reasoning_n,
+                   chunk->reasoning, (size_t)copy);
+            cap->reasoning_n += copy;
+            cap->reasoning[cap->reasoning_n] = '\0';
+        }
+    }
+    return 0;
+}
+
+// Feed `chunks[0..n)` into the filter sequentially, then finish.
+// Verifies content / reasoning outputs against the goldens.
+// Returns 1 on fail (caller increments failure counter).
+static int llm_think_test_case(const char * name,
+                               const char ** chunks, int n_chunks,
+                               const char * want_content,
+                               const char * want_reasoning) {
+    int failed = 0;
+    struct llm_think_filter f;
+    llm_think_filter_init(&f);
+    struct llm_think_test_capture cap;
+    cap.content_n = 0;
+    cap.content[0] = '\0';
+    cap.reasoning_n = 0;
+    cap.reasoning[0] = '\0';
+    for (int i = 0; i < n_chunks; i++) {
+        llm_think_filter_push(&f, chunks[i],
+                              llm_think_test_cb, &cap);
+    }
+    llm_think_filter_finish(&f, llm_think_test_cb, &cap);
+    if (strcmp(cap.content, want_content) != 0) {
+        fprintf(stderr,
+            "think-test %s: content MISMATCH\n  got:  %s\n  want: %s\n",
+            name, cap.content, want_content);
+        failed = 1;
+    }
+    if (strcmp(cap.reasoning, want_reasoning) != 0) {
+        fprintf(stderr,
+            "think-test %s: reasoning MISMATCH\n  got:  %s\n  want: %s\n",
+            name, cap.reasoning, want_reasoning);
+        failed = 1;
+    }
+    return failed;
+}
+
+static int32_t llm_think_test(void) {
+    int failures = 0;
+    // A: plain content, no markers.
+    {
+        const char * chunks[] = { "Hello, world." };
+        failures += llm_think_test_case("A", chunks, 1,
+                                        "Hello, world.", "");
+    }
+    // B: leading <think> block emptied by gen prompt pre-fill,
+    //    then content. Simulates Qwen3.5 non-thinking mode where
+    //    the prompt ends "<think>\n\n</think>\n\n" and the model
+    //    occasionally emits the closer first.
+    {
+        const char * chunks[] = {
+            "</think>\n\nHello."
+        };
+        failures += llm_think_test_case("B", chunks, 1,
+                                        "\n\nHello.", "");
+    }
+    // C: real reasoning block then content.
+    {
+        const char * chunks[] = {
+            "<think>let me think</think>\n\nAnswer."
+        };
+        failures += llm_think_test_case("C", chunks, 1,
+                                        "\n\nAnswer.",
+                                        "let me think");
+    }
+    // D: marker split across two chunks (the holdback case).
+    {
+        const char * chunks[] = {
+            "abc<thi", "nk>secret</thi", "nk>end"
+        };
+        failures += llm_think_test_case("D", chunks, 3,
+                                        "abcend", "secret");
+    }
+    // E: stray `<` that doesn't lead anywhere (must emit, not eat).
+    {
+        const char * chunks[] = {
+            "x<y<not_a_marker>z"
+        };
+        failures += llm_think_test_case("E", chunks, 1,
+                                        "x<y<not_a_marker>z", "");
+    }
+    // F: byte-at-a-time delivery (worst-case for the holdback).
+    {
+        const char * src = "a<think>b</think>c";
+        // 18 1-byte chunks.
+        const char * chunks[32];
+        char single[32];
+        int n = (int)strlen(src);
+        for (int i = 0; i < n; i++) {
+            single[i] = src[i];
+            single[i + 1] = '\0';
+            // Have to dup so the char* survives — but chunks[i] in
+            // this scope can just point into a stack array of
+            // 2-byte strings; do it inline.
+        }
+        char twos[32][2];
+        for (int i = 0; i < n; i++) {
+            twos[i][0] = src[i];
+            twos[i][1] = '\0';
+            chunks[i] = twos[i];
+        }
+        failures += llm_think_test_case("F", chunks, n, "ac", "b");
+    }
+    if (failures == 0) {
+        printf("think-test: PASS (6 fixtures)\n");
+    } else {
+        printf("think-test: FAIL (%d fixture(s) failed)\n",
+               (int)failures);
+    }
+    return failures;
 }
 
 double llm_pp_per_sec(const struct llm_ctx * c) {
@@ -3806,22 +4288,29 @@ static const char * llm_cli_gguf_path(void) {
     return LLM_GGUF_PATH_DEFAULT;
 }
 
-static int32_t print_cb(const char * s, void * user) {
+static int32_t print_cb(const struct llm_stream_chunk * chunk,
+                        void * user) {
     (void)user;
-    fputs(s, stdout);
-    fflush(stdout);
+    if (chunk->content != NULL) {
+        fputs(chunk->content, stdout);
+        fflush(stdout);
+    }
+    // Reasoning is discarded in the bare CLI surface. --ask (agent
+    // mode) and the SwiftUI app are where reasoning gets routed
+    // somewhere user-visible.
     return 0;
 }
 
-// Token callback for the chat CLI: capture into `chars` only. The
-// turn is printed in one shot at the end (after strip_reasoning_for_history
-// runs on the buffer), so the user sees a clean reply without the
-// leading `</think>` leak that streaming-print would expose. Loses
-// the per-token streaming feel but the chat CLI is for offline
-// testing - the SwiftUI surface still streams via ChatStreamFilter.
-static int32_t capture_cb(const char * s, void * user) {
+// Token callback for the chat CLI: capture content into `chars`.
+// Reasoning is the C-side filter's responsibility now — by the time
+// we get here, `<think>...</think>` blocks have already been
+// stripped and routed to chunk->reasoning, which we drop.
+static int32_t capture_cb(const struct llm_stream_chunk * chunk,
+                          void * user) {
     struct chars * out = (struct chars *)user;
-    chars_put(out, s, (int32_t)strlen(s));
+    if (chunk->content != NULL) {
+        chars_put(out, chunk->content, strlen(chunk->content));
+    }
     return 0;
 }
 
@@ -3943,16 +4432,25 @@ struct chat_test_capture {
     uint64_t     hash;
 };
 
-static int chat_test_cb(const char * utf8, void * user) {
+// Hash BOTH streams together so the pre-filter byte-stream
+// equivalence is preserved across the API rename. content +
+// reasoning combined exactly reconstructs what the model emitted
+// (modulo `<think>`/`</think>` marker bytes, which the C-side
+// filter discards). The hash thus captures the same "did the
+// generator behave identically" signal as before; if reasoning
+// shape changes between runs, that's surfaced.
+static int chat_test_cb(const struct llm_stream_chunk * chunk,
+                        void * user) {
     struct chat_test_capture * cap = (struct chat_test_capture *)user;
-    size_t n = strlen(utf8);
-    chars_put(&cap->text, utf8, n);
-    // Same FNV-1a polynomial as qh_fnv1a64 — keep its byte loop
-    // inline so the hash is computed incrementally as tokens stream
-    // in (the qh_fnv1a64 helper expects a single contiguous buffer).
-    for (size_t i = 0; i < n; i++) {
-        cap->hash ^= (uint64_t)(uint8_t)utf8[i];
-        cap->hash *= 0x100000001b3ULL;
+    const char * piece = (chunk->content != NULL) ? chunk->content
+                                                  : chunk->reasoning;
+    if (piece != NULL) {
+        size_t n = strlen(piece);
+        chars_put(&cap->text, piece, n);
+        for (size_t i = 0; i < n; i++) {
+            cap->hash ^= (uint64_t)(uint8_t)piece[i];
+            cap->hash *= 0x100000001b3ULL;
+        }
     }
     return 0;
 }
@@ -4172,6 +4670,8 @@ int main(int argc, char ** argv) {
             mode = 9;
         } else if (strcmp(argv[i], "--agent-test") == 0) {
             mode = 10;
+        } else if (strcmp(argv[i], "--think-test") == 0) {
+            mode = 12;
         } else if (strcmp(argv[i], "--ask") == 0 && i + 1 < argc) {
             mode = 11;
             prompt = argv[++i];
@@ -4290,6 +4790,8 @@ int main(int argc, char ** argv) {
             " (rebuild: cd llm && LLM_WITH_TOOLS=1 make)\n");
         rc = 1;
 #endif
+    } else if (mode == 12) {
+        rc = llm_think_test();
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  llm --self-test\n"

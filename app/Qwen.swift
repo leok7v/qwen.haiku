@@ -174,14 +174,28 @@ private final class ContinuationBox {
     init(onToken: @escaping (String) -> Bool) { self.onToken = onToken }
 }
 
-private func qwenTokenTrampoline(utf8: UnsafePointer<CChar>?,
-                                 user: UnsafeMutableRawPointer?) -> Int32 {
+private func qwenTokenTrampoline(
+    chunk: UnsafePointer<llm_stream_chunk>?,
+    user: UnsafeMutableRawPointer?
+) -> Int32 {
     var rc: Int32 = 1
-    if let utf8 = utf8, let user = user {
+    if let chunk = chunk, let user = user {
         let box = Unmanaged<ContinuationBox>.fromOpaque(user)
                        .takeUnretainedValue()
-        let piece = String(cString: utf8)
-        rc = box.onToken(piece) ? 0 : 1
+        // For the existing single-stream Swift API we only surface
+        // `chunk.content`. Reasoning (chunk.reasoning) is currently
+        // discarded — a future onToken-with-reasoning variant can
+        // expose it directly if Chat.swift wants to render the
+        // scratchpad separately.
+        let c = chunk.pointee
+        var rcSwift = true
+        if let cPtr = c.content {
+            let piece = String(cString: cPtr)
+            rcSwift = box.onToken(piece)
+        }
+        // Reasoning piece — silently drop (still iterate so the
+        // generator advances normally).
+        rc = rcSwift ? 0 : 1
     }
     return rc
 }

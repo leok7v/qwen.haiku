@@ -105,9 +105,67 @@ struct llm_sampler llm_sampler_default(void);
 // repetition penalty than the Qwen3.5 card's recommendation).
 struct llm_sampler llm_sampler_im_ai(void);
 
+// ---------------------------------------------------------------------------
+// <think>...</think> stream filter (C side, server-side state machine)
+//
+// Qwen3 models emit a reasoning scratchpad between `<think>` and
+// `</think>` markers BEFORE producing visible content. Most chat
+// surfaces want to render the two streams differently — reasoning
+// muted / collapsible, content prominent. This filter is a small
+// byte-stream state machine that splits one llm_generate stream
+// into two callbacks: `content_cb` (outside think blocks) and
+// `reasoning_cb` (inside). Marker bytes themselves are NOT
+// emitted to either callback.
+//
+// Lifecycle: init -> push... -> finish. Stack-allocated; no
+// malloc, no destroy. Reset via re-init.
+//
+// Inspired by im.ai's ReasoningState.swift table-driven parser; we
+// implement just the Qwen3 `<think>` / `</think>` pair here.
+// Easy to extend with more marker rows when porting other models.
+//
+// One emission from the split-stream callback. Exactly one of
+// `content` / `reasoning` is non-NULL per call; the other is NULL.
+// Easy to extend later (a `tool_call` field would land here for the
+// agent-loop integration). NUL-terminated UTF-8 pieces, semantics
+// match llm_token_cb's `utf8`.
+struct llm_stream_chunk {
+    const char * content;
+    const char * reasoning;
+};
+
+// Return non-zero to abort generation (same convention as
+// llm_token_cb).
+typedef int (*llm_stream_cb)(const struct llm_stream_chunk * chunk,
+                             void * user);
+
+// Like llm_generate, but the raw model output is run through an
+// internal <think>...</think> state machine and emitted to `cb` in
+// two streams. `cb` is invoked once per chunk with exactly one of
+// `chunk->content` / `chunk->reasoning` set (the marker bytes
+// themselves are not emitted). Pass NULL for `cb` to discard the
+// stream while still advancing the model.
+//
+// The filter internals (push/finish/state struct) intentionally
+// stay file-static in llm.c — callers don't need that surface, and
+// hiding it keeps the public ABI small.
+int llm_generate_split(struct llm_ctx * ctx,
+                       const int32_t * prompt_ids, int prompt_n,
+                       int max_new, int min_new,
+                       const struct llm_sampler * sampler,
+                       uint64_t seed,
+                       llm_stream_cb cb,
+                       void * user);
+
 // Run inference: prefill the prompt token ids, then sample up to
-// `max_new` tokens, calling `cb(decoded_piece, user)` once per
-// generated token. Stops early on EOS or when `cb` returns non-zero.
+// `max_new` tokens, calling `cb(chunk, user)` once per emitted
+// piece. The raw token stream is run through an internal
+// `<think>...</think>` filter, so each chunk has EXACTLY ONE of
+// `chunk->content` / `chunk->reasoning` non-NULL — the marker
+// bytes themselves are never emitted. Callers that just want
+// visible bytes read `chunk->content` and ignore the other field.
+// Stops early on EOS or when `cb` returns non-zero. Pass NULL for
+// `cb` to discard the stream while still advancing the model.
 //
 // `sampler` controls how each token is chosen. Pass NULL for the
 // zero-initialized (greedy) default. See `struct llm_sampler`.
@@ -127,7 +185,7 @@ int llm_generate(struct llm_ctx * ctx,
                  int max_new, int min_new,
                  const struct llm_sampler * sampler,
                  uint64_t seed,
-                 llm_token_cb cb, void * user);
+                 llm_stream_cb cb, void * user);
 
 // Model metadata accessors. Cheap (O(1)).
 int llm_vocab_size(const struct llm_ctx * ctx);
