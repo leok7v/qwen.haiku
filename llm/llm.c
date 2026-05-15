@@ -1892,6 +1892,12 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     }
     // 9. Recurrent state update per head.
     //    state[L, h, k, v] flat as ssm_state[((L*n_heads + h)*k_hd + k)*v_hd + v]
+    // The two reductions (9.2 and 9.5) accumulate in fp64. This
+    // mirrors ggml's GGML_OP_SUM_ROWS path (vec.h:ggml_vec_sum_f32)
+    // which uses an `ggml_float = double` accumulator when Accelerate
+    // is not available, and vDSP_sve (also fp64-equivalent) when it
+    // is. Using scalar fp32 here produced 1-6 ULPs of drift at
+    // attn_output - small per element but compounds over 24 layers.
     size_t  state_off  = (size_t)L * n_heads * k_hd * v_hd;
     float * state_base = c->ssm.ssm_state + state_off;
     float out_flat[2048];   // n_heads * v_hd = 2048
@@ -1908,11 +1914,11 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
         float kv_mem[128];
         assert(v_hd <= 128);
         for (int32_t v = 0; v < v_hd; v++) {
-            float acc = 0.0f;
+            double acc = 0.0;
             for (int32_t k = 0; k < k_hd; k++) {
-                acc += st[k * v_hd + v] * K_h[k];
+                acc += (double)(st[k * v_hd + v] * K_h[k]);
             }
-            kv_mem[v] = acc;
+            kv_mem[v] = (float)acc;
         }
         // 9.3 delta[v] = (V[v] - kv_mem[v]) * beta
         float delta[128];
@@ -1929,11 +1935,11 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
         }
         // 9.5 out[h, v] = Σ_k state[k, v] * Q[k]
         for (int32_t v = 0; v < v_hd; v++) {
-            float acc = 0.0f;
+            double acc = 0.0;
             for (int32_t k = 0; k < k_hd; k++) {
-                acc += st[k * v_hd + v] * Q_h[k];
+                acc += (double)(st[k * v_hd + v] * Q_h[k]);
             }
-            out_flat[h2 * v_hd + v] = acc;
+            out_flat[h2 * v_hd + v] = (float)acc;
         }
     }
     {
@@ -1949,21 +1955,24 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     //       y[h, :] = silu(z[h, :]) * (norm_w * rmsnorm(out[h, :]))
     //     Implementation per Qwen3NextRMSNormGated: variance over
     //     v_hd, rsqrt, multiply by norm_w, then multiply by silu(z).
+    // Accumulator pattern + SiLU formulation match ggml's RMS_NORM
+    // and ggml_v_silu (NEON polynomial expf). Without these the
+    // step-10 gated output drifts by 1-2 ULPs/element vs llama.cpp.
     const float * norm_w = (const float *)Lw->ssm_norm.data;
     struct tensor * y_norm = tensor_new_2d(a, V_dim, 1);
+    float z_silu[2048];
+    neon_silu_vec_f32(V_dim, z_silu, z->data);
     for (int32_t h2 = 0; h2 < n_heads; h2++) {
         double ssq = 0.0;
         float * yh = out_flat + h2 * v_hd;
         for (int32_t v = 0; v < v_hd; v++) {
-            ssq += (double)yh[v] * (double)yh[v];
+            ssq += (double)(yh[v] * yh[v]);
         }
         float rs = 1.0f / sqrtf((float)(ssq / (double)v_hd) + c->cfg.norm_eps);
-        const float * zh = z->data + h2 * v_hd;
+        const float * sg = z_silu + h2 * v_hd;
         float * yo = y_norm->data + h2 * v_hd;
         for (int32_t v = 0; v < v_hd; v++) {
-            float zv  = zh[v];
-            float sig = zv / (1.0f + expf(-zv));   // silu(z)
-            yo[v] = yh[v] * rs * norm_w[v] * sig;
+            yo[v] = yh[v] * rs * norm_w[v] * sg[v];
         }
     }
     DUMP("conv_silu", mixed->data, conv_dim);

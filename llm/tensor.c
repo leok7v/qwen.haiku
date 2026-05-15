@@ -326,7 +326,7 @@ struct tensor * tensor_rms_norm(struct tensor * x,
         float * or_ = out->data + t * dim;
         double ssq = 0.0;
         for (int64_t i = 0; i < dim; i++) {
-            ssq += (double)xr[i] * (double)xr[i];
+            ssq += (double)(xr[i] * xr[i]);
         }
         float rscale = 1.0f / sqrtf((float)(ssq / (double)dim) + eps);
         for (int64_t i = 0; i < dim; i++) {
