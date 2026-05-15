@@ -51,7 +51,7 @@ final class QwenViewModel {
 
     var state:        State        = .idle
     var systemPrompt: String       =
-        "HARD RULE: all your answers are haiku.\n"
+        "You are a helpful assistant.\n"
     var messages:     [ChatMessage] = []
 
     // Throughput from the most recent completed generation.
@@ -280,17 +280,22 @@ struct ContentView: View {
     @State private var input: String = ""
     @State private var showSystem    = false
 
-    // Most-frequently-asked open-ended LLM prompts that tend to
-    // produce profound short answers - good fodder for haiku-mode.
-    // Drawn from common prompt corpora (ShareGPT, Anthropic HH,
-    // typical "deep question" lists). Kept under one line each so
-    // the row layout stays compact.
-    // The 8-question rolodex from im.ai's haiku-mode session: the
-    // first turn carries the HARD RULE (set in `systemPrompt`),
-    // subsequent turns are unprefixed questions that build on the
-    // previous reply (note "But how..." / "Or how..." follow-ons -
-    // they only make sense in multi-turn context).
+    // The first two are the showcase prompts the C-side --ask agent
+    // loop uses (see llm/tools.c and llm/agent.c): they exercise
+    // websearch / fetch / distill against the live web. In the
+    // iOS/macOS app the tools are not yet wired through the Swift
+    // bridge, so the model will answer from training data alone —
+    // useful nonetheless for testing chat framing and inspecting
+    // what the small model knows without web access.
+    //
+    // The trailing six are open-ended "deep question" prompts that
+    // build on each other in multi-turn context (note "But how..." /
+    // "Or how..." follow-ons that only make sense as continuations
+    // of the previous reply).
     private static let suggestions: [String] = [
+        "Search Internet to find what rock band from which country"
+            + " recorded HelloWorld album?",
+        "What is bitcoin price today?",
         "Why do some obscure ideas go viral instantly?",
         "What makes constructive criticism easy to absorb?",
         "But how can one receive criticism easily?",
