@@ -1336,11 +1336,13 @@ static int32_t chunked_self_test(void) {
 // it's been told tools exist.
 char * llm_chat_format_delta(const char * user_message,
                              const char * system_prefix,
-                             int enable_thinking) {
+                             int enable_thinking,
+                             int enable_tools) {
     char * result = NULL;
     if (user_message != NULL) {
         if (system_prefix != NULL && system_prefix[0] != '\0') {
-            // First turn: full frame with tool advertisements.
+            // First turn: full frame, with tool advertisements only
+            // when the caller asked for them.
             struct jinja_message msgs[2];
             memset(msgs, 0, sizeof(msgs));
             msgs[0].role    = JINJA_ROLE_SYSTEM;
@@ -1352,11 +1354,13 @@ char * llm_chat_format_delta(const char * user_message,
                 { AGENT_TOOL_FETCH },
                 { AGENT_TOOL_DISTILL },
             };
-            result = jinja_apply(msgs, 2, tools, 3,
+            int n_tools = enable_tools ? 3 : 0;
+            result = jinja_apply(msgs, 2, tools, n_tools,
                                  /*add_gen=*/1,
                                  enable_thinking);
         } else {
-            // Subsequent turn: bare delta (KV holds the tools).
+            // Subsequent turn: bare delta (KV holds whatever was
+            // advertised on turn 1, including no tools at all).
             result = jinja_apply_delta(user_message, NULL,
                                        enable_thinking);
         }

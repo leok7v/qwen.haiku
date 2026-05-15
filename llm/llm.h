@@ -280,10 +280,18 @@ char * llm_chat_format(const struct llm_chat_message * messages,
 // given an already-warm context. `system_prefix` is rendered INLINE
 // with the user message (no separate <|im_start|>system block) and
 // should be passed only on the FIRST turn of a conversation, NULL
-// otherwise. Returns NULL if `user_message` is NULL.
+// otherwise. `enable_tools` (1/0) controls whether the FIRST-turn
+// frame advertises the websearch / fetch / distill tools to the
+// model (the Jinja `# Tools` system block). With 0, no tools are
+// listed and the model produces plain content; pairs with
+// `llm_sampler.tools = false` so the runtime's embedded agent loop
+// is also dormant. Subsequent turns (system_prefix NULL) carry no
+// tool advertisement either way — KV holds whatever was advertised
+// on turn 1. Returns NULL if `user_message` is NULL.
 char * llm_chat_format_delta(const char * user_message,
                              const char * system_prefix,
-                             int enable_thinking);
+                             int enable_thinking,
+                             int enable_tools);
 
 #ifdef __cplusplus
 }

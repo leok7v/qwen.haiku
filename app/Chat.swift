@@ -130,12 +130,15 @@ public enum ChatTemplate {
     /// llm/jinja-template.c only.
     public static func applyDelta(userMessage: String,
                                   systemPrefix: String? = nil,
-                                  reasoning: Bool = false) -> String {
+                                  reasoning: Bool = false,
+                                  tools: Bool = true) -> String {
         var result = ""
         let think: Int32 = reasoning ? 1 : 0
+        let toolsFlag: Int32 = tools ? 1 : 0
         if let raw = llm_chat_format_delta(userMessage,
                                            systemPrefix,
-                                           think) {
+                                           think,
+                                           toolsFlag) {
             result = String(cString: raw)
             free(raw)
         }

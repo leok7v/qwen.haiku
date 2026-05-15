@@ -91,6 +91,16 @@ final class QwenViewModel {
     var systemPrompt: String       =
         "You are a helpful assistant.\n"
     var messages:     [ChatMessage] = []
+    // Tools toggle drives both (a) the first-turn frame: when off,
+    // the system block emitted by `ChatTemplate.applyDelta` has no
+    // `# Tools` advertisement, so the model doesn't know any tools
+    // exist; and (b) the sampler's tools flag — the embedded agent
+    // loop in llm_generate ignores `<tool_call>` markers when off.
+    // Default true. The setting only takes effect on the FIRST turn
+    // of a conversation; once the system block is committed to KV
+    // the model "remembers" whichever choice was in force. Toggle
+    // before sending the first message, or Clear to start fresh.
+    var tools:        Bool          = true
     // Debug toggle drives both (a) the sampler's debug flag — i.e.
     // whether llm_generate emits chunk->tool_call / tool_response
     // visibility chunks — and (b) the UI rendering: when on, those
@@ -182,7 +192,7 @@ final class QwenViewModel {
                                     minP:              0.05,
                                     repetitionPenalty: 1.25,
                                     repetitionWindow:  64,
-                                    tools:             true,
+                                    tools:             self.tools,
                                     think:             false,
                                     debug:             self.debug,
                                     maxNew:            512,
@@ -233,14 +243,18 @@ final class QwenViewModel {
             let assistantIdx = self.messages.count - 1
             let delta = ChatTemplate.applyDelta(
                 userMessage: trimmedUser,
-                systemPrefix: isFirstTurn ? trimmedSys : nil)
+                systemPrefix: isFirstTurn ? trimmedSys : nil,
+                tools: self.tools)
             self.state         = .generating
             self.stopRequested = false
             self.prefillDone   = 0
             self.prefillTotal  = 0
             // Sync per-turn flags onto the live Qwen ctx so the next
-            // generate() reads the current Debug toggle state.
+            // generate() reads the current toggle state. `tools`
+            // also gates the embedded agent loop in llm_generate —
+            // when off, `<tool_call>` markers stream as plain content.
             self.qwen?.options.debug = self.debug
+            self.qwen?.options.tools = self.tools
             await self.streamAssistant(prompt: delta, at: assistantIdx)
         }
     }
@@ -466,6 +480,15 @@ struct ContentView: View {
             Button(showSystem ? "done" : "edit") { showSystem.toggle() }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+            // Tools toggle: when off, the first-turn frame has no
+            // tool advertisement and the embedded agent loop is
+            // dormant. Only takes effect at the start of a new
+            // conversation (the system block is KV-cached after
+            // turn 1).
+            Toggle("Tools", isOn: $vm.tools)
+                .toggleStyle(.checkbox)
+                .font(.caption.monospaced())
+                .disabled(vm.state == .generating)
             // Debug toggle: when on, agent tool_call / tool_response
             // chunks land as bracketed lines in the assistant bubble
             // so the user can watch the model's web activity.
