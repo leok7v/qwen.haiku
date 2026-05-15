@@ -36,6 +36,7 @@ $(BIN): $(SWIFT_SRCS) $(LLM) $(BRIDGE) | $(BUILD)
 	    $(addprefix -Xcc ,$(CFLAGS)) \
 	    $(SWIFT_SRCS) $(LLM) \
 	    -framework Foundation \
+	    -lcurl \
 	    -o $@
 
 $(BUILD):

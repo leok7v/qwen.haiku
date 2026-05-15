@@ -15,21 +15,14 @@ CFLAGS  = -O3 -std=c17 -Wall -Wextra \
           -Wno-unused-parameter -Wno-missing-braces \
           -DLLM_CLI \
           -fvectorize -fslp-vectorize
-LDFLAGS = -lm
+# libcurl is always linked: tools.c (websearch / fetch / distill)
+# is compiled unconditionally so the model can hit the network the
+# moment it emits a <tool_call>. Future per-llm_ctx flags will
+# gate runtime activation.
+LDFLAGS = -lm -lcurl
 
 ifeq ($(shell uname -m),arm64)
 CFLAGS += -mcpu=apple-m1
-endif
-
-# Opt-in: build with agent tools (websearch / fetch / distill, see
-# llm/tools.c). Adds a libcurl link dep — the system libcurl on
-# macOS / Linux works out of the box; `curl-config --libs` should
-# print `-lcurl`. Invocation:
-#   LLM_WITH_TOOLS=1 make
-# Off by default so the core inference binary stays dep-free.
-ifeq ($(LLM_WITH_TOOLS),1)
-CFLAGS  += -DLLM_WITH_TOOLS
-LDFLAGS += -lcurl
 endif
 
 BUILD := ../Build/cli

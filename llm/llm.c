@@ -29,13 +29,11 @@
 #include "tensor.c"
 #include "llm.h"
 #include "jinja-template.c"
-#ifdef LLM_WITH_TOOLS
 #include "tools.c"
 // agent.c is `#include`-d lower in this file — it references
 // struct llm_ctx + tok_encode + llm_generate + chars / chars_put,
 // none of which are in scope here at the top of llm.c. The actual
-// include site is right before run_chat (search for "agent.c").
-#endif
+// include site is right before the public llm_generate definition.
 
 #ifdef LLM_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>
@@ -3464,54 +3462,83 @@ static int llm_generate_raw(struct llm_ctx * c,
 // ---------------------------------------------------------------------------
 
 struct llm_think_filter {
-    int  mode;             // 0 = content, 1 = reasoning
-    char hold_data[64];    // partial-marker holdback buffer
+    int  mode;                  // 0 = content, 1 = reasoning, 2 = tool_call
+    char hold_data[64];         // partial-marker holdback buffer
     int  hold_n;
+    char tool_call_data[4096];  // contents inside <tool_call>...</tool_call>
+    int  tool_call_n;
+    // Set to 1 by the filter the moment a </tool_call> marker is
+    // consumed. The public llm_generate loop reads this after the
+    // generate_raw call returns to dispatch the tool + re-feed the
+    // model. Reset by init().
+    int  tool_call_ready;
 };
 
 struct llm_think_marker {
     const char * tag;   // null-terminated literal
     int          len;   // strlen(tag), cached
-    int          mode;  // 0 = content, 1 = reasoning, -1 = no-op (skip tag)
+    int          mode;  // 0=content, 1=reasoning, 2=tool_call, -1=no-op
 };
 
 static const struct llm_think_marker THINK_MARKERS[] = {
-    { "<think>",   7,  1 },
-    { "</think>",  8,  0 },
+    { "<think>",      7, 1 },
+    { "</think>",     8, 0 },
+    { "<tool_call>", 11, 2 },
+    { "</tool_call>",12, 0 },  // exit back to content
 };
 #define LLM_THINK_N_MARKERS \
     ((int)(sizeof(THINK_MARKERS) / sizeof(THINK_MARKERS[0])))
-#define LLM_THINK_MAX_MARKER 8  // strlen("</think>")
+#define LLM_THINK_MAX_MARKER 12  // strlen("</tool_call>")
 
 static void llm_think_filter_init(struct llm_think_filter * f) {
     f->mode = 0;
     f->hold_n = 0;
     f->hold_data[0] = '\0';
+    f->tool_call_n = 0;
+    f->tool_call_data[0] = '\0';
+    f->tool_call_ready = 0;
 }
 
 // Emit `[start, end)` bytes through `cb`, tagging the chunk's text
-// as content or reasoning per the filter's current mode. Returns
-// the callback's return value, or 0 when there's no work / no
-// callback. Internal helper.
+// per the filter's current mode. Mode 2 (tool_call) routes bytes
+// into the filter's internal tool_call_data buffer instead of
+// firing `cb` — the buffered call is dispatched as one atomic
+// chunk when </tool_call> arrives. Returns the callback's return
+// value, or 0 when there's no work / no callback / mode is 2.
 static int llm_think_emit(struct llm_think_filter * f,
                           const char * start, int n,
                           llm_stream_cb cb, void * user) {
     int rc = 0;
-    if (n > 0 && cb != NULL) {
-        char tmp[80];
-        int  copy = n < (int)sizeof(tmp) - 1 ? n : (int)sizeof(tmp) - 1;
-        memcpy(tmp, start, (size_t)copy);
-        tmp[copy] = '\0';
-        struct llm_stream_chunk chunk = { NULL, NULL };
-        if (f->mode == 1) { chunk.reasoning = tmp; }
-        else              { chunk.content   = tmp; }
-        rc = cb(&chunk, user);
-        // If the chunk overflowed our temp buffer, recurse on the
-        // remainder. Keeps the stack-only design.
-        if (n > copy && rc == 0) {
-            int rc2 = llm_think_emit(f, start + copy, n - copy,
-                                     cb, user);
-            if (rc2 != 0) { rc = rc2; }
+    if (n > 0) {
+        if (f->mode == 2) {
+            // Buffering inside a tool_call block — don't emit yet.
+            int avail = (int)sizeof(f->tool_call_data) - 1
+                      - f->tool_call_n;
+            int copy = n < avail ? n : avail;
+            if (copy > 0) {
+                memcpy(f->tool_call_data + f->tool_call_n,
+                       start, (size_t)copy);
+                f->tool_call_n += copy;
+                f->tool_call_data[f->tool_call_n] = '\0';
+            }
+            // If the call body overflows the fixed buffer the
+            // overflow is dropped — small models in practice emit
+            // tool_call blocks <1 KB; 4 KB is comfortable.
+        } else if (cb != NULL) {
+            char tmp[80];
+            int  copy = n < (int)sizeof(tmp) - 1
+                      ? n : (int)sizeof(tmp) - 1;
+            memcpy(tmp, start, (size_t)copy);
+            tmp[copy] = '\0';
+            struct llm_stream_chunk chunk = { NULL, NULL, NULL, NULL };
+            if (f->mode == 1) { chunk.reasoning = tmp; }
+            else              { chunk.content   = tmp; }
+            rc = cb(&chunk, user);
+            if (n > copy && rc == 0) {
+                int rc2 = llm_think_emit(f, start + copy, n - copy,
+                                         cb, user);
+                if (rc2 != 0) { rc = rc2; }
+            }
         }
     }
     return rc;
@@ -3646,9 +3673,34 @@ int llm_think_filter_push(struct llm_think_filter * f,
                     int r2 = llm_think_emit(f, f->hold_data, pos,
                                             cb, user);
                     if (r2 != 0) { rc = r2; }
+                    int prev_mode = f->mode;
                     // Flip mode (or no-op for mode==-1 markers).
                     if (THINK_MARKERS[m].mode >= 0) {
                         f->mode = THINK_MARKERS[m].mode;
+                    }
+                    // 2 -> non-2: tool_call block just finished.
+                    // Emit chunk->tool_call with the buffered body
+                    // and signal the outer loop to dispatch + inject.
+                    if (prev_mode == 2 && f->mode != 2) {
+                        if (cb != NULL && f->tool_call_n > 0) {
+                            struct llm_stream_chunk chunk =
+                                { NULL, NULL, f->tool_call_data, NULL };
+                            int r3 = cb(&chunk, user);
+                            if (r3 != 0) { rc = r3; }
+                        }
+                        f->tool_call_ready = 1;
+                        // Force llm_generate_raw's decode loop to
+                        // exit so the public llm_generate can run
+                        // the dispatch + inject step before any
+                        // further sampling.
+                        rc = 1;
+                        more = 0;
+                    }
+                    // 0/1 -> 2: entering tool_call; reset the
+                    // accumulator.
+                    if (prev_mode != 2 && f->mode == 2) {
+                        f->tool_call_n = 0;
+                        f->tool_call_data[0] = '\0';
                     }
                     int after = pos + THINK_MARKERS[m].len;
                     int remain = f->hold_n - after;
@@ -3746,24 +3798,10 @@ static int llm_split_trampoline(const char * utf8, void * user) {
     return llm_think_filter_push(&b->filter, utf8, b->cb, b->user);
 }
 
-int llm_generate(struct llm_ctx * c,
-                 const int32_t * prompt_ids, int prompt_n,
-                 int max_new, int min_new,
-                 const struct llm_sampler * sampler_in,
-                 uint64_t seed,
-                 llm_stream_cb cb,
-                 void * user) {
-    struct llm_split_box box;
-    llm_think_filter_init(&box.filter);
-    box.cb   = cb;
-    box.user = user;
-    int n = llm_generate_raw(c, prompt_ids, prompt_n,
-                             max_new, min_new,
-                             sampler_in, seed,
-                             llm_split_trampoline, &box);
-    llm_think_filter_finish(&box.filter, cb, user);
-    return n;
-}
+// The public `llm_generate` definition lives AFTER `#include
+// "agent.c"` so the tools-enabled build can reach
+// agent_parse_tool_calls + agent_dispatch (defined in agent.c).
+// See the matching definition further down in this file.
 
 // Self-test for the think filter. Feeds known streams through it
 // piece-by-piece (mimicking llm_generate's per-token callback) and
@@ -4159,6 +4197,127 @@ static int32_t chunked_self_test(void) {
     return (max_rel_diff <= 1e-5f) ? 0 : 1;
 }
 
+// Agent helpers (parser + tool dispatcher) — `#include`-d here so
+// llm_generate's embedded agent loop can reach them. agent.c uses
+// llm_ctx + tok_encode + chars / chars_put + tools_*, all of which
+// are in scope by this point.
+#include "agent.c"
+
+// Public llm_generate. The think + tool-call stream filter (set up
+// via llm_split_box / llm_split_trampoline above) routes the
+// model's bytes through llm_stream_cb. A completed
+// <tool_call>...</tool_call> block stops llm_generate_raw, the
+// body is parsed, the named tool dispatches synchronously, and
+// the result is tokenized + prefilled back into the KV cache for
+// the next iteration. The loop continues until the model produces
+// content without another tool_call or an iteration cap kicks in.
+//
+// Tools are always linked into llm.c — a future per-llm_ctx flag
+// (e.g. ctx->enable_tools / enable_thinking) will gate runtime
+// activation; for now they're on whenever the model emits the
+// markers.
+#define LLM_GENERATE_TOOL_ITER_CAP 6
+int llm_generate(struct llm_ctx * c,
+                 const int32_t * prompt_ids, int prompt_n,
+                 int max_new, int min_new,
+                 const struct llm_sampler * sampler_in,
+                 uint64_t seed,
+                 llm_stream_cb cb,
+                 void * user) {
+    int total_gen = 0;
+    int done      = 0;
+    int32_t * cur_ids =
+        (int32_t *)llm_oom(calloc((size_t)(prompt_n > 0 ? prompt_n : 1),
+                                  sizeof(int32_t)));
+    if (prompt_n > 0) {
+        memcpy(cur_ids, prompt_ids,
+               (size_t)prompt_n * sizeof(int32_t));
+    }
+    int cur_n = prompt_n;
+    int iter  = 0;
+    while (!done && iter < LLM_GENERATE_TOOL_ITER_CAP &&
+           total_gen < max_new) {
+        struct llm_split_box box;
+        llm_think_filter_init(&box.filter);
+        box.cb   = cb;
+        box.user = user;
+        int budget = max_new - total_gen;
+        int n = llm_generate_raw(c, cur_ids, cur_n,
+                                 budget, min_new,
+                                 sampler_in, seed,
+                                 llm_split_trampoline, &box);
+        total_gen += n;
+        llm_think_filter_finish(&box.filter, cb, user);
+        free(cur_ids);
+        cur_ids = NULL;
+        cur_n   = 0;
+        if (box.filter.tool_call_ready && total_gen < max_new) {
+            // Rewrap the buffered body in <tool_call>...</tool_call>
+            // since the parser scans for those markers.
+            struct chars wrapped = {0};
+            const char * pre  = "<tool_call>";
+            const char * post = "</tool_call>";
+            chars_put(&wrapped, pre, strlen(pre));
+            if (box.filter.tool_call_n > 0) {
+                chars_put(&wrapped, box.filter.tool_call_data,
+                          (size_t)box.filter.tool_call_n);
+            }
+            chars_put(&wrapped, post, strlen(post));
+            chars_put(&wrapped, "", 0);
+            struct agent_call calls[4];
+            int nc = agent_parse_tool_calls(wrapped.data, calls, 4);
+            chars_free(&wrapped);
+            struct chars result = {0};
+            for (int i = 0; i < nc; i++) {
+                struct tool_result r = {0};
+                agent_dispatch(&calls[i], &r);
+                const char * payload =
+                    r.ok && r.body != NULL ? r.body
+                  : r.error != NULL        ? r.error
+                                           : "(no result)";
+                if (i > 0) { chars_put(&result, "\n\n", 2); }
+                chars_put(&result, payload, strlen(payload));
+                tools_result_free(&r);
+            }
+            chars_put(&result, "", 0);
+            agent_free_calls(calls, nc);
+            // Visibility chunk: tell the caller what the tool
+            // returned. The model never sees this chunk — only
+            // the framed tool_response below is fed back into KV.
+            if (cb != NULL && result.data != NULL) {
+                struct llm_stream_chunk ch =
+                    { NULL, NULL, NULL, result.data };
+                cb(&ch, user);
+            }
+            struct chars inject = {0};
+            const char * head =
+                "<|im_end|>\n<|im_start|>user\n<tool_response>\n";
+            chars_put(&inject, head, strlen(head));
+            if (result.data != NULL) {
+                chars_put(&inject, result.data, result.count);
+            }
+            const char * tail =
+                "\n</tool_response><|im_end|>\n"
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+            chars_put(&inject, tail, strlen(tail));
+            chars_put(&inject, "", 0);
+            int32_t * ids = (int32_t *)llm_oom(
+                calloc(16384, sizeof(int32_t)));
+            int n_ids = tok_encode(&c->tok, inject.data,
+                                   ids, 16384);
+            cur_ids = ids;
+            cur_n   = n_ids;
+            chars_free(&inject);
+            chars_free(&result);
+        } else {
+            done = 1;
+        }
+        iter++;
+    }
+    free(cur_ids);
+    return total_gen;
+}
+
 // --self-test: build a tiny synthetic model with deterministic
 // weights and run one forward step. Validates the data flow without
 // needing the GGUF file present. CLI-only - library callers don't
@@ -4347,14 +4506,6 @@ static void strip_reasoning_for_history(struct chars * s) {
     s->data[kept] = '\0';
 }
 
-#ifdef LLM_WITH_TOOLS
-// Agent loop sits here (after llm_ctx + chars + tok_encode + the
-// jinja_message struct are all in scope). Provides agent_run() and
-// agent_parser_test() that the CLI's --ask / --agent-test modes
-// drive.
-#include "agent.c"
-#endif
-
 // Multi-turn chat mode. Each --prompt is one user turn. The runner
 // re-prefills the full conversation each turn (KV cache overwrites,
 // SSM cache cleared via llm_reset() between turns). The optional
@@ -4532,7 +4683,6 @@ static int32_t run_chat_test(int32_t max_new) {
     return r;
 }
 
-#ifdef LLM_WITH_TOOLS
 // One-shot agent run: feed `question` to the model with websearch /
 // fetch / distill tools advertised, let it iterate up to max_iters
 // tool calls, print the final answer. --trace dumps per-iteration
@@ -4558,7 +4708,6 @@ static int32_t run_ask(const char * question,
     tools_global_cleanup();
     return rc;
 }
-#endif
 
 static int32_t run_single(const char * prompt, int32_t max_new,
                           const struct llm_sampler * sp, uint64_t seed) {
@@ -4634,7 +4783,22 @@ static int32_t run_repl(const struct llm_sampler * sp,
 #define LLM_CLI_MAX_TURNS 32
 
 int main(int argc, char ** argv) {
-    int32_t mode = 0;  // 0=help, 1=self-test, 2=single, 3=repl, 4=chat
+    enum cli_mode {
+        CLI_HELP            =  0,
+        CLI_SELF_TEST       =  1,
+        CLI_SINGLE          =  2,
+        CLI_REPL            =  3,
+        CLI_CHAT            =  4,
+        CLI_CHUNKED_TEST    =  5,
+        CLI_CHAT_TEST       =  6,
+        CLI_PRINT_TEMPLATE  =  7,
+        CLI_JINJA_TEST      =  8,
+        CLI_TOOLS_TEST      =  9,
+        CLI_AGENT_TEST      = 10,
+        CLI_ASK             = 11,
+        CLI_THINK_TEST      = 12,
+    };
+    enum cli_mode mode = CLI_HELP;
     const char * prompt = "Hello, my name is";
     const char * system_prompt   = NULL;
     const char * chat_prompts[LLM_CLI_MAX_TURNS];
@@ -4650,30 +4814,30 @@ int main(int argc, char ** argv) {
     int32_t  dump_layer   = -1;
     for (int32_t i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--self-test") == 0) {
-            mode = 1;
+            mode = CLI_SELF_TEST;
         } else if (strcmp(argv[i], "--chunked-test") == 0) {
-            mode = 5;
+            mode = CLI_CHUNKED_TEST;
         } else if (strcmp(argv[i], "--single") == 0) {
-            mode = 2;
+            mode = CLI_SINGLE;
             if (i + 1 < argc) { prompt = argv[++i]; }
         } else if (strcmp(argv[i], "--repl") == 0) {
-            mode = 3;
+            mode = CLI_REPL;
         } else if (strcmp(argv[i], "--chat") == 0) {
-            mode = 4;
+            mode = CLI_CHAT;
         } else if (strcmp(argv[i], "--chat-test") == 0) {
-            mode = 6;
+            mode = CLI_CHAT_TEST;
         } else if (strcmp(argv[i], "--print-chat-template") == 0) {
-            mode = 7;
+            mode = CLI_PRINT_TEMPLATE;
         } else if (strcmp(argv[i], "--jinja-test") == 0) {
-            mode = 8;
+            mode = CLI_JINJA_TEST;
         } else if (strcmp(argv[i], "--tools-test") == 0) {
-            mode = 9;
+            mode = CLI_TOOLS_TEST;
         } else if (strcmp(argv[i], "--agent-test") == 0) {
-            mode = 10;
+            mode = CLI_AGENT_TEST;
         } else if (strcmp(argv[i], "--think-test") == 0) {
-            mode = 12;
+            mode = CLI_THINK_TEST;
         } else if (strcmp(argv[i], "--ask") == 0 && i + 1 < argc) {
-            mode = 11;
+            mode = CLI_ASK;
             prompt = argv[++i];
         } else if ((strcmp(argv[i], "-p") == 0 ||
                     strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
@@ -4732,15 +4896,15 @@ int main(int argc, char ** argv) {
     g_no_q8k_rt    = getenv("NO_Q8K_RT")       != NULL;
     g_trace_tokens = getenv("LLM_TRACE_TOKENS") != NULL;
     int rc = 0;
-    if (mode == 1) {
+    if (mode == CLI_SELF_TEST) {
         rc = llm_self_test();
-    } else if (mode == 5) {
+    } else if (mode == CLI_CHUNKED_TEST) {
         rc = chunked_self_test();
-    } else if (mode == 2) {
+    } else if (mode == CLI_SINGLE) {
         rc = run_single(prompt, max_new, &sp, seed);
-    } else if (mode == 3) {
+    } else if (mode == CLI_REPL) {
         rc = run_repl(&sp, seed, max_new);
-    } else if (mode == 4) {
+    } else if (mode == CLI_CHAT) {
         if (chat_n == 0) {
             fprintf(stderr, "llm: --chat needs at least one -p/--prompt\n");
             rc = 1;
@@ -4748,9 +4912,9 @@ int main(int argc, char ** argv) {
             rc = run_chat(chat_prompts, chat_n, system_prompt,
                           &sp, seed, max_new);
         }
-    } else if (mode == 6) {
+    } else if (mode == CLI_CHAT_TEST) {
         rc = run_chat_test(max_new);
-    } else if (mode == 7) {
+    } else if (mode == CLI_PRINT_TEMPLATE) {
         struct llm_ctx * c = llm_create(llm_cli_gguf_path());
         if (!c->loaded) {
             fprintf(stderr, "llm: load failed: %s\n", llm_get_error(c));
@@ -4760,37 +4924,17 @@ int main(int argc, char ** argv) {
             if (tpl != NULL) { fputs(tpl, stdout); }
         }
         llm_destroy(c);
-    } else if (mode == 8) {
+    } else if (mode == CLI_JINJA_TEST) {
         rc = jinja_self_test();
-    } else if (mode == 9) {
-#ifdef LLM_WITH_TOOLS
+    } else if (mode == CLI_TOOLS_TEST) {
         rc = tools_self_test();
         tools_global_cleanup();
-#else
-        fprintf(stderr,
-            "llm: --tools-test requires LLM_WITH_TOOLS=1 at build time"
-            " (rebuild: cd llm && LLM_WITH_TOOLS=1 make)\n");
-        rc = 1;
-#endif
-    } else if (mode == 10) {
-#ifdef LLM_WITH_TOOLS
+    } else if (mode == CLI_AGENT_TEST) {
         rc = agent_parser_test();
-#else
-        fprintf(stderr,
-            "llm: --agent-test requires LLM_WITH_TOOLS=1\n");
-        rc = 1;
-#endif
-    } else if (mode == 11) {
-#ifdef LLM_WITH_TOOLS
+    } else if (mode == CLI_ASK) {
         rc = run_ask(prompt, &sp, seed, max_iters,
                      max_new > 0 ? max_new : 256, trace_agent);
-#else
-        fprintf(stderr,
-            "llm: --ask requires LLM_WITH_TOOLS=1 at build time"
-            " (rebuild: cd llm && LLM_WITH_TOOLS=1 make)\n");
-        rc = 1;
-#endif
-    } else if (mode == 12) {
+    } else if (mode == CLI_THINK_TEST) {
         rc = llm_think_test();
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
@@ -4801,11 +4945,10 @@ int main(int argc, char ** argv) {
                        "[-sys \"system prompt\"] [sampler flags]\n"
                "  llm --chat-test [--max-new N]\n"
                "  llm --jinja-test\n"
-               "  llm --tools-test          (requires LLM_WITH_TOOLS=1 at build)\n"
+               "  llm --tools-test          (live: needs network for DDG)\n"
                "  llm --agent-test          (parser fixtures, no network)\n"
                "  llm --ask \"question\" [--max-iters N] [--max-new N]"
-                       " [--trace] [sampler flags]   "
-                       "(requires LLM_WITH_TOOLS=1)\n"
+                       " [--trace] [sampler flags]\n"
                "  llm --print-chat-template\n"
                "\n"
                "sampler flags:\n"

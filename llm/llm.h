@@ -125,13 +125,27 @@ struct llm_sampler llm_sampler_im_ai(void);
 // Easy to extend with more marker rows when porting other models.
 //
 // One emission from the split-stream callback. Exactly one of
-// `content` / `reasoning` is non-NULL per call; the other is NULL.
-// Easy to extend later (a `tool_call` field would land here for the
-// agent-loop integration). NUL-terminated UTF-8 pieces, semantics
-// match llm_token_cb's `utf8`.
+// these fields is non-NULL per call; the others are NULL.
+// NUL-terminated UTF-8 pieces, same semantics as llm_token_cb's
+// `utf8`.
+//
+// content        - visible reply text. Display in the chat bubble.
+// reasoning      - text inside a `<think>...</think>` block. Hide
+//                  or render muted; do not feed back into history.
+// tool_call      - text inside a `<tool_call>...</tool_call>` block
+//                  the model emitted. Display as a "tool: …"
+//                  indicator while the C side dispatches.
+// tool_response  - text the C-side tool returned for that call.
+//                  Display as a "result: …" indicator. After this
+//                  chunk fires, the C side automatically continues
+//                  generation with the tool's response prefilled
+//                  into the model's context — the caller stays a
+//                  pure stream consumer; no agent-loop wiring.
 struct llm_stream_chunk {
     const char * content;
     const char * reasoning;
+    const char * tool_call;
+    const char * tool_response;
 };
 
 // Return non-zero to abort generation (same convention as
