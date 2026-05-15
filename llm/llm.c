@@ -31,6 +31,10 @@
 #include "jinja-template.c"
 #ifdef LLM_WITH_TOOLS
 #include "tools.c"
+// agent.c is `#include`-d lower in this file — it references
+// struct llm_ctx + tok_encode + llm_generate + chars / chars_put,
+// none of which are in scope here at the top of llm.c. The actual
+// include site is right before run_chat (search for "agent.c").
 #endif
 
 #ifdef LLM_USE_ACCELERATE
@@ -3854,6 +3858,14 @@ static void strip_reasoning_for_history(struct chars * s) {
     s->data[kept] = '\0';
 }
 
+#ifdef LLM_WITH_TOOLS
+// Agent loop sits here (after llm_ctx + chars + tok_encode + the
+// jinja_message struct are all in scope). Provides agent_run() and
+// agent_parser_test() that the CLI's --ask / --agent-test modes
+// drive.
+#include "agent.c"
+#endif
+
 // Multi-turn chat mode. Each --prompt is one user turn. The runner
 // re-prefills the full conversation each turn (KV cache overwrites,
 // SSM cache cleared via llm_reset() between turns). The optional
@@ -4022,6 +4034,34 @@ static int32_t run_chat_test(int32_t max_new) {
     return r;
 }
 
+#ifdef LLM_WITH_TOOLS
+// One-shot agent run: feed `question` to the model with websearch /
+// fetch / distill tools advertised, let it iterate up to max_iters
+// tool calls, print the final answer. --trace dumps per-iteration
+// trace to stderr so the user can watch what the agent does.
+static int32_t run_ask(const char * question,
+                       const struct llm_sampler * sp, uint64_t seed,
+                       int32_t max_iters, int32_t max_new,
+                       int32_t trace) {
+    struct llm_ctx * c = llm_create(llm_cli_gguf_path());
+    int32_t rc = 0;
+    if (!c->loaded) {
+        fprintf(stderr, "llm: load failed: %s\n", llm_get_error(c));
+        rc = 1;
+    } else {
+        printf("[user] %s\n", question);
+        fflush(stdout);
+        char * answer = agent_run(c, question, sp, seed,
+                                  max_iters, max_new, trace);
+        printf("\n[assistant] %s\n", answer != NULL ? answer : "");
+        free(answer);
+    }
+    llm_destroy(c);
+    tools_global_cleanup();
+    return rc;
+}
+#endif
+
 static int32_t run_single(const char * prompt, int32_t max_new,
                           const struct llm_sampler * sp, uint64_t seed) {
     struct llm_ctx * c = llm_create(llm_cli_gguf_path());
@@ -4107,6 +4147,8 @@ int main(int argc, char ** argv) {
     sp.repetition_window  = 64;
     uint64_t seed         = 0;          // 0 = derive from wall clock
     int32_t  max_new      = 64;
+    int32_t  max_iters    = 4;          // agent-loop cap (--ask)
+    int32_t  trace_agent  = 0;          // --trace
     int32_t  dump_layer   = -1;
     for (int32_t i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--self-test") == 0) {
@@ -4128,6 +4170,11 @@ int main(int argc, char ** argv) {
             mode = 8;
         } else if (strcmp(argv[i], "--tools-test") == 0) {
             mode = 9;
+        } else if (strcmp(argv[i], "--agent-test") == 0) {
+            mode = 10;
+        } else if (strcmp(argv[i], "--ask") == 0 && i + 1 < argc) {
+            mode = 11;
+            prompt = argv[++i];
         } else if ((strcmp(argv[i], "-p") == 0 ||
                     strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
             if (chat_n < LLM_CLI_MAX_TURNS) {
@@ -4171,6 +4218,10 @@ int main(int argc, char ** argv) {
             seed = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--max-new") == 0 && i + 1 < argc) {
             max_new = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--max-iters") == 0 && i + 1 < argc) {
+            max_iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--trace") == 0) {
+            trace_agent = 1;
         } else if (strcmp(argv[i], "--min-new") == 0 && i + 1 < argc) {
             g_min_new = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--dump-layer") == 0 && i + 1 < argc) {
@@ -4221,6 +4272,24 @@ int main(int argc, char ** argv) {
             " (rebuild: cd llm && LLM_WITH_TOOLS=1 make)\n");
         rc = 1;
 #endif
+    } else if (mode == 10) {
+#ifdef LLM_WITH_TOOLS
+        rc = agent_parser_test();
+#else
+        fprintf(stderr,
+            "llm: --agent-test requires LLM_WITH_TOOLS=1\n");
+        rc = 1;
+#endif
+    } else if (mode == 11) {
+#ifdef LLM_WITH_TOOLS
+        rc = run_ask(prompt, &sp, seed, max_iters,
+                     max_new > 0 ? max_new : 256, trace_agent);
+#else
+        fprintf(stderr,
+            "llm: --ask requires LLM_WITH_TOOLS=1 at build time"
+            " (rebuild: cd llm && LLM_WITH_TOOLS=1 make)\n");
+        rc = 1;
+#endif
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  llm --self-test\n"
@@ -4231,6 +4300,10 @@ int main(int argc, char ** argv) {
                "  llm --chat-test [--max-new N]\n"
                "  llm --jinja-test\n"
                "  llm --tools-test          (requires LLM_WITH_TOOLS=1 at build)\n"
+               "  llm --agent-test          (parser fixtures, no network)\n"
+               "  llm --ask \"question\" [--max-iters N] [--max-new N]"
+                       " [--trace] [sampler flags]   "
+                       "(requires LLM_WITH_TOOLS=1)\n"
                "  llm --print-chat-template\n"
                "\n"
                "sampler flags:\n"

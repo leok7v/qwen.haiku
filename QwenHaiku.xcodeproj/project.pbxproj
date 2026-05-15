@@ -15,6 +15,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Makefile,
+				agent.c,
 				chunked.c,
 				jinja-template.c,
 				neon.c,
