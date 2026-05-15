@@ -60,6 +60,22 @@
 // existing autoregressive path on a single token is meaningful (the
 // math is identical, only the accumulation order differs).
 //
+// Index convention (this file): (i, j) where i = QUERY time and
+// j = KEY time, row-major in memory (i is row, j is column). This
+// is the TRANSPOSE of ggml's (d0=key, d1=query) view but produces
+// the same mathematical matrices. The mapping is consistent across
+// every operation here:
+//
+//   attn_kq[i, j]    = (K[j] · Q[i]) * decay_mask[i, j]   for j <= i
+//   kk_dot[i, j]     = (K[j] · K_beta[i]) * decay_mask[i, j]  for j < i
+//   attn[i, j]       = I[i, j] + SOLVE_TRI((I + kk_dot), -kk_dot)[i, j]
+//                      for j <= i
+//   v_eff[i, e]      = sum_j attn[i, j] * v_beta[j, e]
+//   v_attn[i, e]     = sum_j attn_kq[i, j] * v_new[j, e]
+//
+// Cross-validated against an autoregressive scalar reference
+// (autoregressive_ref in llm.c) at N=8: sub-1e-5 relative diff.
+//
 // Numerical reference: ggml's compute kernel - the SOLVE_TRI step is
 // a pure forward-substitution on a lower-triangular system, fp32. We
 // match `ggml_compute_forward_solve_tri_f32` (ops.cpp ~line 10293) bit
@@ -228,63 +244,65 @@ static void chunked_ssm_step_f32(int k_hd, int v_hd,
             v_beta[t * v_hd + e] = v_in[t * v_hd + e] * b;
         }
     }
-    // 3b. kk_dot[i, j] = (K[i, :] · K_beta[j, :]) * decay_mask[i, j]
-    //     attn_lower (strict lower tri) = -kk_dot * causal_lower (i.e. negate, keep i>j)
-    //     lhs = I - attn_lower = I + kk_dot * causal_lower
-    // KNOWN INCORRECT for multi-token: this index pairing produces
-    // the right output for N=1 (where only [0,0] matters) but the
-    // wrong cross-token contributions for N>1. See chunked-test
-    // N=4 output. Multi-token correctness needs:
-    //   1. Swap K/K_beta and K/Q index roles to match ggml's (key,
-    //      query) convention - my (i, j) maps to ggml's (query, key)
-    //      not (key, query). See git log for details.
-    //   2. NEGATE the RHS passed to solve_tri (`rhs = -kk_dot`) to
-    //      match ggml's `attn_pre_solve = -k_decay*causal_mask`.
-    // Fixing both gets multi-token bit-parity; tracked as next
-    // session entry.
+    // 3b. (i = QUERY time, j = KEY time)
+    //     kk_dot[i, j] = (K[j, :] · K_beta[i, :]) * decay_mask[i, j]
+    //     for i > j (key time j strictly before query time i).
+    //     lhs   = I + kk_dot  (= I - attn_lower, with attn_lower = -kk_dot)
+    //     rhs   = -kk_dot     (= ggml's `attn_pre_solve`)
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             if (i > j) {
                 float s = 0.0f;
                 for (int d = 0; d < k_hd; d++) {
-                    s += k_in[i * k_hd + d] * k_beta[j * k_hd + d];
+                    s += k_in[j * k_hd + d] * k_beta[i * k_hd + d];
                 }
                 kk_dot[i * N + j] = s * decay_mask[i * N + j];
-                lhs[i * N + j]    = kk_dot[i * N + j];     // I + (-attn_lower) = I + kk_dot
-                // also the matrix passed as RHS to solve_tri is -attn_lower's
-                // strict-lower part, which equals kk_dot here. ggml's attn
-                // before solve is -(kk_dot * decay * causal); since we
-                // already include decay and causal_lower above, the RHS
-                // matrix's strict-lower part IS kk_dot. Upper part is 0.
+                lhs[i * N + j]    = kk_dot[i * N + j];     // I + kk_dot below diag
             } else if (i == j) {
                 kk_dot[i * N + j] = 0.0f;
-                lhs[i * N + j]    = 1.0f;
+                lhs[i * N + j]    = 1.0f;                  // diag of I
             } else {
                 kk_dot[i * N + j] = 0.0f;
                 lhs[i * N + j]    = 0.0f;
             }
         }
     }
-    // 3c. SOLVE_TRI(lhs, kk_dot, lower=1, unit=1) -> in-place into attn,
-    //     then add identity on the diagonal so attn = lin_solve + I.
-    //     The strict-lower part of attn after solve is the "within-chunk
-    //     attention coefficient" between tokens i and j with j < i.
-    solve_tri_lower_unit_f32(N, lhs, kk_dot, attn);
+    // 3c. SOLVE_TRI(lhs, -kk_dot, lower=1, unit=1) -> attn, then add I.
+    //     ggml's RHS to solve_tri is `attn_pre_solve = -k_decay*causal_mask`,
+    //     i.e. the NEGATION of kk_dot's strict-lower part. We build a
+    //     fresh negated buffer in attn (reusing it as scratch) and
+    //     run forward substitution.
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            attn[i * N + j] = -kk_dot[i * N + j];   // negate; upper stays 0
+        }
+    }
+    {
+        // Reuse v_eff temporarily as the SOLVE_TRI output buffer to
+        // avoid an alias between rhs (= attn) and X (= attn). After
+        // the solve we copy back to attn and add identity.
+        solve_tri_lower_unit_f32(N, lhs, attn, v_eff);
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                attn[i * N + j] = v_eff[i * N + j];
+            }
+        }
+    }
     for (int i = 0; i < N; i++) {
         attn[i * N + i] = 1.0f;                            // add identity on diag
         for (int j = i + 1; j < N; j++) {
             attn[i * N + j] = 0.0f;                        // mask upper (causal)
         }
     }
-    // 4. v_eff = attn^T @ v_beta    (shape [N, v_hd])
-    //    v_eff[t, e] = sum_s attn[s, t] * v_beta[s, e]
-    for (int t = 0; t < N; t++) {
+    // 4. v_eff[i, e] = sum_j attn[i, j] * v_beta[j, e]
+    //    (i = query time, j = key time; attn[i, j] nonzero for j <= i)
+    for (int i = 0; i < N; i++) {
         for (int e = 0; e < v_hd; e++) {
             float s = 0.0f;
-            for (int u = 0; u < N; u++) {
-                s += attn[u * N + t] * v_beta[u * v_hd + e];
+            for (int j = 0; j < N; j++) {
+                s += attn[i * N + j] * v_beta[j * v_hd + e];
             }
-            v_eff[t * v_hd + e] = s;
+            v_eff[i * v_hd + e] = s;
         }
     }
     // 5b. kbeta_gexp[t, d] = k_beta[t, d] * gexp[t]
@@ -305,17 +323,15 @@ static void chunked_ssm_step_f32(int k_hd, int v_hd,
             k_cumdecay[t * k_hd + d] = s;
         }
     }
-    // 5d. attn_kq[i, j] = (K[i, :] · Q[j, :]) * decay_mask[i, j]  (causal i>=j only)
-    //     For i == j: decay_mask was zeroed on the diagonal at step 2,
-    //     so substitute 1.0 (= exp(0)) explicitly.
-    // KNOWN INCORRECT for multi-token: K/Q index roles swapped vs
-    // ggml. See the kk_dot block above for the fix.
+    // 5d. attn_kq[i, j] = (K[j, :] · Q[i, :]) * decay_mask[i, j]
+    //     i = query time, j = key time; nonzero for j <= i.
+    //     decay_mask[i, j] is 0 on diag per step 2; use 1 (= exp 0).
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             if (i >= j) {
                 float s = 0.0f;
                 for (int d = 0; d < k_hd; d++) {
-                    s += k_in[i * k_hd + d] * q[j * k_hd + d];
+                    s += k_in[j * k_hd + d] * q[i * k_hd + d];
                 }
                 float dm = (i == j) ? 1.0f : decay_mask[i * N + j];
                 attn_kq[i * N + j] = s * dm;

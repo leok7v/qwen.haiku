@@ -2786,12 +2786,12 @@ int  llm_bos_id    (const struct llm_ctx * c) { return c->cfg.bos_id; }
 // drift. A larger discrepancy means our chunked port is wrong.
 #define CHUNKED_TEST_KHD 128
 #define CHUNKED_TEST_VHD 128
-// N=1 passes (chunked degenerates to autoregressive for one real
-// token; see degeneracy proof in chunked.c). N>1 currently FAILS
-// because chunked.c has the (key, query) index roles swapped vs
-// ggml's convention plus a missing sign flip on the RHS to
-// solve_tri - documented in chunked.c step 3b. Next-session work.
-#define CHUNKED_TEST_NTOK 1
+// N=8 validates the chunked recurrence against an autoregressive
+// reference implementation. Both should agree to within fp32
+// accumulation noise (sub-1e-5 relative). The chunked path uses
+// matmul-style reductions across all N tokens at once; the
+// autoregressive ref applies the per-token recurrence step-by-step.
+#define CHUNKED_TEST_NTOK 8
 
 // Run the autoregressive recurrence (qwen3-next gated delta net) for
 // `n` tokens in sequence, single head. Mirrors llm_forward_ssm step 9
