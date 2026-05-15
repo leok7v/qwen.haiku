@@ -831,22 +831,20 @@ struct tensor * tensor_matmul_q4k_f32(const q4k_block * w_blocks,
     int64_t n          = x->ne[1];
     int64_t nb_per_row = k / QK_K;
     struct tensor * out = tensor_new_2d(x->arena, out_f, n);
-    // Per-call Q8_K activation buffer. Arena-allocated rather than
-    // stack so the dispatch_apply block can refer to it via pointer
-    // (clang forbids array references inside blocks).
     q8k_block * xq8 = (q8k_block *)arena_alloc(
         x->arena, (size_t)nb_per_row * sizeof(q8k_block));
     for (int64_t t = 0; t < n; t++) {
         quantize_row_q8_K(x->data + t * k, xq8, k);
         float * or_ = out->data + t * out_f;
+        // Row-level Q4_K dot - single fp32 accumulator across all
+        // super-blocks of the row, matching ggml's nrc=1 NEON path
+        // exactly. The previous per-block-then-outer-sum pattern was
+        // mathematically equivalent but rounded differently, producing
+        // 1 ULP drift on some weight matrices (visible at attn_gate).
         dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
             int64_t j = (int64_t)jj;
             const q4k_block * row = w_blocks + j * nb_per_row;
-            float acc = 0.0f;
-            for (int64_t b = 0; b < nb_per_row; b++) {
-                acc += q4k_dot_q8k_neon(row + b, xq8 + b);
-            }
-            or_[j] = acc;
+            or_[j] = q4k_row_dot_q8k_neon((int)nb_per_row, row, xq8);
         });
     }
     return out;
@@ -912,11 +910,7 @@ struct tensor * tensor_matmul_q5k_f32(const q5k_block * w_blocks,
         dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
             int64_t j = (int64_t)jj;
             const q5k_block * row = w_blocks + j * nb_per_row;
-            float acc = 0.0f;
-            for (int64_t b = 0; b < nb_per_row; b++) {
-                acc += q5k_dot_q8k_neon(row + b, xq8 + b);
-            }
-            or_[j] = acc;
+            or_[j] = q5k_row_dot_q8k_neon((int)nb_per_row, row, xq8);
         });
     }
     return out;
@@ -999,11 +993,7 @@ struct tensor * tensor_matmul_q6k_f32(const q6k_block * w_blocks,
         dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
             int64_t j = (int64_t)jj;
             const q6k_block * row = w_blocks + j * nb_per_row;
-            float acc = 0.0f;
-            for (int64_t b = 0; b < nb_per_row; b++) {
-                acc += q6k_dot_q8k_neon(row + b, xq8 + b);
-            }
-            or_[j] = acc;
+            or_[j] = q6k_row_dot_q8k_neon((int)nb_per_row, row, xq8);
         });
     }
     return out;
