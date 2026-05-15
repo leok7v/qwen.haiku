@@ -3012,17 +3012,6 @@ static inline float rng_uniform(struct rng * r) {
     return (float)(rng_next(r) >> 40) / (float)(1u << 24);
 }
 
-struct llm_sampler llm_sampler_default(void) {
-    struct llm_sampler s;
-    s.temperature        = 1.0f;
-    s.top_k              = 20;
-    s.top_p              = 0.95f;
-    s.min_p              = 0.0f;
-    s.repetition_penalty = 1.05f;
-    s.repetition_window  = 64;
-    return s;
-}
-
 // Sampler chain order (sample_with below): penalties -> temperature
 // (softmax-with-T on top-K logits) -> top-P -> min-P -> distribution.
 // Matches im.ai's `Sampler.swift` ordering (see comment block at
@@ -3307,12 +3296,10 @@ char * llm_chat_format(const struct llm_chat_message * messages,
     return result;
 }
 
-char * llm_chat_format_delta(const char * user_message,
-                             const char * system_prefix,
-                             int enable_thinking) {
-    return jinja_apply_delta(user_message, system_prefix,
-                             enable_thinking);
-}
+// llm_chat_format_delta is defined further down — its full body
+// needs the AGENT_TOOL_* tool-spec JSON strings (declared in
+// agent.c), so the definition lives below the `#include "agent.c"`
+// site. See the matching block right after the agent.c include.
 
 // File-internal token-stream callback. llm_generate_raw emits one
 // utf8 piece per generated token to this; the public llm_generate
@@ -4203,6 +4190,55 @@ static int32_t chunked_self_test(void) {
 // are in scope by this point.
 #include "agent.c"
 
+// Public delta-format helper: produces the bytes the C runner
+// tokenizes for one new user turn given an already-warm KV cache.
+//
+// Behavior depends on `system_prefix`:
+//
+//   - First turn (system_prefix non-NULL): emit a FULL system+user
+//     frame including the websearch / fetch / distill tools
+//     advertisement (the Jinja's `# Tools` system block). The model
+//     sees the tools list once and remembers it via the persistent
+//     KV cache.
+//   - Subsequent turns (system_prefix NULL): emit a bare delta —
+//     `<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n
+//     <think>\n\n</think>\n\n`. The model still "knows" about the
+//     tools from turn 1's system frame.
+//
+// Without this, the Swift chat path never advertised tools to the
+// model — the embedded agent loop in llm_generate fires only when
+// the model emits `<tool_call>` markers, which only happens when
+// it's been told tools exist.
+char * llm_chat_format_delta(const char * user_message,
+                             const char * system_prefix,
+                             int enable_thinking) {
+    char * result = NULL;
+    if (user_message != NULL) {
+        if (system_prefix != NULL && system_prefix[0] != '\0') {
+            // First turn: full frame with tool advertisements.
+            struct jinja_message msgs[2];
+            memset(msgs, 0, sizeof(msgs));
+            msgs[0].role    = JINJA_ROLE_SYSTEM;
+            msgs[0].content = system_prefix;
+            msgs[1].role    = JINJA_ROLE_USER;
+            msgs[1].content = user_message;
+            struct jinja_tool tools[3] = {
+                { AGENT_TOOL_WEBSEARCH },
+                { AGENT_TOOL_FETCH },
+                { AGENT_TOOL_DISTILL },
+            };
+            result = jinja_apply(msgs, 2, tools, 3,
+                                 /*add_gen=*/1,
+                                 enable_thinking);
+        } else {
+            // Subsequent turn: bare delta (KV holds the tools).
+            result = jinja_apply_delta(user_message, NULL,
+                                       enable_thinking);
+        }
+    }
+    return result;
+}
+
 // Public llm_generate. The think + tool-call stream filter (set up
 // via llm_split_box / llm_split_trampoline above) routes the
 // model's bytes through llm_stream_cb. A completed
@@ -4803,10 +4839,11 @@ int main(int argc, char ** argv) {
     const char * system_prompt   = NULL;
     const char * chat_prompts[LLM_CLI_MAX_TURNS];
     int32_t      chat_n          = 0;
-    struct llm_sampler sp = {0};        // greedy by default
-    sp.top_k              = 40;
-    sp.repetition_penalty = 1.0f;
-    sp.repetition_window  = 64;
+    // Hardcoded sampler default: im.ai's chat-tuned profile
+    // (temp 0.7, top_k 40, top_p 0.9, min_p 0.05, rep 1.25, win 64).
+    // Empirically the best fit for Qwen3.5-0.8B in chat + tools mode.
+    // Individual flags below can override any field.
+    struct llm_sampler sp = llm_sampler_im_ai();
     uint64_t seed         = 0;          // 0 = derive from wall clock
     int32_t  max_new      = 64;
     int32_t  max_iters    = 4;          // agent-loop cap (--ask)
@@ -4851,21 +4888,6 @@ int main(int argc, char ** argv) {
         } else if ((strcmp(argv[i], "-sys") == 0 ||
                     strcmp(argv[i], "--system") == 0) && i + 1 < argc) {
             system_prompt = argv[++i];
-        } else if (strcmp(argv[i], "--preset") == 0 && i + 1 < argc) {
-            const char * pn = argv[++i];
-            if (strcmp(pn, "default") == 0) {
-                sp = llm_sampler_default();
-            } else if (strcmp(pn, "im_ai") == 0 || strcmp(pn, "im-ai") == 0) {
-                sp = llm_sampler_im_ai();
-            } else if (strcmp(pn, "greedy") == 0) {
-                memset(&sp, 0, sizeof(sp));
-                sp.repetition_penalty = 1.0f;
-                sp.repetition_window  = 64;
-            } else {
-                fprintf(stderr,
-                        "llm: unknown --preset '%s'"
-                        " (default|im_ai|greedy)\n", pn);
-            }
         } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
             sp.temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
@@ -4952,7 +4974,6 @@ int main(int argc, char ** argv) {
                "  llm --print-chat-template\n"
                "\n"
                "sampler flags:\n"
-               "  --preset {default|im_ai|greedy}   load named preset\n"
                "  --temperature T                   0 = greedy, >0 = softmax T\n"
                "  --top-k K                         keep K best logits\n"
                "  --top-p P                         nucleus cutoff in (0,1)\n"

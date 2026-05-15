@@ -78,8 +78,8 @@ int llm_tokenize(struct llm_ctx * ctx, const char * text,
 
 // Sampler parameters. Mirrors llama.cpp's `common_params_sampling`
 // for the subset we care about. Zero-initialized struct = greedy
-// (argmax), no filters, no penalty. See `llm_sampler_default` for a
-// chat-friendly preset.
+// (argmax), no filters, no penalty. See `llm_sampler_im_ai` for the
+// chat-tuned preset that the CLI / agent surface uses by default.
 struct llm_sampler {
     float    temperature;        // 0 = greedy; >0 = softmax temperature
     int      top_k;              // 0 or 1 = greedy; >1 = keep top k
@@ -95,14 +95,10 @@ struct llm_sampler {
                                  // far; >0 = only the last N.
 };
 
-// Chat preset: T=1.0, top_k=20, top_p=0.95, min_p=0, rep=1.05, win=64.
-// Roughly matches Qwen3.5 non-thinking recommended sampling.
-struct llm_sampler llm_sampler_default(void);
-
-// im.ai conversational preset: T=0.7, top_k=40, top_p=0.9, min_p=0.05,
-// rep=1.25, win=64. Values lifted from im.ai's Sampler.swift defaults
-// (well-tuned for back-and-forth chat — tighter filters and stronger
-// repetition penalty than the Qwen3.5 card's recommendation).
+// Default chat sampler: T=0.7, top_k=40, top_p=0.9, min_p=0.05,
+// rep=1.25, win=64. Lifted from im.ai's Sampler.swift defaults —
+// empirically the best fit for Qwen3.5-0.8B in chat + tools mode.
+// The CLI hardcodes this; callers can override individual fields.
 struct llm_sampler llm_sampler_im_ai(void);
 
 // ---------------------------------------------------------------------------
