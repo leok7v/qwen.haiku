@@ -135,7 +135,100 @@ revisit once Phase A-C are landed.
   term: ship a known-good SHA256 in code, verify after download,
   refuse to load mismatches.
 
+## Parity log: BIT-IDENTICAL with llama.cpp (2026-05-15)
+
+**Result**: 20/20 layer-0 checkpoints and `result_output` (the final
+logits) match llama.cpp **byte-for-byte** for greedy "Hello"
+single-token prefill on Qwen3.5-0.8B-Q4_K_M.
+
+Verified two ways:
+
+| llama.cpp build           | fnv64(result_output)        |
+|---------------------------|-----------------------------|
+| default (Accelerate)      | `5a2e0989fe3afd0e`          |
+| `-DGGML_ACCELERATE=OFF`   | `2f490c9b438ec280`          |
+
+Our default build (no Accelerate link) matches `2f490c9b438ec280`.
+Compile with `-DLLM_USE_ACCELERATE -framework Accelerate` and we
+match `5a2e0989fe3afd0e` instead. Both are bit-perfect parity.
+
+What it took (see `tools/qwen-haiku/` diagnostic dumper in the
+companion ggml-org/llama.cpp tree for the JSONL traces this work
+gated against):
+
+1. **NEON-poly `expf` + `silu`** ported verbatim from
+   `ggml/src/ggml-cpu/vec.h` into `llm/neon.c`. Closes conv-silu
+   drift inside the SSM block; also wired into FFN SwiGLU.
+2. **Q8_0 NEON int8 dot** added to `neon.c` plus a Q8_0
+   activation quantiser. The previous scalar `int8 × fp32`
+   product for `ssm_alpha` / `ssm_beta` was off by ~100 ULPs.
+3. **L2-norm accumulator** rewritten to `sum += (double)(q * q)`
+   (square in fp32, then cast to fp64) plus
+   `1.0f / fmaxf(sqrtf(sum), eps)` instead of
+   `1.0f / sqrtf(sum + eps)`. Matches `ggml_l2_norm`.
+4. **`tensor_rms_norm` accumulator** same shape (matches ggml's
+   `ggml_compute_forward_rms_norm_f32`).
+5. **Gated RMS norm + z-SiLU** in SSM step 10: split into three
+   separate write-back loops so clang can't contract into a single
+   FMA. Mirrors ggml's RMS_NORM + MUL + MUL pipeline exactly.
+6. **Row-level Q4_K / Q5_K / Q6_K NEON dots** carrying ONE fp32
+   `sumf` across all super-blocks of a row, exactly matching
+   ggml's `ggml_vec_dot_qN_K_q8_K` nrc=1 path. The prior per-block
+   kernel reset `sumf=0` per block and returned a scalar; the outer
+   matmul loop accumulated those returns. Mathematically equivalent
+   but the fp32 re-parenthesisation drifted by 1 ULP for some
+   weight values (visible at `attn_gate`, hidden on `attn_qkv` -
+   same kernel, just different weights).
+7. **SSM recurrent reductions** (steps 9.2 / 9.5) use a fp64
+   accumulator by default (matching ggml's non-Accelerate
+   `ggml_vec_sum_f32`); under `LLM_USE_ACCELERATE` they materialise
+   k-contiguous products and call `vDSP_sve` (matching ggml's
+   Accelerate-on `ggml_vec_sum_f32`).
+
+The `tools/qwen-haiku/` source in the companion llama.cpp tree
+contains the diagnostic dumper that this work was gated against; it
+emits every ggml node's bytes to JSONL via
+`ggml_backend_sched_eval_callback`. Our matching trace points are
+guarded by `QH_TRACE_OUT=...` in `llm.c`.
+
+## Phase 2 next: chunked-SSM rewrite for batched prefill
+
+Currently `llm_generate` prefills the prompt by calling
+`llm_forward_step` **once per token** (autoregressive). llama.cpp
+batches the whole prompt through `build_delta_net_chunking` in
+one graph - on a 100-token prompt that is ~10× faster on CPU than
+the sequential recurrent path.
+
+This is a **performance** goal, not a parity goal: the autoregressive
+path is bit-identical with llama.cpp's autoregressive path
+(verified). Chunked output is also bit-identical (between
+ggml-vs-ggml) but different from autoregressive output by a few
+ULPs, so chunked-us must be measured against chunked-llama.cpp.
+
+Scope:
+- New batched API: `llm_prefill_batch(c, tok_ids, n, pos)` writes
+  KV cache for all tokens at once, returns nothing (we only need
+  the LAST token's logits for the first sample).
+- Port `ggml_solve_tri` (~50 LOC, forward substitution on a lower
+  triangular system, fp32) - the only "new" ops needed.
+- Re-implement `build_delta_net_chunking`'s 80-LOC loop body:
+  per-chunk `q_g_exp · state → attn_inter`, `v_new = v - state·k_cumdecay`,
+  `attn @ v_new → v_attn`, `out_chunk = attn_inter + v_attn`,
+  state update `state = state · g_last + key_gdiff^T · v_new`.
+  Chunk size is 64 per the qwen3-next config.
+- Trace tooling change: dump per-batch instead of per-token, so
+  the chunked path can be diffed against `build_delta_net_chunking`.
+
+Bit-parity gate: compare `cache_s_l0..l23` (the SSM state cache
+view after prefill) against llama.cpp's `new_state-N` per layer
+once the batched prefill finishes. Same prompt, same batch size.
+
+Estimated effort: 400-600 LOC, multi-session.
+
 ## Investigation log: greedy parity vs llama.cpp (2026-05-14)
+
+> Outcome: superseded by the 2026-05-15 parity work above.
+> Kept for historical context.
 
 `tools/parity.sh` runs our `./Build/cli/llm --temperature 0` vs
 `llama-completion --temp 0 -ngl 0 -st -no-cnv` on the same four
