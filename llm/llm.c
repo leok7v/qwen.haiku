@@ -600,7 +600,17 @@ static int32_t llm_load_config(const struct gguf * g, struct llm_config * c) {
     c->n_heads      = KV_U32("attention.head_count",            0);
     c->n_kv_heads   = KV_U32("attention.head_count_kv",   (uint32_t)c->n_heads);
     c->ffn_dim      = KV_U32("feed_forward_length",             0);
-    c->max_position = KV_U32("context_length",               2048);
+    // qwen35's nominal context_length is 262144 but the KV cache is
+    // sized linearly to it (k + v, fp16, per kv-head per layer). At
+    // the full 262144 that's 12 GB of committed virtual memory — fine
+    // on macOS where zero-fill-on-demand keeps RSS low, lethal on iOS
+    // where jetsam counts the virtual commit. Cap at 4096 by default;
+    // power users can raise via QWEN_MAX_POS env var.
+    int32_t cl = KV_U32("context_length", 2048);
+    const char * cap_env = getenv("QWEN_MAX_POS");
+    int32_t cap = (cap_env != NULL && atoi(cap_env) > 0) ? atoi(cap_env)
+                                                         : 4096;
+    c->max_position = (cl < cap) ? cl : cap;
     c->rope_theta   = KV_F32("rope.freq_base",            10000.0f);
     c->norm_eps     = KV_F32("attention.layer_norm_rms_epsilon", 1e-5f);
     int32_t kl      = KV_U32("attention.key_length", 0);
@@ -1475,6 +1485,133 @@ static int g_min_new      = 0;
         } \
     } while (0)
 
+// ---------------------------------------------------------------------------
+// qh_trace: machine-comparable per-tensor JSONL dump, enabled when the
+// QH_TRACE_OUT env var is set to a writable path. The schema matches
+// what llama.cpp/tools/qwen-haiku/llama-qwen-haiku emits, so a side-by-side
+// proofdiff of the two files reveals the first divergence on a fixed
+// prompt + greedy run. Disabled at runtime when the file pointer is
+// NULL - the qh_trace_f32 call sites then degenerate to a single
+// pointer comparison.
+//
+// Emitted fields per line:
+//   name, op, type=f32, ne[4], nb[4] (synthetic dense-row strides),
+//   nbytes, fnv64 (raw byte hash for binary equality), head/head_hex,
+//   tail/tail_hex (first/last up-to-8 floats as both %.9g and as raw
+//   fp32 hex bits), sum (drift-sensitive single scalar), n_nan, n_inf.
+// ---------------------------------------------------------------------------
+
+static FILE * g_qh_trace_fp = NULL;
+
+static void qh_trace_open(void) {
+    if (g_qh_trace_fp == NULL) {
+        const char * p = getenv("QH_TRACE_OUT");
+        if (p != NULL && p[0] != '\0') {
+            g_qh_trace_fp = fopen(p, "w");
+            if (g_qh_trace_fp != NULL) {
+                fprintf(stderr, "qh_trace: writing JSONL to %s\n", p);
+            }
+        }
+    }
+}
+
+static void qh_trace_close(void) {
+    if (g_qh_trace_fp != NULL) {
+        fclose(g_qh_trace_fp);
+        g_qh_trace_fp = NULL;
+    }
+}
+
+// FNV-1a 64-bit over raw bytes. Stable across runs and across
+// implementations; identical bytes -> identical hash. We do NOT need
+// cryptographic strength, just "did the bytes match?" - collision
+// probability for typical tensor sizes is negligible.
+static uint64_t qh_fnv1a64(const uint8_t * data, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint64_t)data[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static void qh_emit_floats(FILE * f, const char * key,
+                           const float * v, int n) {
+    fprintf(f, ",\"%s\":[", key);
+    for (int i = 0; i < n; i++) {
+        if (i > 0) { fputc(',', f); }
+        if (isnan(v[i])) {
+            fputs("\"nan\"", f);
+        } else if (isinf(v[i])) {
+            fputs(v[i] < 0.0f ? "\"-inf\"" : "\"inf\"", f);
+        } else {
+            fprintf(f, "%.9g", v[i]);
+        }
+    }
+    fputs("]", f);
+    fprintf(f, ",\"%s_hex\":[", key);
+    for (int i = 0; i < n; i++) {
+        if (i > 0) { fputc(',', f); }
+        uint32_t u;
+        memcpy(&u, &v[i], 4);
+        fprintf(f, "\"%08x\"", u);
+    }
+    fputs("]", f);
+}
+
+static void qh_trace_f32(const char * name, const char * op,
+                         const float * data,
+                         int64_t ne0, int64_t ne1,
+                         int64_t ne2, int64_t ne3) {
+    FILE *  f = g_qh_trace_fp;
+    int64_t n = ne0 * ne1 * ne2 * ne3;
+    if (f != NULL && n > 0) {
+        size_t   nbytes = (size_t)n * sizeof(float);
+        uint64_t fnv    = qh_fnv1a64((const uint8_t *)data, nbytes);
+        int64_t  k      = n < 8 ? n : 8;
+        int64_t  tstart = n - k > 0 ? n - k : 0;
+        float    head[8] = {0,0,0,0,0,0,0,0};
+        float    tail[8] = {0,0,0,0,0,0,0,0};
+        for (int64_t i = 0; i < k; i++) { head[i] = data[i];          }
+        for (int64_t i = 0; i < k; i++) { tail[i] = data[tstart + i]; }
+        float sum   = 0.0f;
+        int   n_nan = 0;
+        int   n_inf = 0;
+        for (int64_t i = 0; i < n; i++) {
+            float v = data[i];
+            if (isnan(v))      { n_nan++; }
+            else if (isinf(v)) { n_inf++; }
+            else               { sum += v; }
+        }
+        // Synthetic dense-row strides: nb[0]=4, then ne0*4, ne0*ne1*4,
+        // ne0*ne1*ne2*4. This matches what llama.cpp emits for
+        // contiguous fp32 tensors.
+        int64_t nb1 = ne0 * 4;
+        int64_t nb2 = ne0 * ne1 * 4;
+        int64_t nb3 = ne0 * ne1 * ne2 * 4;
+        fprintf(f,
+                "{\"name\":\"%s\",\"op\":\"%s\",\"type\":\"f32\","
+                "\"ne\":[%lld,%lld,%lld,%lld],"
+                "\"nb\":[4,%lld,%lld,%lld],"
+                "\"nbytes\":%zu,\"fnv64\":\"%016llx\"",
+                name, op,
+                (long long)ne0, (long long)ne1,
+                (long long)ne2, (long long)ne3,
+                (long long)nb1, (long long)nb2, (long long)nb3,
+                nbytes, (unsigned long long)fnv);
+        qh_emit_floats(f, "head", head, (int)k);
+        qh_emit_floats(f, "tail", tail, (int)k);
+        fprintf(f, ",\"sum\":%.9g,\"n_nan\":%d,\"n_inf\":%d}\n",
+                sum, n_nan, n_inf);
+    }
+}
+
+// Convenience: trace a 1D row of n fp32 values.
+static inline void qh_trace_row(const char * name, const char * op,
+                                const float * data, int64_t n) {
+    qh_trace_f32(name, op, data, n, 1, 1, 1);
+}
+
 static void llm_dump_row(const char * label, const float * data, int32_t n) {
     // Mirror llama-eval-callback's format: head + tail + sum. The
     // sum across the whole tensor is the cheapest single number that
@@ -1576,9 +1713,19 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     struct tensor * h_norm =
         tensor_rms_norm(h, &attn_norm_w, c->cfg.norm_eps);
     DUMP("attn_norm", h_norm->data, c->cfg.hidden_dim);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
+        qh_trace_row(nm, "RMS_NORM", h_norm->data, c->cfg.hidden_dim);
+    }
     // 2. In-projections.
     struct tensor * qkv_pre = matmul_dispatch(&Lw->attn_qkv,  h_norm);
     DUMP("attn_qkv ", qkv_pre->data, conv_dim);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "attn_qkv-%d", (int)L);
+        qh_trace_row(nm, "MUL_MAT", qkv_pre->data, conv_dim);
+    }
     struct tensor * z = matmul_dispatch(&Lw->attn_gate, h_norm);
     // GGUF naming ambiguity: ssm_alpha vs ssm_beta - neither the
     // Python code nor the file name documents which is which. The
@@ -1592,6 +1739,13 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     //   ssm_alpha -> a -> softplus -> g_log
     struct tensor * b_t = matmul_dispatch(&Lw->ssm_beta,  h_norm);
     struct tensor * a_t = matmul_dispatch(&Lw->ssm_alpha, h_norm);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "alpha-%d", (int)L);
+        qh_trace_row(nm, "MUL_MAT", a_t->data, n_heads);
+        snprintf(nm, sizeof(nm), "beta-%d", (int)L);
+        qh_trace_row(nm, "MUL_MAT", b_t->data, n_heads);
+    }
     // shapes: qkv_pre(conv_dim,1), z(V_dim,1), b_t(n_heads,1), a_t(n_heads,1).
     // 3. Shift conv state ring; write qkv_pre into the new slot.
     {
@@ -1613,6 +1767,10 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     const float * conv_w = (const float *)Lw->ssm_conv1d.data;
     struct tensor * mixed = tensor_new_2d(a, conv_dim, 1);
     size_t conv_lane_base = (size_t)L * kK * conv_dim;
+    // Conv pass: write raw conv output into mixed->data so we can
+    // trace it before the SiLU activation. Splitting conv from silu
+    // does not change the conv kernel's bit output (acc lives in a
+    // register; we only write the final value).
     for (int32_t ch = 0; ch < conv_dim; ch++) {
         float acc = 0.0f;
         const float * wch = conv_w + (size_t)ch * kK;
@@ -1622,8 +1780,19 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
                                              (size_t)slot * conv_dim + ch];
             acc += v * wch[k];
         }
-        mixed->data[ch] = acc / (1.0f + expf(-acc));
+        mixed->data[ch] = acc;
     }
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "conv_raw-%d", (int)L);
+        qh_trace_row(nm, "CONV1D", mixed->data, conv_dim);
+    }
+    // SiLU using ggml's NEON polynomial-approximation expf; bit-
+    // identical to ggml's GGML_OP_SILU output. The libm scalar form
+    // x / (1 + expf(-x)) differs by 1-2 ULPs and compounds through
+    // 24 layers to visible drift, so we use ggml's vectorized variant
+    // exclusively for parity.
+    neon_silu_vec_f32(conv_dim, mixed->data, mixed->data);
     // 5. Split mixed into Q, K, V. Per the Python reference's
     //    `mixed_qkv = torch.cat((query, key, value), dim=-1)` after
     //    reshape, the FLAT layout in memory is block-concatenated
@@ -1637,8 +1806,28 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     const float * K_flat = mixed->data + K_dim;
     const float * V_flat = mixed->data + 2 * K_dim;
     assert(K_dim == 2048 && V_dim == 2048);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "Q_raw-%d", (int)L);
+        qh_trace_row(nm, "VIEW", Q_flat, K_dim);
+        snprintf(nm, sizeof(nm), "K_raw-%d", (int)L);
+        qh_trace_row(nm, "VIEW", K_flat, K_dim);
+        snprintf(nm, sizeof(nm), "V_raw-%d", (int)L);
+        qh_trace_row(nm, "VIEW", V_flat, V_dim);
+    }
     // 6/7. L2-normalise Q and K per-head along head dim. Then scale
     //      Q by 1/sqrt(k_hd) (the attention temperature).
+    //
+    // Accumulator shape matches ggml_compute_forward_l2_norm_f32:
+    //   sum += (double)(q*q)        -- square in fp32, cast UP to fp64
+    //   scale = 1/fmaxf(sqrtf(sum), eps)
+    // Doing the multiply in fp32 first (then promoting to fp64 for
+    // accumulation) is what ggml does, and gives bit-identical sum;
+    // `(double)q * (double)q` keeps more precision but produces a
+    // different bit result that compounds. eps applied via fmaxf
+    // (not inside sqrt) also matters - same reason. The qwen3-next
+    // l2_norm eps is 1e-6f per the GGUF default.
+    const float l2_eps = 1e-6f;
     float scale = 1.0f / sqrtf((float)k_hd);
     float Q_norm[2048];
     float K_norm[2048];
@@ -1647,15 +1836,22 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
         for (int32_t i = 0; i < k_hd; i++) {
             float q = Q_flat[h2 * k_hd + i];
             float k = K_flat[h2 * k_hd + i];
-            qss += (double)q * (double)q;
-            kss += (double)k * (double)k;
+            qss += (double)(q * q);
+            kss += (double)(k * k);
         }
-        float qrs = 1.0f / sqrtf((float)qss + 1e-6f);
-        float krs = 1.0f / sqrtf((float)kss + 1e-6f);
+        float qrs = 1.0f / fmaxf(sqrtf((float)qss), l2_eps);
+        float krs = 1.0f / fmaxf(sqrtf((float)kss), l2_eps);
         for (int32_t i = 0; i < k_hd; i++) {
             Q_norm[h2 * k_hd + i] = Q_flat[h2 * k_hd + i] * qrs * scale;
             K_norm[h2 * k_hd + i] = K_flat[h2 * k_hd + i] * krs;
         }
+    }
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "Q_l2norm-%d", (int)L);
+        qh_trace_row(nm, "L2_NORM_SCALE", Q_norm, K_dim);
+        snprintf(nm, sizeof(nm), "K_l2norm-%d", (int)L);
+        qh_trace_row(nm, "L2_NORM", K_norm, K_dim);
     }
     // 8. Per-head beta and g.
     //    NOTE: ssm_a in the GGUF is already pre-computed as the
@@ -1667,15 +1863,32 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     //    directly without exponentiating.
     const float * ssm_a_w   = (const float *)Lw->ssm_a.data;
     const float * dt_bias_w = (const float *)Lw->ssm_dt_bias.data;
-    float beta[64], g_t[64];
+    float beta[64], g_t[64], g_log_dbg[64], a_softplus_dbg[64];
     assert(n_heads <= 64);
     for (int32_t h2 = 0; h2 < n_heads; h2++) {
         float bb = b_t->data[h2];
         beta[h2] = 1.0f / (1.0f + expf(-bb));   // sigmoid(b)
         float aa = a_t->data[h2] + dt_bias_w[h2];
         float softplus_a = aa > 20.0f ? aa : logf(1.0f + expf(aa));
+        a_softplus_dbg[h2] = softplus_a;
         float g_log = ssm_a_w[h2] * softplus_a; // already neg-exp
+        g_log_dbg[h2] = g_log;
         g_t[h2] = expf(g_log);
+    }
+    {
+        // Trace names match the equivalent llama.cpp ggml node names
+        // for layer 0 of qwen3-next; see tools/qwen-haiku trace map.
+        char nm[48];
+        snprintf(nm, sizeof(nm), "beta_in-%d", (int)L);
+        qh_trace_row(nm, "SIGMOID", beta, n_heads);
+        snprintf(nm, sizeof(nm), "a_softplus-%d", (int)L);
+        qh_trace_row(nm, "SOFTPLUS", a_softplus_dbg, n_heads);
+        // llama's `g_in-0` is the PRE-EXP g_log value (ssm_a * softplus_a),
+        // not the post-exp g. Trace g_log here so byte-equality is direct;
+        // g_t = expf(g_log) is the local intermediate we feed into the
+        // recurrent state update below.
+        snprintf(nm, sizeof(nm), "g_in-%d", (int)L);
+        qh_trace_row(nm, "MUL", g_log_dbg, n_heads);
     }
     // 9. Recurrent state update per head.
     //    state[L, h, k, v] flat as ssm_state[((L*n_heads + h)*k_hd + k)*v_hd + v]
@@ -1723,6 +1936,15 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
             out_flat[h2 * v_hd + v] = acc;
         }
     }
+    {
+        // Recurrent-state output - matches llama's attn_output-0
+        // shape (V_dim contiguous, head-major). Trace before any
+        // gating / norm so we can pinpoint divergence in the
+        // recurrent update separately from the gated rmsnorm.
+        char nm[48];
+        snprintf(nm, sizeof(nm), "attn_output-%d", (int)L);
+        qh_trace_row(nm, "RECURRENT", out_flat, V_dim);
+    }
     // 10. Gated RMSNorm with z (per head, v_hd wide):
     //       y[h, :] = silu(z[h, :]) * (norm_w * rmsnorm(out[h, :]))
     //     Implementation per Qwen3NextRMSNormGated: variance over
@@ -1746,9 +1968,21 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
     }
     DUMP("conv_silu", mixed->data, conv_dim);
     DUMP("y_norm   ", y_norm->data, V_dim);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "conv_silu-%d", (int)L);
+        qh_trace_row(nm, "SILU", mixed->data, conv_dim);
+        snprintf(nm, sizeof(nm), "y_norm-%d", (int)L);
+        qh_trace_row(nm, "RMS_NORM_GATED", y_norm->data, V_dim);
+    }
     // 11. Output projection V_dim -> hidden.
     struct tensor * out_t = matmul_dispatch(&Lw->ssm_out, y_norm);
     DUMP("ssm_out  ", out_t->data, c->cfg.hidden_dim);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "ssm_out-%d", (int)L);
+        qh_trace_row(nm, "MUL_MAT", out_t->data, c->cfg.hidden_dim);
+    }
     return out_t;
 }
 
@@ -1774,6 +2008,11 @@ static struct tensor * llm_forward_attn(struct llm_ctx * c,
     struct tensor * h_norm =
         tensor_rms_norm(h, &attn_norm_w, c->cfg.norm_eps);
     DUMP("[A]attn_nm", h_norm->data, c->cfg.hidden_dim);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
+        qh_trace_row(nm, "RMS_NORM", h_norm->data, c->cfg.hidden_dim);
+    }
     // Q / K / V projections. Qwen3.5 has attn_output_gate=true: the
     // Q projection emits n_heads*head_dim*2, split into (Q, gate).
     // The gate is sigmoid'd and multiplied with the attention output
@@ -1782,6 +2021,15 @@ static struct tensor * llm_forward_attn(struct llm_ctx * c,
     struct tensor * q_raw = matmul_dispatch(&Lw->attn_q, h_norm);
     struct tensor * k     = matmul_dispatch(&Lw->attn_k, h_norm);
     struct tensor * v     = matmul_dispatch(&Lw->attn_v, h_norm);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "Qfull-%d", (int)L);
+        qh_trace_row(nm, "MUL_MAT", q_raw->data, attn_inner * 2);
+        snprintf(nm, sizeof(nm), "Kcur-%d", (int)L);
+        qh_trace_row(nm, "MUL_MAT", k->data, kv_hidden);
+        snprintf(nm, sizeof(nm), "Vcur-%d", (int)L);
+        qh_trace_row(nm, "MUL_MAT", v->data, kv_hidden);
+    }
     if (c->dump_layer == L) {
         llm_dump_row("[A]Qfull  ", q_raw->data, attn_inner * 2);
         llm_dump_row("[A]Kcur   ", k->data, n_kvh * hd);
@@ -1929,7 +2177,14 @@ static struct tensor * llm_forward_attn(struct llm_ctx * c,
         DUMP("[A]gated  ", ctx_t->data, attn_inner);
     }
     // Output projection.
-    return matmul_dispatch(&Lw->attn_out, ctx_t);
+    struct tensor * attn_out_t = matmul_dispatch(&Lw->attn_out, ctx_t);
+    {
+        char nm[48];
+        snprintf(nm, sizeof(nm), "attn_out-%d", (int)L);
+        qh_trace_row(nm, "MUL_MAT",
+                     attn_out_t->data, c->cfg.hidden_dim);
+    }
+    return attn_out_t;
 }
 
 static struct tensor * llm_forward_step(struct llm_ctx * c,
@@ -1967,6 +2222,7 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
         }
     }
     // h shape: (hidden_dim, 1)
+    qh_trace_row("inp_embd", "GET_ROWS", h->data, c->cfg.hidden_dim);
 
     for (int32_t L = 0; L < c->cfg.n_layers; L++) {
         struct llm_layer_w * Lw = &c->W.layers[L];
@@ -1976,23 +2232,51 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
         } else {
             mix = llm_forward_attn(c, L, pos, h);
         }
+        {
+            char nm[48];
+            snprintf(nm, sizeof(nm), "mix-%d", (int)L);
+            qh_trace_row(nm, Lw->is_ssm ? "SSM" : "ATTN",
+                         mix->data, c->cfg.hidden_dim);
+        }
         h = tensor_add(h, mix);
 
         // FFN: SwiGLU (shared by attention and SSM layers).
         DUMP("[F]residual", h->data, c->cfg.hidden_dim);
+        {
+            char nm[48];
+            snprintf(nm, sizeof(nm), "mix_residual-%d", (int)L);
+            qh_trace_row(nm, "ADD", h->data, c->cfg.hidden_dim);
+        }
         struct tensor ffn_norm_w =
             weights_as_f32_view(&Lw->ffn_norm, a);
         struct tensor * h_ffn_norm =
             tensor_rms_norm(h, &ffn_norm_w, c->cfg.norm_eps);
         DUMP("[F]post_atn", h_ffn_norm->data, c->cfg.hidden_dim);
+        {
+            char nm[48];
+            snprintf(nm, sizeof(nm), "ffn_norm-%d", (int)L);
+            qh_trace_row(nm, "RMS_NORM",
+                         h_ffn_norm->data, c->cfg.hidden_dim);
+        }
         struct tensor * gate     = matmul_dispatch(&Lw->ffn_gate, h_ffn_norm);
         struct tensor * up       = matmul_dispatch(&Lw->ffn_up,   h_ffn_norm);
         struct tensor * gate_act = tensor_silu(gate);
         struct tensor * ffn_in   = tensor_mul(gate_act, up);
         struct tensor * ffn_out  = matmul_dispatch(&Lw->ffn_down, ffn_in);
         DUMP("[F]ffn_out ", ffn_out->data, c->cfg.hidden_dim);
+        {
+            char nm[48];
+            snprintf(nm, sizeof(nm), "ffn_out-%d", (int)L);
+            qh_trace_row(nm, "MUL_MAT",
+                         ffn_out->data, c->cfg.hidden_dim);
+        }
         h = tensor_add(h, ffn_out);
         DUMP("[F]post_ffn", h->data, c->cfg.hidden_dim);
+        {
+            char nm[48];
+            snprintf(nm, sizeof(nm), "l_out-%d", (int)L);
+            qh_trace_row(nm, "ADD", h->data, c->cfg.hidden_dim);
+        }
     }
 
     // 12. Final RMSNorm + lm_head.
@@ -2000,7 +2284,11 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
         weights_as_f32_view(&c->W.output_norm, a);
     struct tensor * h_final =
         tensor_rms_norm(h, &output_norm_w, c->cfg.norm_eps);
+    qh_trace_row("result_norm", "RMS_NORM",
+                 h_final->data, c->cfg.hidden_dim);
     struct tensor * logits = matmul_dispatch(&c->W.output, h_final);
+    qh_trace_row("result_output", "MUL_MAT",
+                 logits->data, (int64_t)tensor_nelements(logits));
     return logits;
 }
 
@@ -2315,6 +2603,7 @@ int llm_generate(struct llm_ctx * c,
     if (sampler_in != NULL) { sp = *sampler_in; }
     struct rng rng;
     rng_seed(&rng, seed != 0 ? seed : (uint64_t)time(NULL));
+    qh_trace_open();
     int32_t   generated = 0;
     int32_t   pos       = c->pos;        // resume after previous call
     int32_t   stop      = 0;
@@ -2330,6 +2619,13 @@ int llm_generate(struct llm_ctx * c,
     // Pre-fill prompt.
     for (int32_t i = 0; i < prompt_n && !stop; i++) {
         struct tensor * logits = llm_forward_step(c, prompt_ids[i], pos);
+        // Trace facility is for parity diagnostics on the FIRST
+        // forward pass only - one prompt token -> ~1850 JSONL lines
+        // matches the llama-qwen-haiku reference dump shape. Close
+        // after step 0 to keep file size bounded and to avoid noise
+        // from later positions that exercise different KV/SSM
+        // states.
+        if (i == 0) { qh_trace_close(); }
         (void)logits;
         pos++;
     }
@@ -2392,6 +2688,7 @@ int llm_generate(struct llm_ctx * c,
     c->n_generated = generated;
     c->pos         = pos;                // persist across calls
     free(history);
+    qh_trace_close();
     return generated;
 }
 
@@ -2590,21 +2887,23 @@ static int32_t capture_cb(const char * s, void * user) {
 static void strip_reasoning_for_history(struct chars * s) {
     if (s->data == NULL || s->count == 0) { return; }
     const char close[] = "</think>";
-    int32_t close_len = (int32_t)(sizeof(close) - 1);
-    int32_t last_close_end = -1;
-    for (int32_t i = 0; i + close_len <= s->count; i++) {
-        if (memcmp(s->data + i, close, (size_t)close_len) == 0) {
+    size_t close_len = sizeof(close) - 1;
+    size_t last_close_end = 0;
+    int    found = 0;
+    for (size_t i = 0; i + close_len <= s->count; i++) {
+        if (memcmp(s->data + i, close, close_len) == 0) {
             last_close_end = i + close_len;
+            found = 1;
         }
     }
-    int32_t cursor = (last_close_end >= 0) ? last_close_end : 0;
+    size_t cursor = found ? last_close_end : 0;
     while (cursor < s->count &&
            (s->data[cursor] == '\n' || s->data[cursor] == '\r' ||
             s->data[cursor] == ' '  || s->data[cursor] == '\t')) {
         cursor++;
     }
-    int32_t kept = s->count - cursor;
-    if (kept > 0) { memmove(s->data, s->data + cursor, (size_t)kept); }
+    size_t kept = s->count - cursor;
+    if (kept > 0) { memmove(s->data, s->data + cursor, kept); }
     s->count = kept;
     s->data[kept] = '\0';
 }
@@ -2661,14 +2960,14 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
             chars_put(&reply, "", 0);
             strip_reasoning_for_history(&reply);
             const char eot[] = "<|im_end|>";
-            int32_t eot_len = (int32_t)(sizeof(eot) - 1);
+            size_t eot_len = sizeof(eot) - 1;
             if (reply.count >= eot_len &&
                 memcmp(reply.data + reply.count - eot_len,
                        eot, eot_len) == 0) {
                 reply.count -= eot_len;
                 reply.data[reply.count] = '\0';
             }
-            fwrite(reply.data, 1, (size_t)reply.count, stdout);
+            fwrite(reply.data, 1, reply.count, stdout);
             fflush(stdout);
             printf("\n");
             fprintf(stderr,

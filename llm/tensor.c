@@ -743,6 +743,29 @@ typedef struct {
     _Float16 d;
 } q6k_block;
 
+typedef struct {
+    _Float16 d;
+    _Float16 dmin;
+    uint8_t  scales[12];
+    uint8_t  qh[QK_K / 8];
+    uint8_t  qs[QK_K / 2];
+} q5k_block;
+
+typedef struct {
+    _Float16 d;
+    int8_t   qs[32];
+} q8_0_block;
+
+#define Q8_0_BLOCK_SIZE 32
+
+// NEON int8 dot kernels (and ggml-ported elementwise helpers like
+// silu/exp) live in neon.c, included here as a single-file library
+// so all block typedefs above are in scope. neon.c is the ONLY place
+// in this codebase that includes <arm_neon.h>; tensor.c and llm.c
+// stay scalar / portable. To add another SIMD variant (avx2.c
+// later), add a sibling file and switch the include with #if.
+#include "neon.c"
+
 // Unpack 8 * (6-bit scale, 6-bit min) from the 12-byte `scales` field.
 // Layout per llama.cpp dequantize_row_q4_K reference:
 //   For sub-block j in [0,4):  sc = scales[j]   & 63
@@ -788,67 +811,10 @@ static inline void q4k_dequant_block(const q4k_block * bl, float * y) {
     }
 }
 
-// NEON int8 dot of one q4k super-block (256 weights) against one
-// q8k super-block (matching 256 activations). Ported line-for-line
-// from llama.cpp ggml-cpu/arch/arm/quants.c ggml_vec_dot_q4_K_q8_K
-// (the __ARM_NEON branch, lines ~2522-2583). Returns the
-// super-block's contribution to the full row dot product.
-static inline float q4k_dot_q8k_neon(const q4k_block * x,
-                                     const q8k_block * y) {
-    static const uint32_t kmask1 = 0x3f3f3f3f;
-    static const uint32_t kmask2 = 0x0f0f0f0f;
-    static const uint32_t kmask3 = 0x03030303;
-    const uint8x16_t m4b   = vdupq_n_u8(0xf);
-    const int32x4_t  mzero = vdupq_n_s32(0);
-    const float d    = y->d * (float)x->d;
-    const float dmin = y->d * (float)x->dmin;
-    float sumf = 0.0f;
-    const int16x8_t q8sums = vpaddq_s16(vld1q_s16(y->bsums),
-                                        vld1q_s16(y->bsums + 8));
-    uint32_t utmp[4];
-    memcpy(utmp, x->scales, 12);
-    uint32x2_t mins8 = vdup_n_u32(0);
-    mins8 = vset_lane_u32(utmp[1] & kmask1, mins8, 0);
-    mins8 = vset_lane_u32(((utmp[2] >> 4) & kmask2)
-                          | (((utmp[1] >> 6) & kmask3) << 4),
-                          mins8, 1);
-    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-    utmp[0] &= kmask1;
-    const int16x8_t mins = vreinterpretq_s16_u16(
-        vmovl_u8(vreinterpret_u8_u32(mins8)));
-    const int32x4_t prod = vaddq_s32(
-        vmull_s16(vget_low_s16 (q8sums), vget_low_s16 (mins)),
-        vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)));
-    sumf -= dmin * (float)vaddvq_s32(prod);
-    const uint8_t * scales = (const uint8_t *)utmp;
-    const uint8_t * q4 = x->qs;
-    const int8_t  * q8 = y->qs;
-    int32_t sumi1 = 0;
-    int32_t sumi2 = 0;
-    for (int32_t j = 0; j < QK_K / 64; j++) {
-        const uint8x16_t q4bits0 = vld1q_u8(q4);
-        const uint8x16_t q4bits1 = vld1q_u8(q4 + 16);
-        q4 += 32;
-        int8x16_t q8b0 = vld1q_s8(q8);
-        int8x16_t q8b1 = vld1q_s8(q8 + 16);
-        q8 += 32;
-        int8x16_t q4b0 = vreinterpretq_s8_u8(vandq_u8(q4bits0, m4b));
-        int8x16_t q4b1 = vreinterpretq_s8_u8(vandq_u8(q4bits1, m4b));
-        const int32x4_t p1 = vdotq_s32(vdotq_s32(mzero, q4b0, q8b0),
-                                       q4b1, q8b1);
-        sumi1 += vaddvq_s32(p1) * scales[2 * j + 0];
-        q8b0 = vld1q_s8(q8);
-        q8b1 = vld1q_s8(q8 + 16);
-        q8 += 32;
-        q4b0 = vreinterpretq_s8_u8(vshrq_n_u8(q4bits0, 4));
-        q4b1 = vreinterpretq_s8_u8(vshrq_n_u8(q4bits1, 4));
-        const int32x4_t p2 = vdotq_s32(vdotq_s32(mzero, q4b0, q8b0),
-                                       q4b1, q8b1);
-        sumi2 += vaddvq_s32(p2) * scales[2 * j + 1];
-    }
-    sumf += d * (float)(sumi1 + sumi2);
-    return sumf;
-}
+// q4k_dot_q8k_neon, q5k_dot_q8k_neon, q6k_dot_q8k_neon - bodies live
+// in neon.c (included near the top of this file). Comments and
+// licensing context for each kernel are at the function definition
+// in neon.c.
 
 struct tensor * tensor_matmul_q4k_f32(const q4k_block * w_blocks,
                                       int64_t           out_f,
@@ -881,35 +847,10 @@ struct tensor * tensor_matmul_q4k_f32(const q4k_block * w_blocks,
 }
 
 // ---------------------------------------------------------------------------
-// Q5_K and Q8_0 block types (also present in Qwen3.5 Q4_K_M GGUFs)
+// Q5_K dequant (block typedefs for Q5_K and Q8_0 live near q4k_block
+// at the top of the quant section so neon.c sees them; see comment
+// there for the layout reference).
 //
-// Q5_K: like Q4_K but with one extra "high" bit per weight. 256 weights
-// per super-block, 8 sub-blocks of 32. Layout:
-//   ggml_half d, dmin
-//   uint8_t   scales[12]   (same packing as Q4_K)
-//   uint8_t   qh[QK_K/8]   (32 bytes - high bit per weight)
-//   uint8_t   qs[QK_K/2]   (128 bytes - low 4 bits per weight)
-// Per weight: q = (low4 | (high1 << 4)). Same scale/min math as Q4_K.
-// Total: 2 + 2 + 12 + 32 + 128 = 176 bytes per 256 weights = 5.5 bpw.
-//
-// Q8_0: 32 weights per block. fp16 scale + 32 int8 quants. 34 bytes.
-// ---------------------------------------------------------------------------
-
-typedef struct {
-    _Float16 d;
-    _Float16 dmin;
-    uint8_t  scales[12];
-    uint8_t  qh[QK_K / 8];
-    uint8_t  qs[QK_K / 2];
-} q5k_block;
-
-typedef struct {
-    _Float16 d;
-    int8_t   qs[32];
-} q8_0_block;
-
-#define Q8_0_BLOCK_SIZE 32
-
 // Q5_K dequant; port of ggml-quants.c dequantize_row_q5_K.
 // Per super-block (256 weights), iterate 4 chunks of 64. Each chunk:
 //   sub-block 'is':  d1 = d*sc[is], m1 = dmin*m[is].
@@ -948,74 +889,6 @@ static inline void q5k_dequant_block(const q5k_block * bl, float * y) {
     }
 }
 
-// NEON int8 dot of one q5k super-block against one q8k super-block.
-// Ported from llama.cpp ggml-cpu/arch/arm/quants.c ggml_vec_dot_q5_K_q8_K
-// (__ARM_NEON branch, lines ~2617-2683).
-static inline float q5k_dot_q8k_neon(const q5k_block * x,
-                                     const q8k_block * y) {
-    static const uint32_t kmask1 = 0x3f3f3f3f;
-    static const uint32_t kmask2 = 0x0f0f0f0f;
-    static const uint32_t kmask3 = 0x03030303;
-    const uint8x16_t m4b   = vdupq_n_u8(0xf);
-    const uint8x16_t mone  = vdupq_n_u8(1);
-    const uint8x16_t mtwo  = vdupq_n_u8(2);
-    const int32x4_t  mzero = vdupq_n_s32(0);
-    const float d    = y->d * (float)x->d;
-    const float dmin = y->d * (float)x->dmin;
-    const int16x8_t q8sums = vpaddq_s16(vld1q_s16(y->bsums),
-                                        vld1q_s16(y->bsums + 8));
-    uint32_t utmp[4];
-    memcpy(utmp, x->scales, 12);
-    utmp[3] = ((utmp[2] >> 4) & kmask2)
-            | (((utmp[1] >> 6) & kmask3) << 4);
-    const uint32_t uaux = utmp[1] & kmask1;
-    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-    utmp[2] = uaux;
-    utmp[0] &= kmask1;
-    const uint8x8_t mins8 = vld1_u8((const uint8_t *)utmp + 8);
-    const int16x8_t mins  = vreinterpretq_s16_u16(vmovl_u8(mins8));
-    const int32x4_t prod  = vaddq_s32(
-        vmull_s16(vget_low_s16 (q8sums), vget_low_s16 (mins)),
-        vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)));
-    const int32_t sumi_mins = vaddvq_s32(prod);
-    const uint8_t * scales = (const uint8_t *)utmp;
-    const uint8_t * q5 = x->qs;
-    const uint8_t * qh = x->qh;
-    const int8_t  * q8 = y->qs;
-    uint8x16_t qhbits0 = vld1q_u8(qh);
-    uint8x16_t qhbits1 = vld1q_u8(qh + 16);
-    int32_t sumi = 0;
-    for (int32_t j = 0; j < QK_K / 64; j++) {
-        const uint8x16_t q5bits0 = vld1q_u8(q5);
-        const uint8x16_t q5bits1 = vld1q_u8(q5 + 16);
-        q5 += 32;
-        const int8x16_t q8b0 = vld1q_s8(q8);
-        const int8x16_t q8b1 = vld1q_s8(q8 + 16);
-        const int8x16_t q8b2 = vld1q_s8(q8 + 32);
-        const int8x16_t q8b3 = vld1q_s8(q8 + 48);
-        q8 += 64;
-        const uint8x16_t q5h0 = vshlq_n_u8(vandq_u8(mone, qhbits0), 4);
-        const uint8x16_t q5h1 = vshlq_n_u8(vandq_u8(mone, qhbits1), 4);
-        const uint8x16_t q5h2 = vshlq_n_u8(vandq_u8(mtwo, qhbits0), 3);
-        const uint8x16_t q5h3 = vshlq_n_u8(vandq_u8(mtwo, qhbits1), 3);
-        qhbits0 = vshrq_n_u8(qhbits0, 2);
-        qhbits1 = vshrq_n_u8(qhbits1, 2);
-        const int8x16_t q5b0 = vreinterpretq_s8_u8(
-            vorrq_u8(vandq_u8 (q5bits0, m4b), q5h0));
-        const int8x16_t q5b1 = vreinterpretq_s8_u8(
-            vorrq_u8(vandq_u8 (q5bits1, m4b), q5h1));
-        const int8x16_t q5b2 = vreinterpretq_s8_u8(
-            vorrq_u8(vshrq_n_u8(q5bits0, 4),  q5h2));
-        const int8x16_t q5b3 = vreinterpretq_s8_u8(
-            vorrq_u8(vshrq_n_u8(q5bits1, 4),  q5h3));
-        sumi += vaddvq_s32(vdotq_s32(vdotq_s32(mzero, q5b0, q8b0),
-                                     q5b1, q8b1)) * scales[2 * j + 0];
-        sumi += vaddvq_s32(vdotq_s32(vdotq_s32(mzero, q5b2, q8b2),
-                                     q5b3, q8b3)) * scales[2 * j + 1];
-    }
-    return d * (float)sumi - dmin * (float)sumi_mins;
-}
-
 struct tensor * tensor_matmul_q5k_f32(const q5k_block * w_blocks,
                                       int64_t           out_f,
                                       int64_t           k,
@@ -1049,27 +922,26 @@ struct tensor * tensor_matmul_q8_0_f32(const q8_0_block * w_blocks,
                                        struct tensor *    x) {
     assert(x->ndim == 2 && x->ne[0] == k);
     assert(k % Q8_0_BLOCK_SIZE == 0);
+    // Quantise input row to Q8_0 once per token then dot int8*int8
+    // per output row - mirrors ggml's GGML_OP_MUL_MAT dispatch for
+    // Q8_0 weights x F32 activations (activation is quantised to its
+    // matching `vec_dot_type`, which for Q8_0 is also Q8_0). The
+    // previous scalar fp64 path multiplied weights' int8 directly by
+    // un-quantised fp32 activations - mathematically different from
+    // what the model was trained for and what llama.cpp computes;
+    // produced ~50-100 ULPs of drift on ssm_alpha / ssm_beta outputs.
     int64_t n          = x->ne[1];
     int64_t nb_per_row = k / Q8_0_BLOCK_SIZE;
     struct tensor * out = tensor_new_2d(x->arena, out_f, n);
+    q8_0_block * xq = (q8_0_block *)arena_alloc(
+        x->arena, (size_t)nb_per_row * sizeof(q8_0_block));
     for (int64_t t = 0; t < n; t++) {
-        const float * xr = x->data + t * k;
-        float * or_      = out->data + t * out_f;
+        quantize_row_q8_0(x->data + t * k, xq, k);
+        float * or_ = out->data + t * out_f;
         dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
             int64_t j = (int64_t)jj;
             const q8_0_block * row = w_blocks + j * nb_per_row;
-            double acc = 0.0;
-            for (int64_t b = 0; b < nb_per_row; b++) {
-                const q8_0_block * bl = row + b;
-                double d = (double)(float)bl->d;
-                const float * xb = xr + b * Q8_0_BLOCK_SIZE;
-                double bsum = 0.0;
-                for (int i = 0; i < 32; i++) {
-                    bsum += (double)(int)bl->qs[i] * (double)xb[i];
-                }
-                acc += d * bsum;
-            }
-            or_[j] = (float)acc;
+            or_[j] = q8_0_dot_q8_0_neon(row, xq, k);
         });
     }
     return out;
@@ -1102,96 +974,6 @@ static inline void q6k_dequant_block(const q6k_block * bl, float * y) {
         sc +=  8;
         y  += 128;
     }
-}
-
-// NEON int8 dot of one q6k super-block against one q8k super-block.
-// Ported from llama.cpp ggml-cpu/arch/arm/quants.c ggml_vec_dot_q6_K_q8_K
-// (__ARM_NEON branch, lines ~3225-3318). Uses the (q - 32) offset
-// trick: dot in raw 6-bit space then subtract 32 * sum(scale * bsums).
-static inline float q6k_dot_q8k_neon(const q6k_block * x,
-                                     const q8k_block * y) {
-    const uint8x16_t m4b   = vdupq_n_u8(0xF);
-    const int32x4_t  vzero = vdupq_n_s32(0);
-    const uint8x16_t mone  = vdupq_n_u8(3);
-    const int16x8_t q8sums_lo = vld1q_s16(y->bsums);
-    const int16x8_t q8sums_hi = vld1q_s16(y->bsums + 8);
-    const int8x16_t scales_v  = vld1q_s8(x->scales);
-    const int16x8_t q6scales_lo = vmovl_s8(vget_low_s8 (scales_v));
-    const int16x8_t q6scales_hi = vmovl_s8(vget_high_s8(scales_v));
-    const int32x4_t prod = vaddq_s32(
-        vaddq_s32(
-            vmull_s16(vget_low_s16 (q8sums_lo), vget_low_s16 (q6scales_lo)),
-            vmull_s16(vget_high_s16(q8sums_lo), vget_high_s16(q6scales_lo))),
-        vaddq_s32(
-            vmull_s16(vget_low_s16 (q8sums_hi), vget_low_s16 (q6scales_hi)),
-            vmull_s16(vget_high_s16(q8sums_hi), vget_high_s16(q6scales_hi))));
-    const int32_t isum_mins = vaddvq_s32(prod);
-    const uint8_t * q6    = x->ql;
-    const uint8_t * qh    = x->qh;
-    const int8_t  * q8    = y->qs;
-    const int8_t  * scale = x->scales;
-    int32_t isum = 0;
-    for (int32_t j = 0; j < QK_K / 128; j++) {
-        uint8x16_t qhbits0 = vld1q_u8(qh);
-        uint8x16_t qhbits1 = vld1q_u8(qh + 16);
-        qh += 32;
-        const uint8x16_t q6bits0 = vld1q_u8(q6);
-        const uint8x16_t q6bits1 = vld1q_u8(q6 + 16);
-        const uint8x16_t q6bits2 = vld1q_u8(q6 + 32);
-        const uint8x16_t q6bits3 = vld1q_u8(q6 + 48);
-        q6 += 64;
-        int8x16_t q8b0 = vld1q_s8(q8);
-        int8x16_t q8b1 = vld1q_s8(q8 + 16);
-        int8x16_t q8b2 = vld1q_s8(q8 + 32);
-        int8x16_t q8b3 = vld1q_s8(q8 + 48);
-        q8 += 64;
-        uint8x16_t q6h0 = vshlq_n_u8(vandq_u8(mone, qhbits0), 4);
-        uint8x16_t q6h1 = vshlq_n_u8(vandq_u8(mone, qhbits1), 4);
-        uint8x16_t shifted = vshrq_n_u8(qhbits0, 2);
-        uint8x16_t q6h2 = vshlq_n_u8(vandq_u8(mone, shifted), 4);
-        shifted = vshrq_n_u8(qhbits1, 2);
-        uint8x16_t q6h3 = vshlq_n_u8(vandq_u8(mone, shifted), 4);
-        int8x16_t q6b0 = vreinterpretq_s8_u8(
-            vorrq_u8(vandq_u8(q6bits0, m4b), q6h0));
-        int8x16_t q6b1 = vreinterpretq_s8_u8(
-            vorrq_u8(vandq_u8(q6bits1, m4b), q6h1));
-        int8x16_t q6b2 = vreinterpretq_s8_u8(
-            vorrq_u8(vandq_u8(q6bits2, m4b), q6h2));
-        int8x16_t q6b3 = vreinterpretq_s8_u8(
-            vorrq_u8(vandq_u8(q6bits3, m4b), q6h3));
-        isum += vaddvq_s32(vdotq_s32(vzero, q6b0, q8b0)) * scale[0]
-              + vaddvq_s32(vdotq_s32(vzero, q6b1, q8b1)) * scale[1]
-              + vaddvq_s32(vdotq_s32(vzero, q6b2, q8b2)) * scale[2]
-              + vaddvq_s32(vdotq_s32(vzero, q6b3, q8b3)) * scale[3];
-        scale += 4;
-        q8b0 = vld1q_s8(q8);
-        q8b1 = vld1q_s8(q8 + 16);
-        q8b2 = vld1q_s8(q8 + 32);
-        q8b3 = vld1q_s8(q8 + 48);
-        q8 += 64;
-        shifted = vshrq_n_u8(qhbits0, 4);
-        q6h0 = vshlq_n_u8(vandq_u8(mone, shifted), 4);
-        shifted = vshrq_n_u8(qhbits1, 4);
-        q6h1 = vshlq_n_u8(vandq_u8(mone, shifted), 4);
-        shifted = vshrq_n_u8(qhbits0, 6);
-        q6h2 = vshlq_n_u8(vandq_u8(mone, shifted), 4);
-        shifted = vshrq_n_u8(qhbits1, 6);
-        q6h3 = vshlq_n_u8(vandq_u8(mone, shifted), 4);
-        q6b0 = vreinterpretq_s8_u8(
-            vorrq_u8(vshrq_n_u8(q6bits0, 4), q6h0));
-        q6b1 = vreinterpretq_s8_u8(
-            vorrq_u8(vshrq_n_u8(q6bits1, 4), q6h1));
-        q6b2 = vreinterpretq_s8_u8(
-            vorrq_u8(vshrq_n_u8(q6bits2, 4), q6h2));
-        q6b3 = vreinterpretq_s8_u8(
-            vorrq_u8(vshrq_n_u8(q6bits3, 4), q6h3));
-        isum += vaddvq_s32(vdotq_s32(vzero, q6b0, q8b0)) * scale[0]
-              + vaddvq_s32(vdotq_s32(vzero, q6b1, q8b1)) * scale[1]
-              + vaddvq_s32(vdotq_s32(vzero, q6b2, q8b2)) * scale[2]
-              + vaddvq_s32(vdotq_s32(vzero, q6b3, q8b3)) * scale[3];
-        scale += 4;
-    }
-    return (float)x->d * y->d * (float)(isum - 32 * isum_mins);
 }
 
 struct tensor * tensor_matmul_q6k_f32(const q6k_block * w_blocks,
