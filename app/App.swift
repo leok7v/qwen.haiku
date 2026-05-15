@@ -43,8 +43,8 @@ final class QwenViewModel {
 
     enum State: Equatable {
         case idle                                    // initial, nothing checked yet
-        case needsDownload(size: Int64)              // cache empty, awaiting user OK
-        case downloading(done: Int64, total: Int64)  // user pressed Download
+        case needsDownload(size: Int)                // cache empty, awaiting user OK
+        case downloading(done: Int, total: Int)      // user pressed Download
         case loading                                 // model on disk, mmap+parse
         case ready                                   // ctx alive, can generate
         case generating
@@ -480,7 +480,7 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private func downloadPrompt(size: Int64) -> some View {
+    private func downloadPrompt(size: Int) -> some View {
         let mb = Double(size) / 1_048_576.0
         HStack(spacing: 12) {
             Text(String(format: "Model not cached (~%.0f MB).", mb))
@@ -505,7 +505,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private var statusLine: some View {
-        let rss = Memory.formatMB(Memory.residentBytes())
+        let rss = formatMB(residentBytes())
         switch vm.state {
         case .idle:
             Text("starting...")
@@ -540,4 +540,32 @@ struct ContentView: View {
         }
     }
 
+}
+
+// ---------------------------------------------------------------------------
+// Resident memory (`phys_footprint`) for the status line. Was
+// app/utils/Memory.swift; folded in here as fileprivate since the
+// status line is the only consumer.
+// ---------------------------------------------------------------------------
+
+import Darwin.Mach
+
+fileprivate func residentBytes() -> UInt64 {
+    var info  = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<task_vm_info>.size /
+        MemoryLayout<integer_t>.size
+    )
+    let kerr: kern_return_t = withUnsafeMutablePointer(to: &info) { p in
+        p.withMemoryRebound(to: integer_t.self,
+                            capacity: Int(count)) { iptr in
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO),
+                      iptr, &count)
+        }
+    }
+    return kerr == KERN_SUCCESS ? info.phys_footprint : 0
+}
+
+fileprivate func formatMB(_ bytes: UInt64) -> String {
+    String(format: "%.0f MB", Double(bytes) / 1024.0 / 1024.0)
 }

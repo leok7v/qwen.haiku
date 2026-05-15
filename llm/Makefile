@@ -34,10 +34,10 @@ all: $(BIN)
 # library needs to be a prerequisite or edits won't trigger a
 # rebuild (made/llm.c-only deps gave a stale binary against the
 # new qwen.c path on 2026-05-15).
-$(BIN): llm.c llm.h qwen.c gguf.c tokenizer.c sampler.c \
+$(BIN): llm.c llm.h qwen.c gguf.c tokenizer.c sampler.c jinja.c \
         tensor.c neon.c chunked.c \
         tools.c agent.c \
-        utils/arrays.c utils/chars.c utils/maps.c utils/jinja.c \
+        utils/arrays.c utils/chars.c utils/maps.c \
         | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ llm.c $(LDFLAGS)
 

@@ -65,7 +65,7 @@
 
 #include "gguf.c"             // GGUF v3 reader; used by qwen.c below
 #include "qwen.c"
-#include "utils/jinja.c"     // renamed from llm/jinja-template.c
+#include "jinja.c"           // renamed from llm/jinja-template.c
 #include "tools.c"
 
 // Sampler chain (llm_sampler_defaults + sample_with + helpers).

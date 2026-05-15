@@ -17,6 +17,7 @@
 				agent.c,
 				chunked.c,
 				gguf.c,
+				jinja.c,
 				Makefile,
 				neon.c,
 				qwen.c,
@@ -26,7 +27,6 @@
 				tools.c,
 				utils/arrays.c,
 				utils/chars.c,
-				utils/jinja.c,
 				utils/maps.c,
 				utils/text.c,
 			);
