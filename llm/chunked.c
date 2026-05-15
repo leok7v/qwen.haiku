@@ -89,6 +89,75 @@
 
 #define CHUNK_SIZE 64
 
+// ---------------------------------------------------------------------------
+// NEON-vectorized fp32 primitives used by the chunked kernel.
+//
+// arm_neon.h is already in scope here because tensor.c includes neon.c
+// before chunked.c. We do NOT need the row-level Q-quant dots; the
+// chunked kernel works in fp32 throughout (Q4_K dequant happened
+// upstream in the matmul_dispatch path).
+//
+// Bit-parity note: these helpers change the fp32 accumulation order
+// vs the scalar ggml reference (4-lane parallel chains + horizontal
+// sum instead of left-to-right), so they drift by 1-2 ULPs per dot.
+// We accept this — the chunked path is a parallel implementation
+// strategy that is not held to bit-identity against the autoregressive
+// reference, only to "produces the same greedy-decode output text".
+// chunked-test (rel diff vs autoregressive_ref) stays well below
+// the threshold that affects sampling.
+// ---------------------------------------------------------------------------
+
+static inline float chunked_dot_f32(const float * a, const float * b, int k) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 15 < k; i += 16) {
+        acc = vfmaq_f32(acc, vld1q_f32(a + i + 0),  vld1q_f32(b + i + 0));
+        acc = vfmaq_f32(acc, vld1q_f32(a + i + 4),  vld1q_f32(b + i + 4));
+        acc = vfmaq_f32(acc, vld1q_f32(a + i + 8),  vld1q_f32(b + i + 8));
+        acc = vfmaq_f32(acc, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+    }
+    for (; i + 3 < k; i += 4) {
+        acc = vfmaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
+    }
+    float s = vaddvq_f32(acc);
+    for (; i < k; i++) { s += a[i] * b[i]; }
+    return s;
+}
+
+// y[0..k] += alpha * x[0..k]. Contiguous, 4-lane NEON FMA.
+static inline void chunked_axpy_f32(float * y, const float * x,
+                                    float alpha, int k) {
+    const float32x4_t va = vdupq_n_f32(alpha);
+    int i = 0;
+    for (; i + 15 < k; i += 16) {
+        vst1q_f32(y + i + 0,  vfmaq_f32(vld1q_f32(y + i + 0),  va, vld1q_f32(x + i + 0)));
+        vst1q_f32(y + i + 4,  vfmaq_f32(vld1q_f32(y + i + 4),  va, vld1q_f32(x + i + 4)));
+        vst1q_f32(y + i + 8,  vfmaq_f32(vld1q_f32(y + i + 8),  va, vld1q_f32(x + i + 8)));
+        vst1q_f32(y + i + 12, vfmaq_f32(vld1q_f32(y + i + 12), va, vld1q_f32(x + i + 12)));
+    }
+    for (; i + 3 < k; i += 4) {
+        vst1q_f32(y + i, vfmaq_f32(vld1q_f32(y + i), va, vld1q_f32(x + i)));
+    }
+    for (; i < k; i++) { y[i] += alpha * x[i]; }
+}
+
+// y[0..k] = alpha * x[0..k]. Same shape as axpy but overwrites.
+static inline void chunked_scal_f32(float * y, const float * x,
+                                    float alpha, int k) {
+    const float32x4_t va = vdupq_n_f32(alpha);
+    int i = 0;
+    for (; i + 15 < k; i += 16) {
+        vst1q_f32(y + i + 0,  vmulq_f32(va, vld1q_f32(x + i + 0)));
+        vst1q_f32(y + i + 4,  vmulq_f32(va, vld1q_f32(x + i + 4)));
+        vst1q_f32(y + i + 8,  vmulq_f32(va, vld1q_f32(x + i + 8)));
+        vst1q_f32(y + i + 12, vmulq_f32(va, vld1q_f32(x + i + 12)));
+    }
+    for (; i + 3 < k; i += 4) {
+        vst1q_f32(y + i, vmulq_f32(va, vld1q_f32(x + i)));
+    }
+    for (; i < k; i++) { y[i] = alpha * x[i]; }
+}
+
 // Forward substitution on a strict-lower-triangular system (I - L)X = B
 // where L has zero diagonal. Solution overwrites X (B may be the same
 // buffer). All matrices are stored row-major; dimensions are square
@@ -255,10 +324,8 @@ static void chunked_ssm_step_f32(int n, int k_hd, int v_hd,
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             if (i > j) {
-                float s = 0.0f;
-                for (int d = 0; d < k_hd; d++) {
-                    s += k_in[j * k_hd + d] * k_beta[i * k_hd + d];
-                }
+                float s = chunked_dot_f32(k_in + j * k_hd,
+                                          k_beta + i * k_hd, k_hd);
                 kk_dot[i * N + j] = s * decay_mask[i * N + j];
                 lhs[i * N + j]    = kk_dot[i * N + j];     // I + kk_dot below diag
             } else if (i == j) {
@@ -299,13 +366,16 @@ static void chunked_ssm_step_f32(int n, int k_hd, int v_hd,
     }
     // 4. v_eff[i, e] = sum_j attn[i, j] * v_beta[j, e]
     //    (i = query time, j = key time; attn[i, j] nonzero for j <= i)
+    //    Outer-product form: walk j outer so v_beta[j, :] is loaded
+    //    contiguously and accumulated via NEON axpy.
     for (int i = 0; i < N; i++) {
-        for (int e = 0; e < v_hd; e++) {
-            float s = 0.0f;
-            for (int j = 0; j < N; j++) {
-                s += attn[i * N + j] * v_beta[j * v_hd + e];
+        memset(v_eff + i * v_hd, 0, (size_t)v_hd * sizeof(float));
+        for (int j = 0; j <= i; j++) {
+            float a_ij = attn[i * N + j];
+            if (a_ij != 0.0f) {
+                chunked_axpy_f32(v_eff + i * v_hd,
+                                 v_beta + j * v_hd, a_ij, v_hd);
             }
-            v_eff[i * v_hd + e] = s;
         }
     }
     // 5b. kbeta_gexp[t, d] = k_beta[t, d] * gexp[t]
@@ -316,14 +386,16 @@ static void chunked_ssm_step_f32(int n, int k_hd, int v_hd,
         }
     }
     // 5c. k_cumdecay = (attn @ kbeta_gexp^T)^T -> shape [N, k_hd]
-    //     Equivalent: k_cumdecay[t, d] = sum_s attn[t, s] * kbeta_gexp[s, d]
+    //     Equivalent: k_cumdecay[t, d] = sum_u attn[t, u] * kbeta_gexp[u, d]
+    //     Same axpy rewrite as step 4: outer u, NEON axpy over d.
     for (int t = 0; t < N; t++) {
-        for (int d = 0; d < k_hd; d++) {
-            float s = 0.0f;
-            for (int u = 0; u < N; u++) {
-                s += attn[t * N + u] * kbeta_gexp[u * k_hd + d];
+        memset(k_cumdecay + t * k_hd, 0, (size_t)k_hd * sizeof(float));
+        for (int u = 0; u <= t; u++) {
+            float a_tu = attn[t * N + u];
+            if (a_tu != 0.0f) {
+                chunked_axpy_f32(k_cumdecay + t * k_hd,
+                                 kbeta_gexp + u * k_hd, a_tu, k_hd);
             }
-            k_cumdecay[t * k_hd + d] = s;
         }
     }
     // 5d. attn_kq[i, j] = (K[j, :] · Q[i, :]) * decay_mask[i, j]
@@ -332,10 +404,8 @@ static void chunked_ssm_step_f32(int n, int k_hd, int v_hd,
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             if (i >= j) {
-                float s = 0.0f;
-                for (int d = 0; d < k_hd; d++) {
-                    s += k_in[j * k_hd + d] * q[i * k_hd + d];
-                }
+                float s = chunked_dot_f32(k_in + j * k_hd,
+                                          q + i * k_hd, k_hd);
                 float dm = (i == j) ? 1.0f : decay_mask[i * N + j];
                 attn_kq[i * N + j] = s * dm;
             } else {
@@ -346,30 +416,32 @@ static void chunked_ssm_step_f32(int n, int k_hd, int v_hd,
     // 6. Per-chunk update (single chunk per call, no outer loop here).
     // 6a. q_g_exp[t, d] = q[t, d] * gexp[t]
     for (int t = 0; t < N; t++) {
-        float ge = gexp[t];
-        for (int d = 0; d < k_hd; d++) {
-            q_g_exp[t * k_hd + d] = q[t * k_hd + d] * ge;
-        }
+        chunked_scal_f32(q_g_exp + t * k_hd,
+                         q + t * k_hd, gexp[t], k_hd);
     }
     // 6b. attn_inter[t, e] = sum_d state[d, e] * q_g_exp[t, d]
-    //     state is [k_hd, v_hd] row-major.
+    //     state is [k_hd, v_hd] row-major. Walk d outer so state[d, :]
+    //     is loaded contiguously and accumulated via axpy.
     for (int t = 0; t < N; t++) {
-        for (int e = 0; e < v_hd; e++) {
-            float s = 0.0f;
-            for (int d = 0; d < k_hd; d++) {
-                s += state[d * v_hd + e] * q_g_exp[t * k_hd + d];
+        memset(attn_inter + t * v_hd, 0, (size_t)v_hd * sizeof(float));
+        for (int d = 0; d < k_hd; d++) {
+            float qgd = q_g_exp[t * k_hd + d];
+            if (qgd != 0.0f) {
+                chunked_axpy_f32(attn_inter + t * v_hd,
+                                 state + d * v_hd, qgd, v_hd);
             }
-            attn_inter[t * v_hd + e] = s;
         }
     }
     // 6c. v_prime[t, e] = sum_d state[d, e] * k_cumdecay[t, d]
+    //     Same axpy pattern as 6b.
     for (int t = 0; t < N; t++) {
-        for (int e = 0; e < v_hd; e++) {
-            float s = 0.0f;
-            for (int d = 0; d < k_hd; d++) {
-                s += state[d * v_hd + e] * k_cumdecay[t * k_hd + d];
+        memset(v_prime + t * v_hd, 0, (size_t)v_hd * sizeof(float));
+        for (int d = 0; d < k_hd; d++) {
+            float kcd = k_cumdecay[t * k_hd + d];
+            if (kcd != 0.0f) {
+                chunked_axpy_f32(v_prime + t * v_hd,
+                                 state + d * v_hd, kcd, v_hd);
             }
-            v_prime[t * v_hd + e] = s;
         }
     }
     // 6d. v_new = v_eff - v_prime
