@@ -581,6 +581,7 @@ static int agent_capture_cb(const struct llm_stream_chunk * chunk,
 // catastrophic failure; the visible content is whatever the model
 // produced in its last turn, with the <tool_call> blocks stripped
 // out so the user reads only the natural-language answer.
+__attribute__((unused))
 static char * agent_run(struct llm_ctx * ctx,
                         const char * question,
                         const struct llm_sampler * sp, uint64_t seed,
@@ -737,6 +738,7 @@ static char * agent_run(struct llm_ctx * ctx,
 
 // Self-test for the parser only (no network, no model). The dispatch
 // + live agent loop are exercised by --ask (which IS the live test).
+__attribute__((unused))
 static int32_t agent_parser_test(void) {
     int failures = 0;
     const char * sample =

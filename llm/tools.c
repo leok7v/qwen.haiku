@@ -148,6 +148,7 @@ static void tools_global_init(void) {
     }
 }
 
+__attribute__((unused))
 static void tools_global_cleanup(void) {
     if (g_tools_curl_initialized) {
         curl_global_cleanup();
@@ -690,6 +691,7 @@ static void tools_distill(const char * html, size_t n,
 // trivia query that should find substantive snippets, and
 // "bitcoin price today" exercises a fresh-data query the model
 // CAN'T answer from training alone.
+__attribute__((unused))
 static int32_t tools_self_test(void) {
     tools_global_init();
     int failures = 0;

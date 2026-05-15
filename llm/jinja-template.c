@@ -546,6 +546,7 @@ static char * jinja_apply_delta(const char * user_msg,
 
 // Self-test: render conversations covering every branch and assert
 // against hand-traced golden strings. Returns 0 on PASS.
+__attribute__((unused))
 static int32_t jinja_self_test(void) {
     int32_t failures = 0;
     // Fixture A: bare user + assistant, no system, no gen prompt.

@@ -1481,7 +1481,7 @@ int g_no_q8k_rt = 0;
 // perf rewrites that change the underlying logits but keep the
 // argmax stable.
 static int g_trace_tokens = 0;
-static int g_min_new      = 0;
+__attribute__((unused)) static int g_min_new = 0;
 
 // DUMP(label, data, n) - one-line dump-when-this-layer-is-selected.
 // Captures `c` (the llm_ctx) and `L` (the current layer index) from
@@ -3865,6 +3865,7 @@ static int llm_think_test_case(const char * name,
     return failed;
 }
 
+__attribute__((unused))
 static int32_t llm_think_test(void) {
     int failures = 0;
     // A: plain content, no markers.
@@ -4044,6 +4045,7 @@ static void autoregressive_ref(int n, int k_hd, int v_hd,
     }
 }
 
+__attribute__((unused))
 static int32_t chunked_self_test(void) {
     enum { k_hd = CHUNKED_TEST_KHD, v_hd = CHUNKED_TEST_VHD,
            N   = CHUNKED_TEST_NTOK };
