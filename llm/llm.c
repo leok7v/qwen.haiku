@@ -2047,14 +2047,15 @@ static struct tensor * llm_forward_ssm(struct llm_ctx * c,
 // (chunked_ssm_step_f32). Returns a [hidden_dim, n] tensor of
 // post-output-projection vectors, ready for the residual add.
 //
-// Requires n <= CHUNK_SIZE (=64); larger prompts must be split
-// into multiple chunked calls (loop in the caller, state carries
-// over). State is updated in place once after processing all `n`
-// tokens.
+// Any n >= 1 is accepted: the internal multi-chunk loop segments
+// the input into successive chunked_ssm_step_f32 calls of size
+// min(remaining, CHUNK_SIZE), and the per-head state carries in
+// place across chunks. State is updated by the kernel itself, not
+// by this wrapper.
 //
 // `h` is [hidden_dim, n] - the input residual stream for these n
-// tokens. The SSM layer reads h as-is; the embedding lookup +
-// per-token RMS norm scaffolding is done by `llm_forward_step_batch`.
+// tokens. The SSM layer reads h as-is; the embedding lookup is
+// done by the caller (llm_forward_batch).
 static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
                                               int32_t L, int32_t n,
                                               struct tensor * h) {
@@ -2187,8 +2188,9 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
         snprintf(nm, sizeof(nm), "g_in-%d", (int)L);
         qh_trace_batch(nm, "MUL", g_log_all, n_heads, n);
     }
-    // 9. Chunked SSM per head. Padded chunk buffers, allocated once
-    //    and reused per head.
+    // 9. Chunked SSM per head. Per-chunk buffers (sized at CHUNK_SIZE
+    //    so the same scratch handles every chunk; the kernel uses the
+    //    actual chunk_n as its leading dim).
     float * q_chunk    = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
     float * k_chunk    = (float *)arena_alloc(a, CHUNK_SIZE * k_hd * sizeof(float));
     float * v_chunk    = (float *)arena_alloc(a, CHUNK_SIZE * v_hd * sizeof(float));
@@ -2218,12 +2220,11 @@ static struct tensor * llm_forward_ssm_batch(struct llm_ctx * c,
     size_t state_off  = (size_t)L * n_heads * k_hd * v_hd;
     float * state_base = c->ssm.ssm_state + state_off;
     float * out_flat = (float *)arena_alloc(a, (size_t)n * V_dim * sizeof(float));
-    // Multi-chunk loop: process CHUNK_SIZE tokens at a time, state
-    // carries in place across chunks (chunked_ssm_step_f32 updates
-    // it). The final chunk pads with zeros if n is not a multiple
-    // of CHUNK_SIZE - zero-padded tokens contribute nothing to the
-    // recurrence (K/V/beta = 0 there, g_log = 0 so exp(gcs[t]) is
-    // a constant continuation = no decay change).
+    // Multi-chunk loop: process min(remaining, CHUNK_SIZE) tokens
+    // per call. State carries in place across chunks because
+    // chunked_ssm_step_f32 updates it. The tail chunk is whatever
+    // length is left (no zero-padding — the kernel takes its own
+    // chunk_n parameter).
     int32_t n_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
     for (int32_t ck = 0; ck < n_chunks; ck++) {
         int32_t chunk_start = ck * CHUNK_SIZE;
@@ -2826,12 +2827,12 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
 // the autoregressive `llm_forward_step` for long prompts).
 //
 // Per-layer routing:
-//   - SSM layer: llm_forward_ssm_batch (chunked, all n tokens
-//                in one call; multi-chunk loop here for n > CHUNK_SIZE)
-//   - Attention layer: per-token sequential loop (calls the existing
-//                `llm_forward_attn` n times with positions pos_start+t).
-//                Simple and correct; can be optimised later to a
-//                batched-queries-vs-full-KV-cache kernel.
+//   - SSM layer: llm_forward_ssm_batch (chunked, all n tokens in one
+//                call; internal multi-chunk loop for n > CHUNK_SIZE).
+//   - Attention layer: llm_forward_attn_batch (batched-queries-vs-
+//                full-KV-cache kernel; causal mask via k_offset =
+//                pos_start so query t attends only to keys
+//                0..pos_start+t).
 //   - FFN: shape [hidden, n] flows through tensor_rms_norm,
 //          matmul_dispatch, tensor_mul, neon_silu_vec_f32 untouched -
 //          all four operate over the `n` axis natively.
@@ -2840,8 +2841,8 @@ static struct tensor * llm_forward_step(struct llm_ctx * c,
 //   - Caller is responsible for advancing `c->pos` (mirrors
 //     llm_forward_step semantics; we just compute, no state pointer).
 //   - SSM state (`c->ssm.ssm_state`, `c->ssm.conv_state`,
-//     `c->ssm.conv_head`) is updated in place. KV cache rows for
-//     pos_start..pos_start+n-1 are written by the per-token attn calls.
+//     `c->ssm.conv_head`) and KV cache rows for
+//     pos_start..pos_start+n-1 are written by the two batch helpers.
 //
 // Returns logits for the LAST token (shape [vocab_size, 1]). Earlier
 // tokens' logits are discarded (we only need them for prefill

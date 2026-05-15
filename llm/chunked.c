@@ -195,24 +195,6 @@ static void solve_tri_lower_unit_f32(int n,
     }
 }
 
-// Scalar fp32 matrix multiply: C[m, n] = A[m, k] @ B[k, n].
-// Row-major. Used inside chunked_ssm_step for the small (chunk_size,
-// chunk_size, k_hd, v_hd) matmuls. Accumulator is fp32 — matches
-// ggml's GGML_OP_MUL_MAT on F32 inputs (which is also scalar fp32 acc
-// per output element in the generic-C path).
-static void matmul_f32_ref(int m, int k, int n,
-                           const float * A, const float * B, float * C) {
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
-            float acc = 0.0f;
-            for (int t = 0; t < k; t++) {
-                acc += A[i * k + t] * B[t * n + j];
-            }
-            C[i * n + j] = acc;
-        }
-    }
-}
-
 // Chunked Gated DeltaNet SSM step for a single chunk of size
 // `n` (caller picks n in [1, CHUNK_SIZE]; multi-chunk prompts segment
 // into successive calls, state carries in place).
@@ -493,9 +475,4 @@ static void chunked_ssm_step_f32(int n, int k_hd, int v_hd,
                                 + kgd_vnew[d * v_hd + e];
         }
     }
-    // Note: unused — but referenced in the per-chunk math above for
-    // clarity. The matmul_f32_ref / solve_tri_lower_unit_f32 helpers
-    // and the cumsum scratch are organised so a future SIMD pass can
-    // replace each step in isolation with bit-parity testing per op.
-    (void)matmul_f32_ref;
 }
