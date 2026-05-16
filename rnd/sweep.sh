@@ -54,19 +54,20 @@ remote_battery() {
         echo '--- chunked-test'     && ./Build/cli/llm --chunked-test 2>&1 | tail -5  && \
         echo '--- agent-test'       && ./Build/cli/llm --agent-test   2>&1 | tail -3  && \
         echo '--- chat-test (hash gate)' && QWEN_GGUF='$gguf' ./Build/cli/llm --chat-test 2>&1 | tail -10 && \
-        echo '--- qwen-test'        && ./Build/cli/qwen-test          2>&1 | tail -5"
+        echo '--- qwen-test'        && ./Build/cli/qwen-test          2>&1 | tail -5  && \
+        echo '--- bench'            && QWEN_GGUF='$gguf' ./Build/cli/llm --bench       2>&1 | tail -5"
 }
 
-# Extract the three chat-test hashes (pass 0 only) and compare against EXPECTED.
+# Extract the three chat-test hashes (pass 0 only) and the bench line,
+# then emit a single grep-friendly summary line per host.
 summarize() {
     local out_file=$1 host_label=$2
-    local got
+    local got bench
     got=$(grep -oE 'hash=[0-9a-f]{16}' "$out_file" | head -3 | sed 's/hash=//' | tr '\n' ' ' | sed 's/ $//')
-    if [ "$got" = "$EXPECTED" ]; then
-        echo "summary: $host_label: PASS ($got)" | tee -a "$out_file"
-    else
-        echo "summary: $host_label: FAIL (got '$got', want '$EXPECTED')" | tee -a "$out_file"
-    fi
+    bench=$(grep -E '^bench: ' "$out_file" | tail -1 | sed 's/^bench: //')
+    local verdict
+    if [ "$got" = "$EXPECTED" ]; then verdict="PASS"; else verdict="FAIL"; fi
+    echo "summary: $host_label: $verdict | $bench | hashes=$got" | tee -a "$out_file"
 }
 
 skip_msg() {
@@ -91,6 +92,7 @@ run_apple() {
         echo '--- agent-test'   ; ./Build/cli/llm --agent-test   2>&1 | tail -3
         echo '--- chat-test'    ; ./Build/cli/llm --chat-test    2>&1 | tail -10
         echo '--- qwen-test'    ; ./Build/cli/qwen-test          2>&1 | tail -5
+        echo '--- bench'        ; QWEN_GGUF="$GGUF_MAC" ./Build/cli/llm --bench 2>&1 | tail -5
         if [ -x ./Build/cli/qwen-swift-cli ]; then
             echo '--- swift-cli chat-test'
             QWEN_GGUF="$GGUF_MAC" ./Build/cli/qwen-swift-cli chat-test 2>&1 | tail -10

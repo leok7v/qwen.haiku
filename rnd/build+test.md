@@ -186,6 +186,43 @@ push — only if missing remotely), builds, and runs the test battery.
 
 `rnd/sweep-results/<host>.out` holds the captured stdout+stderr of one
 sweep. The first line is the host label; subsequent lines are the test
-outputs. A trailing summary block records the `--chat-test` hashes vs
-the authoritative set so `grep -h '^summary:' rnd/sweep-results/*.out`
-shows the whole fleet at a glance.
+outputs. The penultimate test block is `--- bench` which captures the
+end-to-end prefill (pp) and token-generation (tg) throughput in tok/s
+along with which ISA tier the dispatcher picked. A trailing summary
+line aggregates everything:
+
+    summary: <host>: PASS|FAIL | pp=<float> tg=<float> n_pp=<int> n_tg=<int> dispatch=<label> | hashes=<3>
+
+`grep -h '^summary:' rnd/sweep-results/*.out` shows the whole fleet at
+a glance.
+
+## --bench details
+
+`./Build/cli/llm --bench` runs a fixed ~30-token prompt through prefill
++ 64-token greedy decode (temperature=0, deterministic) three times,
+then prints the median pp/tg. Greedy decode removes sampler RNG noise
+from the timing. The fixed prompt is `"Explain in five short sentences
+why benchmarking large language models across diverse hardware
+matters. Avoid vague generalities; be concrete."` — identical bytes on
+every host, identical token IDs after BPE.
+
+The dispatch label is whatever `simd_init()` picked at startup
+(`NEON+dotprod`, `NEON-baseline`, `AVX-VNNI`, `AVX2-FMA`, `AVX1`,
+or `scalar`). For ARM hosts this is gated on `FEAT_DotProd`
+(`hw.optional.arm.FEAT_DotProd` on Apple, `HWCAP_ASIMDDP` on Linux);
+for x86 hosts it's the CPUID-derived tier.
+
+## Throughput results
+
+Populated by the sweep. Update after each successful run.
+
+| Chip                         | OS / arch        | Dispatch tier   | pp tok/s | tg tok/s | n_pp | n_tg |
+|------------------------------|------------------|-----------------|---------:|---------:|-----:|-----:|
+| Apple M-series               | macOS arm64      | NEON+dotprod    |    24.43 |    24.29 |   25 |   64 |
+| AMD Zen 5 (Strix Halo)       | Linux x86_64     | AVX-VNNI        |        — |        — |    — |    — |
+| Intel Haswell i7-4578U       | macOS x86_64     | AVX2-FMA        |        — |        — |    — |    — |
+| Intel Ivy Bridge i7-3615QM   | macOS x86_64     | AVX1            |        — |        — |    — |    — |
+| Intel Ivy Bridge i7-3720QM   | macOS x86_64     | AVX1            |        — |        — |    — |    — |
+| Intel Ivy Bridge i7-3667U    | Windows x86_64   | AVX1            |        — |        — |    — |    — |
+| Qualcomm SD 765G (A76 + A55) | Android arm64    | NEON+dotprod    |        — |        — |    — |    — |
+| Amlogic A311D (A73 + A53)    | Ubuntu arm64     | NEON-baseline   |        — |        — |    — |    — |

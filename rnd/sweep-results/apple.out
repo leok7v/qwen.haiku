@@ -1,0 +1,53 @@
+host: Apple M-series (local), NEON+dotprod, macOS arm64
+make: Nothing to be done for `all'.
+--- self-test
+[dump] [F]post_ffn:   -0.0060    0.0042   -0.0018   -0.0092 ...  -0.0001    0.0238    0.0221   sum=0.024549
+self-test: forward pass for 3 tokens...
+  pos=0 tok=7 argmax=65 logit=14.8437
+  pos=1 tok=13 argmax=67 logit=8.1609
+  pos=2 tok=42 argmax=68 logit=3.5067
+--- think-test
+think-test: PASS (6 fixtures)
+--- jinja-test
+jinja-test: PASS (10 fixtures)
+--- chunked-test
+chunked-test t=6: chunk[0..3] = -1196.606 -2393.093 -3589.341 -4785.23
+chunked-test t=7: auto[0..3] = 4150.437 8300.458 12449.71 16597.81
+chunked-test t=7: chunk[0..3] = 4150.43 8300.469 12449.73 16597.82
+chunked-test: max |Δ_out| = 0.875 at t=7 e=127 (rel 2.457e-06)
+chunked-test: max |Δ_state| = 0.04102 at d=109 e=121
+--- agent-test
+agent-test: PASS (parser fixtures)
+--- chat-test
+llm: qwen35 hybrid (Mamba-2/DeltaNet + attention). SSM math is best-guess.
+chat-test pass 0 turn 1: gen=27 hash=d2ba984b228fff7a pos=50
+chat-test pass 0 turn 2: gen=57 hash=f12add080343c386 pos=129
+chat-test pass 0 turn 3: gen=58 hash=a99b9d0705cc0220 pos=205
+chat-test pass 1 turn 1: gen=27 hash=d2ba984b228fff7a pos=50
+chat-test pass 1 turn 2: gen=57 hash=f12add080343c386 pos=129
+chat-test pass 1 turn 3: gen=58 hash=a99b9d0705cc0220 pos=205
+chat-test: PASS (3 turns x 2 passes, hashes match across slm_reset)
+--- qwen-test
+qwen-self-test: PASS
+self-test: forward pass for 3 tokens...
+  pos=0 tok=7 argmax=17 logit=1.7540
+  pos=1 tok=13 argmax=2 logit=3316168575936364544.0000
+  pos=2 tok=42 argmax=18 logit=3316601508639801344.0000
+--- bench
+llm: qwen35 hybrid (Mamba-2/DeltaNet + attention). SSM math is best-guess.
+  run 1: pp=23.97 tg=24.21
+  run 2: pp=24.63 tg=24.03
+  run 3: pp=24.66 tg=24.17
+bench: pp=24.63 tg=24.17 n_pp=25 n_tg=64 dispatch=NEON+dotprod
+--- swift-cli chat-test
+[tok] 2647
+[tok] 488
+[tok] 466
+[tok] 513
+[tok] 1017
+[tok] 866
+[tok] 975
+[tok] 12960
+chat-test pass 1 turn 3: hash=041f1a443d077ca9
+chat-test: PASS (3 turns x 2 passes, hashes match across reset)
+summary: Apple M-series: PASS | pp=24.63 tg=24.17 n_pp=25 n_tg=64 dispatch=NEON+dotprod | hashes=d2ba984b228fff7a f12add080343c386 a99b9d0705cc0220

@@ -1441,6 +1441,72 @@ static int32_t run_single(const char * prompt, int32_t max_new,
     return r;
 }
 
+// --bench: cross-host throughput probe. Runs a fixed prompt
+// through prefill + greedy decode three times and prints one
+// machine-grep-friendly summary line:
+//
+//   bench: pp=<float> tg=<float> n_pp=<int> n_tg=<int> dispatch=<label>
+//
+// pp/tg are the median of the three runs (in tok/s). Greedy decode
+// (temperature=0) makes the output deterministic, so the timing
+// numbers aren't perturbed by sampler RNG. Used by rnd/sweep.sh
+// across the multi-host fleet — each host's summary line goes into
+// rnd/sweep-results/<host>.out and a final table aggregates the
+// fleet's pp/tg by ISA tier.
+static int32_t run_bench(void) {
+    struct slm_model * m = slm_model_load(slm_cli_gguf_path());
+    struct slm_ctx *   c =
+        slm_model_loaded(m) ? slm_ctx_create(m, NULL, NULL) : NULL;
+    int32_t r = 0;
+    if (c == NULL || !c->model->loaded) {
+        fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
+        r = 1;
+    } else {
+        // Fixed prompt: ~30 tokens once tokenized, enough to give a
+        // stable pp signal across hosts (very short prompts mostly
+        // measure model-load tail noise, not prefill throughput).
+        const char * prompt =
+            "Explain in five short sentences why benchmarking large "
+            "language models across diverse hardware matters. Avoid "
+            "vague generalities; be concrete.";
+        const int32_t bench_max_new = 64;
+        struct slm_sampler sp = slm_sampler_defaults();
+        sp.temperature = 0.0f;   // greedy: deterministic for re-runs
+        int32_t ids[2048];
+        int32_t n = tokenizer_encode(&c->model->tok, prompt, ids, 2048);
+        // 3 runs; reset between for clean state. Take median.
+        const int N = 3;
+        float pps[N], tgs[N];
+        int32_t n_pp = 0, n_tg = 0;
+        for (int run = 0; run < N; run++) {
+            slm_reset(c);
+            slm_generate(c, ids, n, bench_max_new, g_min_new, &sp,
+                         /*seed=*/1u, /*cb=*/NULL, /*user=*/NULL);
+            pps[run] = slm_pp_per_sec(c);
+            tgs[run] = slm_tg_per_sec(c);
+            n_pp     = (int32_t)slm_n_prefill(c);
+            n_tg     = (int32_t)slm_n_generated(c);
+            fprintf(stderr, "  run %d: pp=%.2f tg=%.2f\n",
+                    run + 1, pps[run], tgs[run]);
+        }
+        // Median of 3: pick the middle element after a 3-element sort.
+        // Tiny enough to inline a sort net.
+        #define SORT3(a) do {                                         \
+            if (a[0] > a[1]) { float t = a[0]; a[0] = a[1]; a[1] = t; }\
+            if (a[1] > a[2]) { float t = a[1]; a[1] = a[2]; a[2] = t; }\
+            if (a[0] > a[1]) { float t = a[0]; a[0] = a[1]; a[1] = t; }\
+        } while (0)
+        SORT3(pps);
+        SORT3(tgs);
+        #undef SORT3
+        printf("bench: pp=%.2f tg=%.2f n_pp=%d n_tg=%d dispatch=%s\n",
+               pps[1], tgs[1], n_pp, n_tg, simd_dispatch_label());
+    }
+    slm_ctx_destroy(c);
+    slm_model_unload(m);
+    return r;
+}
+
 static int32_t run_repl(const struct slm_sampler * sp,
                         uint64_t seed, int32_t max_new) {
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
@@ -1495,6 +1561,7 @@ int main(int argc, char ** argv) {
         CLI_AGENT_TEST      = 10,
         CLI_ASK             = 11,
         CLI_THINK_TEST      = 12,
+        CLI_BENCH           = 13,
     };
     enum cli_mode mode = CLI_HELP;
     const char * prompt = "Hello, my name is";
@@ -1535,6 +1602,8 @@ int main(int argc, char ** argv) {
             mode = CLI_AGENT_TEST;
         } else if (strcmp(argv[i], "--think-test") == 0) {
             mode = CLI_THINK_TEST;
+        } else if (strcmp(argv[i], "--bench") == 0) {
+            mode = CLI_BENCH;
         } else if (strcmp(argv[i], "--ask") == 0 && i + 1 < argc) {
             mode = CLI_ASK;
             prompt = argv[++i];
@@ -1622,9 +1691,12 @@ int main(int argc, char ** argv) {
                      max_new > 0 ? max_new : 256, trace_agent);
     } else if (mode == CLI_THINK_TEST) {
         rc = slm_think_test();
+    } else if (mode == CLI_BENCH) {
+        rc = run_bench();
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  llm --self-test\n"
+               "  llm --bench\n"
                "  llm --single \"prompt\" [--max-new N] [sampler flags]\n"
                "  llm --repl [--max-new N] [sampler flags]\n"
                "  llm --chat -p \"turn1\" [-p \"turn2\" ...] "
