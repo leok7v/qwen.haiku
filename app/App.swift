@@ -297,6 +297,44 @@ final class SLMViewModel {
 
 }
 
+/// Compact capsule-style on/off chip. Replaces the cross-platform
+/// `Toggle(...).toggleStyle(...)` row in the system bar — iOS's
+/// UISwitch is too wide for a three-toggle row on phone width, and
+/// `.checkbox` is macOS-only. This renders the same on both: a
+/// monospaced caption inside a capsule whose tint shifts when on.
+struct ChipToggle: View {
+    let title: String
+    @Binding var isOn: Bool
+    init(_ title: String, isOn: Binding<Bool>) {
+        self.title = title
+        self._isOn = isOn
+    }
+    var body: some View {
+        Button {
+            isOn.toggle()
+        } label: {
+            Text(title)
+                .font(.caption.monospaced())
+                .padding(.horizontal, 10)
+                .padding(.vertical,    5)
+                .background(
+                    Capsule()
+                        .fill(isOn
+                              ? Color.accentColor.opacity(0.35)
+                              : Color.secondary.opacity(0.18)))
+                .overlay(
+                    Capsule()
+                        .stroke(isOn
+                                ? Color.accentColor.opacity(0.7)
+                                : Color.secondary.opacity(0.30),
+                                lineWidth: 1))
+                .foregroundStyle(isOn ? Color.primary : Color.secondary)
+        }
+        .buttonStyle(.plain)
+        .contentShape(Capsule())
+    }
+}
+
 struct ContentView: View {
 
     @State private var vm    = SLMViewModel()
@@ -366,21 +404,17 @@ struct ContentView: View {
             Button(showSystem ? "done" : "edit") { showSystem.toggle() }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-            // `.checkbox` is macOS-only — on iOS the toggle falls
-            // back to its default switch appearance via the .automatic
-            // style. ToggleStyle/.automatic is the documented cross-
-            // platform alias; using it directly avoids #if branches.
-            Toggle("Tools", isOn: $vm.tools)
-                .toggleStyle(.automatic)
-                .font(.caption.monospaced())
+            // iOS UISwitch toggles eat way too much horizontal space
+            // for a three-toggle row on phone width; on macOS the
+            // .checkbox style is the right one but it's iOS-
+            // unavailable. ChipToggle below renders a compact tap-
+            // able capsule on both platforms — same width budget on
+            // iPhone as a `Text("Tools")`.
+            ChipToggle("Tools", isOn: $vm.tools)
                 .disabled(vm.state == .generating)
-            Toggle("Think", isOn: $vm.think)
-                .toggleStyle(.automatic)
-                .font(.caption.monospaced())
+            ChipToggle("Think", isOn: $vm.think)
                 .disabled(vm.state == .generating)
-            Toggle("Debug", isOn: $vm.debug)
-                .toggleStyle(.automatic)
-                .font(.caption.monospaced())
+            ChipToggle("Debug", isOn: $vm.debug)
         }
     }
 

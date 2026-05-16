@@ -380,6 +380,7 @@ static void ssm_cache_free(struct slm_ssm_cache * s) {
 // Reset recurrent state to "fresh conversation". The KV cache is
 // overwritten by the next forward pass so it does not need
 // clearing here; only the SSM/conv recurrent buffers do.
+__attribute__((unused))
 static void ssm_cache_reset(struct slm_ssm_cache * s,
                             const struct slm_config * cfg) {
     if (s->conv_state != NULL) {

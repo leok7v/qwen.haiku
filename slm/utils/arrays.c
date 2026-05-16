@@ -30,12 +30,12 @@ struct arr { // type-erased shape shared by chars/ints/nums/ptrs/...
     size_t capacity;
 };
 
-static inline void* oom(void* a) {
+__attribute__((unused)) static inline void* oom(void* a) {
     if (!a) {fprintf(stderr, "OOM"); abort(); } // no atexit() call!
     return a;
 }
 
-static inline void arr_grow(struct arr * a, size_t esize, size_t need) {
+__attribute__((unused)) static inline void arr_grow(struct arr * a, size_t esize, size_t need) {
     if (!a->data) { // because realloc(NULL) is not well defined
         a->capacity = need;
         a->data = oom(malloc(need * esize));
@@ -47,14 +47,14 @@ static inline void arr_grow(struct arr * a, size_t esize, size_t need) {
 
 #define define_array(T, name) \
 struct name { T * data; size_t count; size_t capacity; }; \
-static inline void name##_grow(struct name * a, size_t need) { \
+__attribute__((unused)) static inline void name##_grow(struct name * a, size_t need) { \
     arr_grow((struct arr *)a, sizeof(T), need); \
 } \
-static inline void name##_put(struct name * a, T v) { \
+__attribute__((unused)) static inline void name##_put(struct name * a, T v) { \
     name##_grow(a, a->count + 1); \
     a->data[a->count++] = v; \
 } \
-static inline void name##_free(struct name * a) { \
+__attribute__((unused)) static inline void name##_free(struct name * a) { \
     free(a->data); \
     a->data = NULL; \
     a->count = 0; \
@@ -68,7 +68,7 @@ define_array(int64_t, ints);
 define_array(double,  nums);
 define_array(void*,   ptrs);
 
-static void test_ints(void) {
+__attribute__((unused)) static void test_ints(void) {
     struct ints a = {0};
     assert(a.data == NULL && a.count == 0 && a.capacity == 0);
     ints_put(&a, 1);
@@ -90,7 +90,7 @@ static void test_ints(void) {
     ints_free(&empty);
 }
 
-static void test_nums(void) {
+__attribute__((unused)) static void test_nums(void) {
     struct nums a = {0};
     assert(a.data == NULL && a.count == 0 && a.capacity == 0);
     nums_put(&a, 1.5);
@@ -110,7 +110,7 @@ static void test_nums(void) {
     nums_free(&empty);
 }
 
-static void test_ptrs(void) {
+__attribute__((unused)) static void test_ptrs(void) {
     struct ptrs a = {0};
     assert(a.data == NULL && a.count == 0 && a.capacity == 0);
     int x = 10, y = 20, z = 30;
@@ -134,7 +134,7 @@ static void test_ptrs(void) {
     ptrs_free(&empty);
 }
 
-static void test(void) {
+__attribute__((unused)) static void test(void) {
     test_ints();
     test_nums();
     test_ptrs();

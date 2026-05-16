@@ -31,7 +31,7 @@ struct map {
     void (*value_free)(void *);
 };
 
-static inline uint64_t map_hash_i(int64_t k) {
+__attribute__((unused)) static inline uint64_t map_hash_i(int64_t k) {
     uint64_t x = (uint64_t)k;
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdULL;
@@ -41,7 +41,7 @@ static inline uint64_t map_hash_i(int64_t k) {
     return x;
 }
 
-static inline uint64_t map_hash_s(const struct chars * k) {
+__attribute__((unused)) static inline uint64_t map_hash_s(const struct chars * k) {
     uint64_t h = 0xcbf29ce484222325ULL; // FNV-1a offset
     for (size_t i = 0; i < k->count; i++) {
         h ^= (uint8_t)k->data[i];
@@ -50,7 +50,7 @@ static inline uint64_t map_hash_s(const struct chars * k) {
     return h;
 }
 
-static inline uint64_t map_hash(const struct map * m, const void * k) {
+__attribute__((unused)) static inline uint64_t map_hash(const struct map * m, const void * k) {
     uint64_t h = 0;
     if (m->key_kind == MAP_KEY_INT) {
         h = map_hash_i(*(const int64_t *)k);
@@ -60,7 +60,7 @@ static inline uint64_t map_hash(const struct map * m, const void * k) {
     return h;
 }
 
-static inline bool map_eq(const struct map * m, const void * a,
+__attribute__((unused)) static inline bool map_eq(const struct map * m, const void * a,
                           const void * b) {
     bool r = false;
     if (m->key_kind == MAP_KEY_INT) {
@@ -74,15 +74,15 @@ static inline bool map_eq(const struct map * m, const void * a,
     return r;
 }
 
-static inline void * map_k(struct map * m, size_t i) {
+__attribute__((unused)) static inline void * map_k(struct map * m, size_t i) {
     return (char *)m->keys + i * m->key_size;
 }
 
-static inline void * map_v(struct map * m, size_t i) {
+__attribute__((unused)) static inline void * map_v(struct map * m, size_t i) {
     return (char *)m->values + i * m->value_size;
 }
 
-static inline void map_key_copy(struct map * m, void * dst,
+__attribute__((unused)) static inline void map_key_copy(struct map * m, void * dst,
                                 const void * src) {
     if (m->key_kind == MAP_KEY_INT) {
         memcpy(dst, src, sizeof(int64_t));
@@ -94,13 +94,13 @@ static inline void map_key_copy(struct map * m, void * dst,
     }
 }
 
-static inline void map_key_free(struct map * m, void * k) {
+__attribute__((unused)) static inline void map_key_free(struct map * m, void * k) {
     if (m->key_kind == MAP_KEY_CHARS) {
         chars_free(k);
     }
 }
 
-static void map_init(struct map * m, enum map_key kk,
+__attribute__((unused)) static void map_init(struct map * m, enum map_key kk,
                      size_t ks, size_t vs, void (*vf)(void *)) {
     m->states = NULL;
     m->keys = NULL;
@@ -113,7 +113,7 @@ static void map_init(struct map * m, enum map_key kk,
     m->value_free = vf;
 }
 
-static void map_grow(struct map * m, size_t new_cap) {
+__attribute__((unused)) static void map_grow(struct map * m, size_t new_cap) {
     uint8_t * ns = oom(calloc(new_cap, 1));
     void * nk = oom(malloc(new_cap * m->key_size));
     void * nv = oom(malloc(new_cap * m->value_size));
@@ -138,7 +138,7 @@ static void map_grow(struct map * m, size_t new_cap) {
     m->capacity = new_cap;
 }
 
-static void * map_put(struct map * m, const void * k, const void * v) {
+__attribute__((unused)) static void * map_put(struct map * m, const void * k, const void * v) {
     void * r = NULL;
     if (m->capacity == 0) {
         map_grow(m, 16);
@@ -174,7 +174,7 @@ static void * map_put(struct map * m, const void * k, const void * v) {
     return r;
 }
 
-static void * map_get(struct map * m, const void * k) {
+__attribute__((unused)) static void * map_get(struct map * m, const void * k) {
     void * r = NULL;
     if (m->capacity > 0) {
         size_t mask = m->capacity - 1;
@@ -193,7 +193,7 @@ static void * map_get(struct map * m, const void * k) {
     return r;
 }
 
-static void map_remove(struct map * m, const void * k) {
+__attribute__((unused)) static void map_remove(struct map * m, const void * k) {
     if (m->capacity > 0) {
         size_t mask = m->capacity - 1;
         size_t j = (size_t)map_hash(m, k) & mask;
@@ -213,7 +213,7 @@ static void map_remove(struct map * m, const void * k) {
     }
 }
 
-static void map_free(struct map * m) {
+__attribute__((unused)) static void map_free(struct map * m) {
     if (m->capacity > 0) {
         for (size_t i = 0; i < m->capacity; i++) {
             if (m->states[i] == MAP_LIVE) {
@@ -233,7 +233,7 @@ static void map_free(struct map * m) {
 }
 
 __attribute__((unused))
-static void map_for_each(struct map * m,
+__attribute__((unused)) static void map_for_each(struct map * m,
                          void (*fn)(const void * k, void * v, void * ctx),
                          void * ctx) {
     for (size_t i = 0; i < m->capacity; i++) {
@@ -243,19 +243,19 @@ static void map_for_each(struct map * m,
     }
 }
 
-static inline void * map_puti(struct map * m, int64_t k, const void * v) {
+__attribute__((unused)) static inline void * map_puti(struct map * m, int64_t k, const void * v) {
     return map_put(m, &k, v);
 }
 
-static inline void * map_geti(struct map * m, int64_t k) {
+__attribute__((unused)) static inline void * map_geti(struct map * m, int64_t k) {
     return map_get(m, &k);
 }
 
-static inline void map_removei(struct map * m, int64_t k) {
+__attribute__((unused)) static inline void map_removei(struct map * m, int64_t k) {
     map_remove(m, &k);
 }
 
-static inline void * map_puts(struct map * m, const char * k,
+__attribute__((unused)) static inline void * map_puts(struct map * m, const char * k,
                               const void * v) {
     struct chars tmp = {0};
     tmp.data = (char *)(uintptr_t)k;
@@ -263,39 +263,39 @@ static inline void * map_puts(struct map * m, const char * k,
     return map_put(m, &tmp, v);
 }
 
-static inline void * map_gets(struct map * m, const char * k) {
+__attribute__((unused)) static inline void * map_gets(struct map * m, const char * k) {
     struct chars tmp = {0};
     tmp.data = (char *)(uintptr_t)k;
     tmp.count = strlen(k);
     return map_get(m, &tmp);
 }
 
-static inline void map_removes(struct map * m, const char * k) {
+__attribute__((unused)) static inline void map_removes(struct map * m, const char * k) {
     struct chars tmp = {0};
     tmp.data = (char *)(uintptr_t)k;
     tmp.count = strlen(k);
     map_remove(m, &tmp);
 }
 
-static inline void chars_free_v(void * s) {
+__attribute__((unused)) static inline void chars_free_v(void * s) {
     chars_free((struct chars *)s);
 }
 
 #ifdef MAP_TESTS
 
-static void sum_ints(const void * k, void * v, void * ctx) {
+__attribute__((unused)) static void sum_ints(const void * k, void * v, void * ctx) {
     (void)k;
     int64_t * sum = ctx;
     *sum += *(int64_t *)v;
 }
 
-static void count_entries(const void * k, void * v, void * ctx) {
+__attribute__((unused)) static void count_entries(const void * k, void * v, void * ctx) {
     (void)k; (void)v;
     size_t * n = ctx;
     (*n)++;
 }
 
-static void test_map_ii(void) {
+__attribute__((unused)) static void test_map_ii(void) {
     struct map m;
     map_init(&m, MAP_KEY_INT, sizeof(int64_t), sizeof(int64_t), NULL);
     assert(m.count == 0 && m.capacity == 0);
@@ -342,7 +342,7 @@ static void test_map_ii(void) {
     map_free(&empty);
 }
 
-static void test_map_si(void) {
+__attribute__((unused)) static void test_map_si(void) {
     struct map m;
     map_init(&m, MAP_KEY_CHARS, sizeof(struct chars),
              sizeof(int64_t), NULL);
@@ -378,7 +378,7 @@ static void test_map_si(void) {
     map_free(&m);
 }
 
-static void test_map_sv(void) {
+__attribute__((unused)) static void test_map_sv(void) {
     struct map m;
     map_init(&m, MAP_KEY_CHARS, sizeof(struct chars),
              sizeof(struct chars), chars_free_v);
@@ -410,7 +410,7 @@ static void test_map_sv(void) {
     map_free(&m);
 }
 
-static void test(void) {
+__attribute__((unused)) static void test(void) {
     test_map_ii();
     test_map_si();
     test_map_sv();

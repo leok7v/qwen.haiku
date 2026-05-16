@@ -14,7 +14,7 @@ struct text { // vector of zero terminated owned strings
     size_t capacity;
 };
 
-static inline void text_put(struct text * t, const char * s, size_t n) {
+__attribute__((unused)) static inline void text_put(struct text * t, const char * s, size_t n) {
     arr_grow((struct arr *)t, sizeof(char *), t->count + 1);
     char * copy = oom(malloc(n + 1));
     memcpy(copy, s, n);
@@ -22,11 +22,11 @@ static inline void text_put(struct text * t, const char * s, size_t n) {
     t->data[t->count++] = copy;
 }
 
-static inline void text_puts(struct text * t, const char * s) {
+__attribute__((unused)) static inline void text_puts(struct text * t, const char * s) {
     text_put(t, s, strlen(s));
 }
 
-static inline void text_free(struct text * t) {
+__attribute__((unused)) static inline void text_free(struct text * t) {
     for (size_t i = 0; i < t->count; i++) { free(t->data[i]); }
     free(t->data);
     t->data = NULL;
@@ -36,7 +36,7 @@ static inline void text_free(struct text * t) {
 
 #ifdef TEXT_TESTS
 
-static void test_text(void) {
+__attribute__((unused)) static void test_text(void) {
     struct text t = {0};
     assert(t.data == NULL && t.count == 0 && t.capacity == 0);
     text_puts(&t, "hello");
@@ -65,7 +65,7 @@ static void test_text(void) {
     text_free(&empty);
 }
 
-static void test(void) {
+__attribute__((unused)) static void test(void) {
     test_text();
 }
 

@@ -11,11 +11,11 @@ struct chars { // always zero terminated array of bytes
     size_t capacity;
 };
 
-static inline void chars_grow(struct chars * s, size_t need) {
+__attribute__((unused)) static inline void chars_grow(struct chars * s, size_t need) {
     arr_grow((struct arr *)s, 1, need);
 }
 
-static inline void chars_put(struct chars * s, const char * d, size_t count) {
+__attribute__((unused)) static inline void chars_put(struct chars * s, const char * d, size_t count) {
     chars_grow(s, s->count + count + 1);
     if (s->data) {
         memcpy(s->data + s->count, d, count);
@@ -24,18 +24,18 @@ static inline void chars_put(struct chars * s, const char * d, size_t count) {
     }
 }
 
-static inline void chars_free(struct chars * s) {
+__attribute__((unused)) static inline void chars_free(struct chars * s) {
     free(s->data);
     s->data = NULL;
     s->count = 0;
     s->capacity = 0;
 }
 
-static inline void chars_puts(struct chars * s, const char * a) {
+__attribute__((unused)) static inline void chars_puts(struct chars * s, const char * a) {
     chars_put(s, a, strlen(a));
 }
 
-static inline void chars_vprintf(struct chars * s, const char * f,
+__attribute__((unused)) static inline void chars_vprintf(struct chars * s, const char * f,
                                  va_list vl) {
     va_list cp;
     va_copy(cp, vl);
@@ -49,7 +49,7 @@ static inline void chars_vprintf(struct chars * s, const char * f,
     }
 }
 
-static inline void chars_printf(struct chars * s, const char * f, ...) {
+__attribute__((unused)) static inline void chars_printf(struct chars * s, const char * f, ...) {
     va_list vl;
     va_start(vl, f);
     chars_vprintf(s, f, vl);
@@ -58,7 +58,7 @@ static inline void chars_printf(struct chars * s, const char * f, ...) {
 
 #ifdef CHARS_TESTS
 
-static void test_chars(void) {
+__attribute__((unused)) static void test_chars(void) {
     struct chars s = {0};
     assert(s.data == NULL && s.count == 0 && s.capacity == 0);
     chars_put(&s, "abc", 3);
