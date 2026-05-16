@@ -538,6 +538,77 @@ static char * jinja_format_system_block(const char * sys_text,
     return b.data;
 }
 
+// ---------------------------------------------------------------------------
+// Lean tool advert (Tool-Calling.md §2). Used by the decomposed cascade
+// in agent.c, NOT by the existing slm_generate / agent_run path.
+// Qwen3.5-0.8B's structural-syntax tolerance is fragile; the verbose
+// K_TOOL_INSTRUCTIONS block (~600 bytes of `<IMPORTANT>` reminders)
+// triggers token-wasting loops on 0.8B. The §2 spec layout below is
+// the minimal frame that the model reliably emits a valid <tool_call>
+// against.
+// ---------------------------------------------------------------------------
+static const char K_TOOL_INSTRUCTIONS_LEAN[] =
+    "# Tools\n\n"
+    "You may call one or more functions to assist with the user query."
+    " You are provided with function signatures within"
+    " <tools></tools> XML tags:\n\n<tools>";
+
+static const char K_TOOL_FOOTER_LEAN[] =
+    "</tools>\n\n"
+    "For each function call, return a json object with function name"
+    " and arguments within <tool_call></tool_call> XML tags:\n\n"
+    "<tool_call>\n"
+    "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+    "</tool_call>";
+
+// Build the full Router prompt: lean system block (advertising the
+// supplied tools), the user question, and the gen prompt (think OFF
+// per Tool-Calling.md §1+§3). Returns a heap-allocated string the
+// caller frees. tools / n_tools must be non-NULL/non-zero — this is
+// the tool-calling phase by construction.
+__attribute__((unused))
+static char * jinja_format_router_prompt(const char * sys_prompt,
+                                         const char * question,
+                                         const struct jinja_tool * tools,
+                                         int n_tools) {
+    struct chars b = {0};
+    chars_puts(&b, "<|im_start|>system\n");
+    chars_puts(&b, K_TOOL_INSTRUCTIONS_LEAN);
+    for (int i = 0; i < n_tools; i++) {
+        chars_puts(&b, "\n");
+        chars_puts(&b, tools[i].json);
+    }
+    chars_puts(&b, "\n");
+    chars_puts(&b, K_TOOL_FOOTER_LEAN);
+    if (sys_prompt != NULL && sys_prompt[0] != '\0') {
+        chars_puts(&b, "\n\n");
+        jinja_puts_trimmed(&b, sys_prompt);
+    }
+    chars_puts(&b, "<|im_end|>\n");
+    chars_puts(&b, "<|im_start|>user\n");
+    chars_puts(&b, question != NULL ? question : "");
+    chars_puts(&b, "<|im_end|>\n");
+    jinja_emit_gen_prompt(&b, /*enable_thinking=*/0);
+    return b.data;
+}
+
+// Build a passive (no-tools, no-think) prompt: just `<system>\n<sys>\n
+// <|im_end|>\n<user>\n<msg>\n<|im_end|>\n<assistant>\n<empty-think>\n`.
+// Used by the Evaluator and Synthesizer phases of the cascade.
+__attribute__((unused))
+static char * jinja_format_passive_prompt(const char * sys_prompt,
+                                          const char * user_msg) {
+    struct chars b = {0};
+    chars_puts(&b, "<|im_start|>system\n");
+    jinja_puts_trimmed(&b, sys_prompt != NULL ? sys_prompt : "");
+    chars_puts(&b, "<|im_end|>\n");
+    chars_puts(&b, "<|im_start|>user\n");
+    chars_puts(&b, user_msg != NULL ? user_msg : "");
+    chars_puts(&b, "<|im_end|>\n");
+    jinja_emit_gen_prompt(&b, /*enable_thinking=*/0);
+    return b.data;
+}
+
 // Format a single user-turn delta for slm_generate. Emits:
 //   <|im_start|>user\n<user_msg><|im_end|>\n
 //   <|im_start|>assistant\n<think prefix>

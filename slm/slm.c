@@ -969,13 +969,36 @@ struct print_cb_box {
     struct slm_stream_callback base;
 };
 
-static int print_cb_fn(const struct slm_stream_callback * cb) {
+// REPL / single / cascade callback. Handles all five chunk types so the
+// `--tools` cascade and `--repl` agent loop don't silently swallow
+// tool dialogue. `that` is set to &g_verbose (an `int`) — non-zero
+// flips every channel to stdout instead of stderr so a piped consumer
+// sees everything.
+static int g_verbose = 0;
+static int repl_cb_fn(const struct slm_stream_callback * cb) {
+    FILE * side = g_verbose ? stdout : stderr;
     if (cb->content != NULL) {
+        // Content always goes to stdout (it's the visible reply).
         fputs(cb->content, stdout);
         fflush(stdout);
     }
     if (cb->reasoning != NULL) {
-        fprintf(stderr, "[think] %s", cb->reasoning);
+        fprintf(side, "[think] %s", cb->reasoning);
+        fflush(side);
+    }
+    if (cb->call != NULL) {
+        fprintf(side, "\n[tool: %s]\n", cb->call);
+        fflush(side);
+    }
+    if (cb->response != NULL) {
+        // Cap visible payload at 400 chars so a 200 KB fetch body
+        // doesn't drown the terminal.
+        size_t n = strlen(cb->response);
+        size_t show = n > 400 ? 400 : n;
+        fprintf(side, "\n[result: %.*s%s]\n",
+                (int)show, cb->response,
+                n > show ? " …(truncated)" : "");
+        fflush(side);
     }
     return 0;
 }
@@ -1021,55 +1044,89 @@ static void strip_reasoning_for_history(struct chars * s) {
     s->data[kept] = '\0';
 }
 
+// Scripted multi-turn chat (-p "Q1" -p "Q2" ...). Two shapes mirror
+// run_repl / run_single:
+//   with_tools=false (default): growing-KV chat via slm_generate; one
+//     ctx, all turns appended, ctrl.tools forced OFF so the model
+//     emits content (not tool_call markers) — the original bug was
+//     that ctrl_defaults() has tools=true and the capture cb only saw
+//     .content, producing empty bubbles.
+//   with_tools=true: each -p is an independent cascade question. No
+//     conversation continuity — same shape as `--tools --repl`.
 static int32_t run_chat(const char ** prompts, int32_t n_prompts,
                         const char * system_prompt,
                         const struct slm_sampler * sp, uint64_t seed,
-                        int32_t max_new) {
+                        int32_t max_new,
+                        bool with_tools, bool with_think) {
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
-    struct slm_ctx * c = slm_model_loaded(m) ? slm_ctx_create(m) : NULL;
     int32_t r = 0;
-    if (c == NULL || !c->model->loaded) {
+    if (!slm_model_loaded(m)) {
         fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
         r = 1;
-    } else {
-        const char * sys = (system_prompt != NULL) ? system_prompt : "";
-        slm_ctx_system_prompt(c, sys, NULL);
-        struct capture_cb_box capbox = {0};
-        capbox.base.callback = capture_cb_fn;
+    } else if (with_tools) {
+        struct print_cb_box pbox = {0};
+        pbox.base.callback = repl_cb_fn;
         for (int32_t t = 0; t < n_prompts && r == 0; t++) {
-            printf("\n--- turn %d/%d ---\n", (int)(t + 1), (int)n_prompts);
-            if (t == 0 && system_prompt != NULL && system_prompt[0] != '\0') {
-                printf("[system] %s\n", system_prompt);
-            }
+            printf("\n--- turn %d/%d ---\n",
+                   (int)(t + 1), (int)n_prompts);
             printf("[user] %s\n[assistant] ", prompts[t]);
             fflush(stdout);
-            struct chars reply = {0};
-            capbox.out = &reply;
-            slm_generate(c, prompts[t], max_new, g_min_new, sp, seed,
-                         &capbox.base);
-            chars_put(&reply, "", 0);
-            strip_reasoning_for_history(&reply);
-            const char eot[] = "<|im_end|>";
-            size_t eot_len = sizeof(eot) - 1;
-            if (reply.count >= eot_len &&
-                memcmp(reply.data + reply.count - eot_len,
-                       eot, eot_len) == 0) {
-                reply.count -= eot_len;
-                reply.data[reply.count] = '\0';
-            }
-            fwrite(reply.data, 1, reply.count, stdout);
-            fflush(stdout);
+            char * answer = agent_cascade_run(m, prompts[t], sp, seed,
+                                              max_new, g_verbose,
+                                              &pbox.base);
             printf("\n");
-            fprintf(stderr,
+            free(answer);
+        }
+    } else {
+        struct slm_ctx * c = slm_ctx_create(m);
+        if (c == NULL) {
+            fprintf(stderr, "slm: ctx create failed\n");
+            r = 1;
+        } else {
+            const char * sys =
+                (system_prompt != NULL) ? system_prompt : "";
+            slm_ctx_ctrl(c)->tools = false;
+            slm_ctx_ctrl(c)->think = with_think;
+            slm_ctx_system_prompt(c, sys, NULL);
+            struct capture_cb_box capbox = {0};
+            capbox.base.callback = capture_cb_fn;
+            for (int32_t t = 0; t < n_prompts && r == 0; t++) {
+                printf("\n--- turn %d/%d ---\n",
+                       (int)(t + 1), (int)n_prompts);
+                if (t == 0 && system_prompt != NULL &&
+                    system_prompt[0] != '\0') {
+                    printf("[system] %s\n", system_prompt);
+                }
+                printf("[user] %s\n[assistant] ", prompts[t]);
+                fflush(stdout);
+                struct chars reply = {0};
+                capbox.out = &reply;
+                slm_generate(c, prompts[t], max_new, g_min_new,
+                             sp, seed, &capbox.base);
+                chars_put(&reply, "", 0);
+                strip_reasoning_for_history(&reply);
+                const char eot[] = "<|im_end|>";
+                size_t eot_len = sizeof(eot) - 1;
+                if (reply.count >= eot_len &&
+                    memcmp(reply.data + reply.count - eot_len,
+                           eot, eot_len) == 0) {
+                    reply.count -= eot_len;
+                    reply.data[reply.count] = '\0';
+                }
+                fwrite(reply.data, 1, reply.count, stdout);
+                fflush(stdout);
+                printf("\n");
+                fprintf(stderr,
                     "pp: %.2f tok/s (%d tok)  tg: %.2f tok/s (%d tok)"
                     "  kv pos=%d\n",
                     slm_pp_per_sec(c), (int)slm_n_prefill(c),
                     slm_tg_per_sec(c), (int)slm_n_generated(c),
                     (int)c->pos);
-            chars_free(&reply);
+                chars_free(&reply);
+            }
+            slm_ctx_destroy(c);
         }
     }
-    slm_ctx_destroy(c);
     slm_model_unload(m);
     return r;
 }
@@ -1209,40 +1266,62 @@ static int32_t run_ask(const char * question,
 }
 
 static int32_t run_single(const char * prompt, int32_t max_new,
-                          const struct slm_sampler * sp, uint64_t seed) {
+                          const struct slm_sampler * sp, uint64_t seed,
+                          bool with_tools, bool with_think) {
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
-    struct slm_ctx * c = slm_model_loaded(m) ? slm_ctx_create(m) : NULL;
     int32_t r = 0;
-    if (c == NULL || !c->model->loaded) {
+    if (!slm_model_loaded(m)) {
         fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
         r = 1;
-    } else {
-        printf("model: %d layers, %d heads (%d kv), head_dim=%d, "
-               "hidden=%d, ffn=%d, vocab=%d\n",
-               (int)c->model->cfg.n_layers, (int)c->model->cfg.n_heads,
-               (int)c->model->cfg.n_kv_heads, (int)c->model->cfg.head_dim,
-               (int)c->model->cfg.hidden_dim, (int)c->model->cfg.ffn_dim,
-               (int)c->model->cfg.vocab_size);
-        printf("rope: dim=%d base=%.1f sections=[%d,%d,%d,%d]\n",
-               (int)c->model->cfg.rope_dim, c->model->cfg.rope_theta,
-               (int)c->model->cfg.rope_sections[0],
-               (int)c->model->cfg.rope_sections[1],
-               (int)c->model->cfg.rope_sections[2],
-               (int)c->model->cfg.rope_sections[3]);
-        slm_ctx_system_prompt(c, "", NULL);
+    } else if (with_tools) {
         struct print_cb_box pbox = {0};
-        pbox.base.callback = print_cb_fn;
-        printf("---\n%s", prompt);
+        pbox.base.callback = repl_cb_fn;
+        printf("[user] %s\n", prompt);
         fflush(stdout);
-        slm_generate(c, prompt, max_new, g_min_new, sp, seed,
-                     &pbox.base);
+        char * answer = agent_cascade_run(m, prompt, sp, seed,
+                                          max_new, g_verbose,
+                                          &pbox.base);
         printf("\n");
-        fprintf(stderr,
-                "pp: %.2f tok/s (%d tok)  tg: %.2f tok/s (%d tok)\n",
-                slm_pp_per_sec(c), (int)slm_n_prefill(c),
-                slm_tg_per_sec(c), (int)slm_n_generated(c));
+        free(answer);
+    } else {
+        struct slm_ctx * c = slm_ctx_create(m);
+        if (c == NULL) {
+            fprintf(stderr, "slm: ctx create failed\n");
+            r = 1;
+        } else {
+            printf("model: %d layers, %d heads (%d kv), head_dim=%d, "
+                   "hidden=%d, ffn=%d, vocab=%d\n",
+                   (int)c->model->cfg.n_layers,
+                   (int)c->model->cfg.n_heads,
+                   (int)c->model->cfg.n_kv_heads,
+                   (int)c->model->cfg.head_dim,
+                   (int)c->model->cfg.hidden_dim,
+                   (int)c->model->cfg.ffn_dim,
+                   (int)c->model->cfg.vocab_size);
+            printf("rope: dim=%d base=%.1f sections=[%d,%d,%d,%d]\n",
+                   (int)c->model->cfg.rope_dim,
+                   c->model->cfg.rope_theta,
+                   (int)c->model->cfg.rope_sections[0],
+                   (int)c->model->cfg.rope_sections[1],
+                   (int)c->model->cfg.rope_sections[2],
+                   (int)c->model->cfg.rope_sections[3]);
+            slm_ctx_ctrl(c)->tools = false;
+            slm_ctx_ctrl(c)->think = with_think;
+            slm_ctx_system_prompt(c, "", NULL);
+            struct print_cb_box pbox = {0};
+            pbox.base.callback = repl_cb_fn;
+            printf("---\n%s", prompt);
+            fflush(stdout);
+            slm_generate(c, prompt, max_new, g_min_new, sp, seed,
+                         &pbox.base);
+            printf("\n");
+            fprintf(stderr,
+                    "pp: %.2f tok/s (%d tok)  tg: %.2f tok/s (%d tok)\n",
+                    slm_pp_per_sec(c), (int)slm_n_prefill(c),
+                    slm_tg_per_sec(c), (int)slm_n_generated(c));
+            slm_ctx_destroy(c);
+        }
     }
-    slm_ctx_destroy(c);
     slm_model_unload(m);
     return r;
 }
@@ -1301,36 +1380,81 @@ static int32_t run_bench(void) {
     return r;
 }
 
+// REPL. Two shapes:
+//   tools=false (default): growing-KV chat via slm_generate. Sys
+//     prompt = "You are a helpful assistant." Sampler as passed in.
+//   tools=true: each turn fires a fresh decomposed cascade (Router →
+//     Eval → Synth). No conversation continuity by design — the
+//     cascade is question-answering, not chat. Sampler is auto-clamped
+//     before calling here (T=0.0, top_p=1.0, rep=1.0).
 static int32_t run_repl(const struct slm_sampler * sp,
-                        uint64_t seed, int32_t max_new) {
+                        uint64_t seed, int32_t max_new,
+                        bool with_tools, bool with_think) {
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
-    struct slm_ctx * c = slm_model_loaded(m) ? slm_ctx_create(m) : NULL;
     int32_t r = 0;
-    if (c == NULL || !c->model->loaded) {
+    if (!slm_model_loaded(m)) {
         fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
         r = 1;
-    } else {
-        slm_ctx_system_prompt(c, "", NULL);
+    } else if (with_tools) {
         struct print_cb_box pbox = {0};
-        pbox.base.callback = print_cb_fn;
+        pbox.base.callback = repl_cb_fn;
         char line[4096];
-        printf("repl: type a message, Enter to send, Ctrl-D to exit.\n");
+        printf("repl: --tools mode (Router → Eval → Synth cascade)."
+               " Each turn is independent.\n"
+               "type a question, Enter to send, Ctrl-D to exit.\n> ");
+        fflush(stdout);
         while (fgets(line, sizeof(line), stdin) != NULL) {
             size_t n = strlen(line);
             while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) {
                 line[--n] = '\0';
             }
             if (n > 0) {
-                printf("\nassistant: ");
-                fflush(stdout);
-                slm_generate(c, line, max_new, g_min_new, sp, seed,
-                             &pbox.base);
+                char * answer = agent_cascade_run(m, line, sp, seed,
+                                                  max_new, g_verbose,
+                                                  &pbox.base);
+                // The synthesizer already streamed via pbox; the
+                // returned string is the fully-concatenated answer.
+                // Print a trailing newline + prompt; the answer text
+                // itself is already on stdout from the stream.
+                free(answer);
                 printf("\n\n> ");
                 fflush(stdout);
             }
         }
+    } else {
+        struct slm_ctx * c = slm_ctx_create(m);
+        if (c == NULL) {
+            fprintf(stderr, "slm: ctx create failed\n");
+            r = 1;
+        } else {
+            slm_ctx_ctrl(c)->tools = false;
+            slm_ctx_ctrl(c)->think = with_think;
+            slm_ctx_system_prompt(c, "You are a helpful assistant.",
+                                  NULL);
+            struct print_cb_box pbox = {0};
+            pbox.base.callback = repl_cb_fn;
+            char line[4096];
+            printf("repl: type a message, Enter to send,"
+                   " Ctrl-D to exit.\n> ");
+            fflush(stdout);
+            while (fgets(line, sizeof(line), stdin) != NULL) {
+                size_t n = strlen(line);
+                while (n > 0 &&
+                       (line[n-1] == '\n' || line[n-1] == '\r')) {
+                    line[--n] = '\0';
+                }
+                if (n > 0) {
+                    printf("\nassistant: ");
+                    fflush(stdout);
+                    slm_generate(c, line, max_new, g_min_new, sp, seed,
+                                 &pbox.base);
+                    printf("\n\n> ");
+                    fflush(stdout);
+                }
+            }
+            slm_ctx_destroy(c);
+        }
     }
-    slm_ctx_destroy(c);
     slm_model_unload(m);
     return r;
 }
@@ -1365,6 +1489,9 @@ int main(int argc, char ** argv) {
     int32_t  max_iters    = 4;
     int32_t  trace_agent  = 0;
     int32_t  dump_layer   = -1;
+    bool     with_tools   = false;     // CLI --tools / --no-tools
+    bool     with_think   = false;     // CLI --think / --no-think
+    bool     repl_max_new_set = false; // user set --max-new explicitly
     for (int32_t i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--self-test") == 0) {
             mode = CLI_SELF_TEST;
@@ -1372,7 +1499,13 @@ int main(int argc, char ** argv) {
             mode = CLI_CHUNKED_TEST;
         } else if (strcmp(argv[i], "--single") == 0) {
             mode = CLI_SINGLE;
-            if (i + 1 < argc) { prompt = argv[++i]; }
+            // Only consume the next argv as the prompt if it isn't
+            // itself a flag — lets the user write
+            // `--single --verbose "Q?"` or `--verbose --single "Q?"`
+            // interchangeably without losing the prompt to flag-eating.
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                prompt = argv[++i];
+            }
         } else if (strcmp(argv[i], "--repl") == 0) {
             mode = CLI_REPL;
         } else if (strcmp(argv[i], "--chat") == 0) {
@@ -1393,7 +1526,7 @@ int main(int argc, char ** argv) {
             mode = CLI_BENCH;
         } else if (strcmp(argv[i], "--ask") == 0 && i + 1 < argc) {
             mode = CLI_ASK;
-            prompt = argv[++i];
+            if (argv[i + 1][0] != '-') { prompt = argv[++i]; }
         } else if ((strcmp(argv[i], "-p") == 0 ||
                     strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
             if (chat_n < LLM_CLI_MAX_TURNS) {
@@ -1422,14 +1555,46 @@ int main(int argc, char ** argv) {
             seed = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--max-new") == 0 && i + 1 < argc) {
             max_new = atoi(argv[++i]);
+            repl_max_new_set = true;
         } else if (strcmp(argv[i], "--max-iters") == 0 && i + 1 < argc) {
             max_iters = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--trace") == 0) {
             trace_agent = 1;
+        } else if (strcmp(argv[i], "--verbose") == 0) {
+            g_verbose = 1;
+        } else if (strcmp(argv[i], "--tools") == 0) {
+            with_tools = true;
+        } else if (strcmp(argv[i], "--no-tools") == 0) {
+            with_tools = false;
+        } else if (strcmp(argv[i], "--think") == 0) {
+            with_think = true;
+        } else if (strcmp(argv[i], "--no-think") == 0) {
+            with_think = false;
         } else if (strcmp(argv[i], "--min-new") == 0 && i + 1 < argc) {
             g_min_new = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--dump-layer") == 0 && i + 1 < argc) {
             dump_layer = atoi(argv[++i]);
+        } else if (argv[i][0] != '-' &&
+                   (mode == CLI_SINGLE || mode == CLI_ASK)) {
+            // Bare positional argument — treat as the prompt for
+            // --single / --ask regardless of flag order. Lets the user
+            // write `--single --verbose --tools "Q?"` or any other
+            // permutation without losing the prompt.
+            prompt = argv[i];
+        }
+    }
+    // REPL default max_new bumped from 64 to 256 so one tool round-
+    // trip + a real reply fits. User --max-new still overrides.
+    if (mode == CLI_REPL && !repl_max_new_set) { max_new = 256; }
+    // When --tools is on, auto-clamp the sampler per Tool-Calling.md
+    // §3 — structural <tool_call> JSON shatters at T=0.7. User can
+    // still override via --temperature / --top-p / --rep-penalty
+    // AFTER --tools on the same line.
+    if (with_tools) {
+        if (sp.temperature == 0.7f) { sp.temperature = 0.0f;  }
+        if (sp.top_p       == 0.9f) { sp.top_p       = 1.0f;  }
+        if (sp.repetition_penalty == 1.25f) {
+            sp.repetition_penalty = 1.0f;
         }
     }
     g_dump_layer   = dump_layer;
@@ -1441,16 +1606,18 @@ int main(int argc, char ** argv) {
     } else if (mode == CLI_CHUNKED_TEST) {
         rc = chunked_self_test();
     } else if (mode == CLI_SINGLE) {
-        rc = run_single(prompt, max_new, &sp, seed);
+        rc = run_single(prompt, max_new, &sp, seed,
+                        with_tools, with_think);
     } else if (mode == CLI_REPL) {
-        rc = run_repl(&sp, seed, max_new);
+        rc = run_repl(&sp, seed, max_new, with_tools, with_think);
     } else if (mode == CLI_CHAT) {
         if (chat_n == 0) {
             fprintf(stderr, "llm: --chat needs at least one -p/--prompt\n");
             rc = 1;
         } else {
             rc = run_chat(chat_prompts, chat_n, system_prompt,
-                          &sp, seed, max_new);
+                          &sp, seed, max_new,
+                          with_tools, with_think);
         }
     } else if (mode == CLI_CHAT_TEST) {
         rc = run_chat_test(max_new);
@@ -1482,19 +1649,27 @@ int main(int argc, char ** argv) {
         rc = run_bench();
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
-               "  llm --self-test\n"
-               "  llm --bench\n"
-               "  llm --single \"prompt\" [--max-new N] [sampler flags]\n"
-               "  llm --repl [--max-new N] [sampler flags]\n"
-               "  llm --chat -p \"turn1\" [-p \"turn2\" ...] "
-                       "[-sys \"system prompt\"] [sampler flags]\n"
-               "  llm --chat-test [--max-new N]\n"
-               "  llm --jinja-test\n"
-               "  llm --tools-test          (live: needs network for DDG)\n"
-               "  llm --agent-test          (parser fixtures, no network)\n"
-               "  llm --ask \"question\" [--max-iters N] [--max-new N]"
-                       " [--trace] [sampler flags]\n"
-               "  llm --print-chat-template\n"
+               "  slm --self-test\n"
+               "  slm --bench\n"
+               "  slm --single \"prompt\" [--max-new N] [flags]\n"
+               "  slm --repl [--max-new N] [flags]\n"
+               "  slm --chat -p \"turn1\" [-p \"turn2\" ...] "
+                       "[-sys \"system prompt\"] [flags]\n"
+               "  slm --chat-test [--max-new N]\n"
+               "  slm --jinja-test\n"
+               "  slm --tools-test          (live: needs network for DDG)\n"
+               "  slm --agent-test          (parser fixtures, no network)\n"
+               "  slm --ask \"question\" [--max-iters N] [--max-new N]"
+                       " [--trace] [flags]\n"
+               "  slm --print-chat-template\n"
+               "\n"
+               "behavior flags (apply to --single / --repl):\n"
+               "  --tools / --no-tools              enable web-research"
+                       " cascade (auto-clamps T=0, top_p=1, rep=1)\n"
+               "  --think / --no-think              enable <think> mode"
+                       " (must stay off for --tools per Tool-Calling.md)\n"
+               "  --verbose                         stream every signal"
+                       " (content + reasoning + tool dialogue) to stdout\n"
                "\n"
                "sampler flags:\n"
                "  --temperature T                   0 = greedy, >0 = softmax T\n"

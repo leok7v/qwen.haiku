@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # rnd/sweep.sh — cross-host build + test sweep.
 #
-# Drives the full llm CLI battery (`--chat-test` is the load-bearing
+# Drives the full slm CLI battery (`--chat-test` is the load-bearing
 # parity gate) on every host in `rnd/build+test.md`. Writes captured
 # output to `rnd/sweep-results/<host>.out` so post-hoc diffing is easy.
 #
@@ -54,14 +54,14 @@ remote_battery() {
     local h=$1 path=$2 gguf=$3
     ssh "$h" "set -e; cd $path && \
         echo '--- build'            && make -C slm 2>&1 | tail -10 && \
-        echo '--- self-test'        && ./Build/cli/llm --self-test    2>&1 | tail -5  && \
-        echo '--- think-test'       && ./Build/cli/llm --think-test   2>&1 | tail -3  && \
-        echo '--- jinja-test'       && ./Build/cli/llm --jinja-test   2>&1 | tail -3  && \
-        echo '--- chunked-test'     && ./Build/cli/llm --chunked-test 2>&1 | tail -5  && \
-        echo '--- agent-test'       && ./Build/cli/llm --agent-test   2>&1 | tail -3  && \
-        echo '--- chat-test (hash gate)' && QWEN_GGUF=$gguf ./Build/cli/llm --chat-test 2>&1 | tail -10 && \
+        echo '--- self-test'        && ./Build/cli/slm --self-test    2>&1 | tail -5  && \
+        echo '--- think-test'       && ./Build/cli/slm --think-test   2>&1 | tail -3  && \
+        echo '--- jinja-test'       && ./Build/cli/slm --jinja-test   2>&1 | tail -3  && \
+        echo '--- chunked-test'     && ./Build/cli/slm --chunked-test 2>&1 | tail -5  && \
+        echo '--- agent-test'       && ./Build/cli/slm --agent-test   2>&1 | tail -3  && \
+        echo '--- chat-test (hash gate)' && QWEN_GGUF=$gguf ./Build/cli/slm --chat-test 2>&1 | tail -10 && \
         echo '--- qwen-test'        && ./Build/cli/qwen-test          2>&1 | tail -5  && \
-        echo '--- bench'            && QWEN_GGUF=$gguf ./Build/cli/llm --bench         2>&1 | tail -5"
+        echo '--- bench'            && QWEN_GGUF=$gguf ./Build/cli/slm --bench         2>&1 | tail -5"
 }
 
 # Extract the three chat-test hashes (pass 0 only) and the bench line,
@@ -91,14 +91,14 @@ run_apple() {
     echo "host: Apple M-series (local), NEON+dotprod, macOS arm64" > "$out"
     {
         make -C slm 2>&1 | tail -10
-        echo '--- self-test'    ; ./Build/cli/llm --self-test    2>&1 | tail -5
-        echo '--- think-test'   ; ./Build/cli/llm --think-test   2>&1 | tail -3
-        echo '--- jinja-test'   ; ./Build/cli/llm --jinja-test   2>&1 | tail -3
-        echo '--- chunked-test' ; ./Build/cli/llm --chunked-test 2>&1 | tail -5
-        echo '--- agent-test'   ; ./Build/cli/llm --agent-test   2>&1 | tail -3
-        echo '--- chat-test'    ; ./Build/cli/llm --chat-test    2>&1 | tail -10
+        echo '--- self-test'    ; ./Build/cli/slm --self-test    2>&1 | tail -5
+        echo '--- think-test'   ; ./Build/cli/slm --think-test   2>&1 | tail -3
+        echo '--- jinja-test'   ; ./Build/cli/slm --jinja-test   2>&1 | tail -3
+        echo '--- chunked-test' ; ./Build/cli/slm --chunked-test 2>&1 | tail -5
+        echo '--- agent-test'   ; ./Build/cli/slm --agent-test   2>&1 | tail -3
+        echo '--- chat-test'    ; ./Build/cli/slm --chat-test    2>&1 | tail -10
         echo '--- qwen-test'    ; ./Build/cli/qwen-test          2>&1 | tail -5
-        echo '--- bench'        ; QWEN_GGUF="$GGUF_MAC" ./Build/cli/llm --bench 2>&1 | tail -5
+        echo '--- bench'        ; QWEN_GGUF="$GGUF_MAC" ./Build/cli/slm --bench 2>&1 | tail -5
         if [ -x ./Build/cli/qwen-swift-cli ]; then
             echo '--- swift-cli chat-test'
             QWEN_GGUF="$GGUF_MAC" ./Build/cli/qwen-swift-cli chat-test 2>&1 | tail -10
@@ -142,8 +142,8 @@ run_pixel5() {
         -Wno-unused-parameter -Wno-missing-braces \
         -DLLM_CLI -DLLM_NO_TOOLS \
         -fvectorize -fslp-vectorize \
-        slm/slm.c -lm -o Build/cli/llm-android 2>&1 | tail -5 >> "$out"
-    adb push Build/cli/llm-android /data/local/tmp/llm 2>&1 | tail -3 >> "$out"
+        slm/slm.c -lm -o Build/cli/slm-android 2>&1 | tail -5 >> "$out"
+    adb push Build/cli/slm-android /data/local/tmp/slm 2>&1 | tail -3 >> "$out"
     # If GGUF isn't already on-device, push it (~530MB; one-time).
     if ! adb shell '[ -f /data/local/tmp/qwen.gguf ]' 2>/dev/null; then
         echo 'pushing gguf to device (one-time)...' >> "$out"
@@ -151,9 +151,9 @@ run_pixel5() {
     fi
     {
         echo '--- chat-test'
-        adb shell 'taskset -a f0 sh -c "QWEN_GGUF=/data/local/tmp/qwen.gguf /data/local/tmp/llm --chat-test"' 2>&1 | tail -10
+        adb shell 'taskset -a f0 sh -c "QWEN_GGUF=/data/local/tmp/qwen.gguf /data/local/tmp/slm --chat-test"' 2>&1 | tail -10
         echo '--- bench'
-        adb shell 'taskset -a f0 sh -c "QWEN_GGUF=/data/local/tmp/qwen.gguf /data/local/tmp/llm --bench"' 2>&1 | tail -8
+        adb shell 'taskset -a f0 sh -c "QWEN_GGUF=/data/local/tmp/qwen.gguf /data/local/tmp/slm --bench"' 2>&1 | tail -8
     } >> "$out"
     summarize "$out" "Pixel 5"
 }

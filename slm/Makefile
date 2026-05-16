@@ -26,7 +26,7 @@ CFLAGS += -mcpu=apple-m1
 endif
 
 BUILD := ../Build/cli
-BIN   := $(BUILD)/llm
+BIN   := $(BUILD)/slm
 # Standalone qwen.c test binary: compiles qwen.c on its own (own
 # header guards + #include's) with -DQWEN_TESTS so its trailing
 # main() runs `qwen_self_test` / `chunked_self_test` without the
