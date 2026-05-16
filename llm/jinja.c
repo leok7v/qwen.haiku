@@ -494,28 +494,65 @@ static char * jinja_apply(const struct jinja_message * msgs, int n_msgs,
     return result;
 }
 
-// Persistent-KV single-turn delta render. Mirrors the iOS app's
-// Chat.swift::ChatTemplate.applyDelta — the bytes the C runner
-// tokenizes for ONE new user turn, given an already-warm KV cache.
-// `system_prefix` is rendered INLINE with the user message (no
-// `<|im_start|>system` block), matching the framing the existing
-// run_chat currently builds by hand on first turn.
-//
+// Format the canonical Qwen3 system block for slm_ctx_system_prompt.
+// Emits:
+//   <|im_start|>system\n
+//   <effort_prefix><sys_text>\n
+//   <tools block if tools array non-empty>\n
+//   <|im_end|>\n
+// `tools` / `n_tools` carry the serialized JSON tool specs. When
+// n_tools == 0 no tools block is emitted. Caller frees the result.
+static char * jinja_format_system_block(const char * sys_text,
+                                        const struct slm_ctrl * ctrl,
+                                        const struct jinja_tool * tools,
+                                        int n_tools) {
+    struct chars b = {0};
+    chars_puts(&b, "<|im_start|>system\n");
+    // Effort prefix per ctrl->effort.
+    if (ctrl != NULL && ctrl->effort != NULL) {
+        if (strcmp(ctrl->effort, "low") == 0) {
+            chars_puts(&b, "(brief: 1-2 sentences)\n\n");
+        } else if (strcmp(ctrl->effort, "high") == 0) {
+            chars_puts(&b, "(think carefully step-by-step before "
+                           "answering)\n\n");
+        }
+    }
+    // System text (may be empty string).
+    if (sys_text != NULL && sys_text[0] != '\0') {
+        chars_puts(&b, sys_text);
+        chars_puts(&b, "\n");
+    }
+    // Tools block if any tools provided.
+    if (tools != NULL && n_tools > 0) {
+        chars_puts(&b, "# Tools\n\nYou have access to the following"
+                       " functions:\n\n<tools>");
+        for (int i = 0; i < n_tools; i++) {
+            chars_puts(&b, "\n");
+            chars_puts(&b, tools[i].json);
+        }
+        chars_puts(&b, "\n</tools>");
+        chars_puts(&b, K_TOOL_INSTRUCTIONS);
+        chars_puts(&b, "\n");
+    }
+    chars_puts(&b, "<|im_end|>\n");
+    return b.data;
+}
+
+// Format a single user-turn delta for slm_generate. Emits:
+//   <|im_start|>user\n<user_msg><|im_end|>\n
+//   <|im_start|>assistant\n<think prefix>
+// where think prefix is `<think>\n` (think=true) or
+// `<think>\n\n</think>\n\n` (think=false).
 // Caller frees the returned buffer.
-static char * jinja_apply_delta(const char * user_msg,
-                                const char * system_prefix,
-                                int enable_thinking) {
+static char * jinja_format_turn_delta(const char * user_msg,
+                                      bool think) {
     char * result = NULL;
     if (user_msg != NULL) {
         struct chars b = {0};
         chars_puts(&b, "<|im_start|>user\n");
-        if (system_prefix != NULL && system_prefix[0] != '\0') {
-            chars_puts(&b, system_prefix);
-            chars_puts(&b, "\n\n");
-        }
         chars_puts(&b, user_msg);
         chars_puts(&b, "<|im_end|>\n");
-        jinja_emit_gen_prompt(&b, enable_thinking);
+        jinja_emit_gen_prompt(&b, think ? 1 : 0);
         result = b.data;
     }
     return result;
@@ -613,12 +650,16 @@ static int32_t jinja_self_test(void) {
         }
         free(out);
     }
-    // Fixture E: applyDelta with system prefix on first turn.
+    // Fixture E: jinja_format_system_block, no tools, no effort.
     {
-        char * out = jinja_apply_delta("Hi there.", "Be brief.", 0);
+        struct slm_ctrl ctrl = {0};
+        ctrl.tools  = false;
+        ctrl.think  = false;
+        ctrl.effort = NULL;
+        char * out = jinja_format_system_block("Be helpful.", &ctrl,
+                                               NULL, 0);
         const char * gold =
-            "<|im_start|>user\nBe brief.\n\nHi there.<|im_end|>\n"
-            "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+            "<|im_start|>system\nBe helpful.\n<|im_end|>\n";
         if (out == NULL || strcmp(out, gold) != 0) {
             fprintf(stderr,
                     "jinja-test E FAIL\n  got:  %s\n  want: %s\n",
@@ -627,11 +668,11 @@ static int32_t jinja_self_test(void) {
         }
         free(out);
     }
-    // Fixture F: applyDelta without system prefix (subsequent turn).
+    // Fixture F: jinja_format_turn_delta, thinking off.
     {
-        char * out = jinja_apply_delta("Bye.", NULL, 0);
+        char * out = jinja_format_turn_delta("Hello!", false);
         const char * gold =
-            "<|im_start|>user\nBye.<|im_end|>\n"
+            "<|im_start|>user\nHello!<|im_end|>\n"
             "<|im_start|>assistant\n<think>\n\n</think>\n\n";
         if (out == NULL || strcmp(out, gold) != 0) {
             fprintf(stderr,

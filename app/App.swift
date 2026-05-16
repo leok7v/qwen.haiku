@@ -1,8 +1,30 @@
 import SwiftUI
 import Observation
+import Foundation
 #if os(macOS)
 import AppKit
 #endif
+
+// One chat bubble's worth of state. Stored on SLMViewModel; the C
+// side accumulates its own UTF-8 message fragments on slm_ctx, but
+// the UI wants a turn-grained view with reasoning split out, so we
+// keep our own slim list here.
+struct ChatMessage: Identifiable, Equatable, Sendable {
+    enum Role: String, Sendable {
+        case user
+        case assistant
+    }
+    let id:        UUID
+    var role:      Role
+    var content:   String
+    var reasoning: String?
+    init(role: Role, content: String, reasoning: String? = nil) {
+        self.id        = UUID()
+        self.role      = role
+        self.content   = content
+        self.reasoning = reasoning
+    }
+}
 
 #if os(macOS)
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -121,13 +143,22 @@ final class SLMViewModel {
                                       repetitionWindow:  64,
                                       maxNew:            512,
                                       minNew:            8)
-            let ctrl    = SLM.Ctrl(tools:  self.tools,
-                                   think:  self.think,
-                                   effort: "medium",
-                                   debug:  self.debug ? 1 : 0)
+            let toolsOn = self.tools
+            let thinkOn = self.think
+            let debugLv: Int32 = self.debug ? 1 : 0
+            let sysText = self.systemPrompt
             do {
                 let loaded = try await Task.detached(priority: .userInitiated) {
-                    try SLM(modelPath: path, sampler: sampler, ctrl: ctrl)
+                    () throws -> SLM in
+                    let slm = try SLM(modelPath: path, sampler: sampler)
+                    // Set ctrl BEFORE prefilling the system block —
+                    // tools/think get baked into the in-context framing.
+                    slm.ctrl.pointee.tools  = toolsOn
+                    slm.ctrl.pointee.think  = thinkOn
+                    slm.ctrl.pointee.effort = nil
+                    slm.ctrl.pointee.debug  = debugLv
+                    try slm.prefillSystem(text: sysText)
+                    return slm
                 }.value
                 self.slm   = loaded
                 self.state = .ready
@@ -138,34 +169,23 @@ final class SLMViewModel {
     }
 
     func send(_ text: String) async {
-        let trimmedSys  = systemPrompt
-            .trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedUser = text
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if slm != nil, state == .ready, !trimmedUser.isEmpty {
-            let isFirstTurn = !self.messages.contains(
-                where: { $0.role == .user })
             self.messages.append(
                 ChatMessage(role: .user, content: trimmedUser))
             self.messages.append(
                 ChatMessage(role: .assistant, content: ""))
             let assistantIdx = self.messages.count - 1
-            let delta = ChatTemplate.applyDelta(
-                userMessage: trimmedUser,
-                systemPrefix: isFirstTurn ? trimmedSys : nil,
-                reasoning: self.think,
-                tools: self.tools,
-                effort: "medium")
             self.state         = .generating
             self.stopRequested = false
             self.prefilling    = true
-            // Sync per-turn ctrl knobs onto the live SLM ctx so the
-            // next generate() reads the current toggle state.
-            self.slm?.ctrl = SLM.Ctrl(tools:  self.tools,
-                                      think:  self.think,
-                                      effort: "medium",
-                                      debug:  self.debug ? 1 : 0)
-            await self.streamAssistant(prompt: delta, at: assistantIdx)
+            // Debug is the only ctrl knob safe to flip mid-conversation
+            // (tools/think are frozen after prefillSystem). Push it
+            // down so the next generate() sees the current toggle.
+            self.slm?.ctrl.pointee.debug = self.debug ? 1 : 0
+            await self.streamAssistant(prompt: trimmedUser,
+                                       at: assistantIdx)
         }
     }
 
@@ -174,78 +194,59 @@ final class SLMViewModel {
             let debugOn = self.debug
             let thinkOn = self.think
             await Task.detached(priority: .userInitiated) { [weak self] in
-                var filter = ChatStreamFilter()
-                do {
-                    try slm.generate(prompt: prompt) { chunk in
-                        var keepGoing = true
-                        switch chunk {
-                        case .content(let s):
-                            let visible = filter.push(s)
-                            if !visible.isEmpty {
-                                Task { @MainActor in
-                                    self?.appendAssistant(visible,
-                                                          at: idx)
-                                }
-                            }
-                            if filter.done { keepGoing = false }
-                        case .reasoning(let s):
-                            if thinkOn {
-                                Task { @MainActor in
-                                    self?.appendReasoning(s, at: idx)
-                                }
-                            }
-                        case .toolCall(let body):
-                            if debugOn {
-                                let line = "\n[tool: " + body + "]\n"
-                                Task { @MainActor in
-                                    self?.appendAssistant(line,
-                                                          at: idx)
-                                }
-                            }
-                        case .toolResponse(let body):
-                            if debugOn {
-                                let n = min(body.count, 400)
-                                let prefix = String(body.prefix(n))
-                                let line = "\n[result: "
-                                         + prefix + "]\n"
-                                Task { @MainActor in
-                                    self?.appendAssistant(line,
-                                                          at: idx)
-                                }
-                            }
-                        case .prefilled:
-                            // Prefill finished, decode starts — drop
-                            // the "thinking…" indicator if the view
-                            // model tracks one. (The boolean swap is
-                            // intentionally minimal: at this model
-                            // size prefill is ~1s so no progress bar.)
-                            Task { @MainActor in
-                                self?.prefilling = false
-                            }
-                        }
-                        if keepGoing {
-                            keepGoing = !(self?.stopRequested ?? true)
-                        }
-                        return keepGoing
-                    }
-                    let tail = filter.finish()
-                    if !tail.isEmpty {
+                // The C side already strips <think>...</think> /
+                // <tool_call>...</tool_call> markers; chunks land in
+                // the right enum case. No client-side state machine.
+                _ = slm.generate(prompt: prompt) { chunk in
+                    var keepGoing = true
+                    switch chunk {
+                    case .content(let s):
                         Task { @MainActor in
-                            self?.appendAssistant(tail, at: idx)
+                            self?.appendAssistant(s, at: idx)
                         }
+                    case .reasoning(let s):
+                        if thinkOn {
+                            Task { @MainActor in
+                                self?.appendReasoning(s, at: idx)
+                            }
+                        }
+                    case .toolCall(let body):
+                        if debugOn {
+                            let line = "\n[tool: " + body + "]\n"
+                            Task { @MainActor in
+                                self?.appendAssistant(line, at: idx)
+                            }
+                        }
+                    case .toolResponse(let body):
+                        if debugOn {
+                            let n = min(body.count, 400)
+                            let prefix = String(body.prefix(n))
+                            let line = "\n[result: " + prefix + "]\n"
+                            Task { @MainActor in
+                                self?.appendAssistant(line, at: idx)
+                            }
+                        }
+                    case .prefilled:
+                        Task { @MainActor in
+                            self?.prefilling = false
+                        }
+                    case .pp:
+                        // Per-token prefill progress chunks. The view
+                        // model just shows a "thinking…" indicator;
+                        // ignore the position counter.
+                        break
                     }
-                    let pp = slm.ppPerSec
-                    let tg = slm.tgPerSec
-                    let np = slm.nPrefill
-                    let ng = slm.nGenerated
-                    Task { @MainActor in
-                        self?.cleanCommittedAssistant(at: idx)
-                        self?.finishTurn(pp: pp, tg: tg, np: np, ng: ng)
+                    if keepGoing {
+                        keepGoing = !(self?.stopRequested ?? true)
                     }
-                } catch {
-                    Task { @MainActor in
-                        self?.state = .error(String(describing: error))
-                    }
+                    return keepGoing
+                }
+                let pp = slm.ppPerSec
+                let tg = slm.tgPerSec
+                let np = slm.nPrefill
+                let ng = slm.nGenerated
+                Task { @MainActor in
+                    self?.finishTurn(pp: pp, tg: tg, np: np, ng: ng)
                 }
             }.value
         }
@@ -264,16 +265,6 @@ final class SLMViewModel {
         }
     }
 
-    private func cleanCommittedAssistant(at idx: Int) {
-        if idx < self.messages.count {
-            let raw = self.messages[idx].content
-            let cleaned = ChatStreamFilter.contentOnly(raw)
-            if cleaned != raw {
-                self.messages[idx].content = cleaned
-            }
-        }
-    }
-
     private func finishTurn(pp: Double, tg: Double, np: Int, ng: Int) {
         self.lastPP       = pp
         self.lastTG       = tg
@@ -286,7 +277,22 @@ final class SLMViewModel {
 
     func clearChat() {
         self.messages.removeAll()
-        self.slm?.newConversation(systemPrompt: self.systemPrompt)
+        if let slm = self.slm {
+            let sysText = self.systemPrompt
+            let toolsOn = self.tools
+            let thinkOn = self.think
+            let debugLv: Int32 = self.debug ? 1 : 0
+            do {
+                try slm.newConversation()
+                slm.ctrl.pointee.tools  = toolsOn
+                slm.ctrl.pointee.think  = thinkOn
+                slm.ctrl.pointee.effort = nil
+                slm.ctrl.pointee.debug  = debugLv
+                try slm.prefillSystem(text: sysText)
+            } catch {
+                self.state = .error(String(describing: error))
+            }
+        }
     }
 
 }

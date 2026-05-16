@@ -2,31 +2,34 @@
 //
 // SLM.swift - Swift bridge to the slm_* C runner.
 //
-// (Renamed from Qwen.swift on 2026-05-15 along with the C side's
-// llm_* → slm_* rename. "SLM" stands for Small Language Model — the
-// runner is no longer Qwen-specific in name, even though Qwen3.5 is
-// still the only architecture wired up.)
-//
 // Calls slm_* C functions directly through the Xcode bridging header
-// (app/bridge.h -> llm/slm.h), so it works on iOS as well as macOS,
-// no spawned binary, no IPC.
+// (app/bridge.h -> llm/slm.h). Works on iOS as well as macOS, no
+// spawned binary, no IPC.
 //
-// Lifecycle parallels the C side: instantiate once with a path to a
-// GGUF, run any number of generations on the same instance. Each
-// `SLM` owns a single `slm_ctx`, which holds the streaming KV/SSM
-// state. That state mutates on every forward pass, so an `SLM` is
-// NOT thread-safe; create one per concurrent stream.
+// Lifecycle parallels the C side (canonical Qwen3 framing):
+//   1. SLM(modelPath:) — open the GGUF.
+//   2. slm.ctrl.tools / slm.ctrl.think — flip BEFORE step 3.
+//   3. try slm.prefillSystem(text:) — sync prefill of system block.
+//   4. try slm.generate(prompt:) — repeat for each user turn.
+//
+// One `SLM` owns one `slm_ctx`. The ctx mutates on every forward
+// pass, so an SLM is NOT thread-safe — create one per concurrent
+// stream. Tools/think become read-only after prefillSystem returns.
 
 import Foundation
 
 public enum SLMError: Error, CustomStringConvertible {
 
     case loadFailed(String)
+    case ctxCreateFailed
+    case systemPromptFailed
     case generationFailed(String)
 
     public var description: String {
         switch self {
         case .loadFailed(let s):       return "slm load failed: \(s)"
+        case .ctxCreateFailed:         return "slm_ctx_create returned NULL"
+        case .systemPromptFailed:      return "slm_ctx_system_prompt aborted"
         case .generationFailed(let s): return "slm generation failed: \(s)"
         }
     }
@@ -36,14 +39,12 @@ public enum SLMError: Error, CustomStringConvertible {
 // `@unchecked Sendable`: the C ctx is not concurrency-safe within a
 // single SLM instance (every forward pass mutates the KV cache and
 // SSM state), but the object itself can be MOVED across isolation
-// boundaries: bootstrap loads on a detached task and hands the SLM
-// back to MainActor. Callers must not share one SLM across
-// concurrent generation streams.
+// boundaries — bootstrap loads on a detached task and hands the SLM
+// back to MainActor. Callers must not share one SLM across concurrent
+// generation streams.
 public final class SLM: @unchecked Sendable {
 
     /// Sampling parameters (passed to every slm_generate call).
-    /// Token-pick math only — conversation-shape knobs (tools,
-    /// reasoning, debug verbosity) moved to `Ctrl` below.
     public struct Sampler {
         public var temperature:       Float
         public var topK:              Int
@@ -75,63 +76,36 @@ public final class SLM: @unchecked Sendable {
         }
     }
 
-    /// Per-conversation behavior knobs. Stored on the C ctx via
-    /// `slm_set_ctrl`. The C side documents tools / think / effort as
-    /// "set once at conversation start"; debug is mutable on the fly.
-    public struct Ctrl {
-        public var tools:  Bool      // enable embedded agent dispatch
-        public var think:  Bool      // open <think> in gen prompt
-        public var effort: String    // "low" / "medium" / "high"
-        public var debug:  Int32     // 0 quiet, 9 chatty
-        public init(tools:  Bool   = true,
-                    think:  Bool   = false,
-                    effort: String = "medium",
-                    debug:  Int32  = 1) {
-            self.tools  = tools
-            self.think  = think
-            self.effort = effort
-            self.debug  = debug
-        }
-    }
-
-    /// One streamed piece from slm_generate. Each case corresponds to
-    /// exactly one signal the C runtime can emit:
-    ///   .content        — visible chat bubble
-    ///   .reasoning      — muted "thinking" panel (when shown)
-    ///   .toolCall       — debug-only "tool: …" trace line
-    ///   .toolResponse   — debug-only "result: …" trace line
-    ///   .prefilled      — prompt prefill finished; decode begins
+    /// One streamed piece from slm_generate / slm_ctx_system_prompt.
+    ///   .content     — visible reply text. Display in chat bubble.
+    ///   .reasoning   — text inside <think>...</think>. Muted.
+    ///   .toolCall    — debug-only "tool: …" trace.
+    ///   .toolResponse — debug-only "result: …" trace.
+    ///   .prefilled   — prompt prefill finished; decode begins.
+    ///   .pp(pos,total) — per-token prefill progress.
     public enum Chunk {
         case content(String)
         case reasoning(String)
         case toolCall(String)
         case toolResponse(String)
         case prefilled
+        case pp(Int, Int)
     }
 
     public let modelPath: URL
-    // Sampler is per-call — mutate freely between generate() calls.
     public var sampler:   Sampler
-    // Ctrl is per-conversation — set once, mostly. Changing tools /
-    // think / effort mid-conversation works mechanically but mixes
-    // history; flip debug freely.
-    public var ctrl:      Ctrl { didSet { syncCtrl() } }
 
     // `struct slm_model;` and `struct slm_ctx;` in slm.h are forward-
     // declared (opaque), so the Clang importer maps the pointers to
-    // OpaquePointer here. No wrapping, no UnsafeMutablePointer needed.
-    // The model is loaded once; the ctx is replaced on
-    // `newConversation()` (the new-API replacement for the old reset).
+    // OpaquePointer here.
     private let model: OpaquePointer
     private var ctx:   OpaquePointer
-    private var systemPromptCopy: String?  // remembered for new ctxs
 
-    /// Load the model at `modelPath` and open a first ctx. Throws
-    /// SLMError.loadFailed if the GGUF can't be parsed.
-    public init(modelPath:     URL,
-                systemPrompt:  String? = nil,
-                sampler:       Sampler = Sampler(),
-                ctrl:          Ctrl    = Ctrl()) throws {
+    /// Load the model at `modelPath` and open a fresh ctx. Throws
+    /// SLMError.loadFailed if the GGUF can't be parsed,
+    /// SLMError.ctxCreateFailed if the ctx couldn't be allocated.
+    public init(modelPath: URL,
+                sampler:   Sampler = Sampler()) throws {
         guard let m = slm_model_load(modelPath.path) else {
             throw SLMError.loadFailed("slm_model_load returned NULL")
         }
@@ -140,19 +114,14 @@ public final class SLM: @unchecked Sendable {
             slm_model_unload(m)
             throw SLMError.loadFailed(msg)
         }
-        let initialCtx = SLM.makeCtx(model:        m,
-                                     systemPrompt: systemPrompt,
-                                     ctrl:         ctrl)
-        guard let c = initialCtx else {
+        guard let c = slm_ctx_create(m) else {
             slm_model_unload(m)
-            throw SLMError.loadFailed("slm_ctx_create returned NULL")
+            throw SLMError.ctxCreateFailed
         }
-        self.model            = m
-        self.ctx              = c
-        self.modelPath        = modelPath
-        self.sampler          = sampler
-        self.ctrl             = ctrl
-        self.systemPromptCopy = systemPrompt
+        self.model     = m
+        self.ctx       = c
+        self.modelPath = modelPath
+        self.sampler   = sampler
     }
 
     deinit {
@@ -160,174 +129,164 @@ public final class SLM: @unchecked Sendable {
         slm_model_unload(model)
     }
 
-    /// Push the current Swift-side ctrl values down to the C ctx so
-    /// the next slm_generate sees them. Called automatically from
-    /// the `ctrl` didSet observer; callers can also invoke directly
-    /// after mutating ctrl in place via, e.g., `slm.ctrl.debug = 9`.
-    public func syncCtrl() {
-        ctrl.effort.withCString { effortPtr in
-            var c = slm_ctrl(tools:  ctrl.tools,
-                             think:  ctrl.think,
-                             effort: effortPtr,
-                             debug:  ctrl.debug)
-            slm_set_ctrl(ctx, &c)
-        }
+    /// Direct read-write access to the ctx's ctrl. Mutate fields
+    /// BEFORE prefillSystem() — tools / think get locked in.
+    ///
+    ///     slm.ctrl.pointee.tools = false
+    ///     slm.ctrl.pointee.think = true
+    public var ctrl: UnsafeMutablePointer<slm_ctrl> {
+        slm_ctx_ctrl(ctx)
     }
 
-    /// Start a fresh conversation: destroy the current ctx and open
-    /// a new one against the same model. Replaces the old `reset()`
-    /// — but explicit about WHAT it clears (everything stored on the
-    /// ctx; the model and the loaded weights survive). `systemPrompt
-    /// = nil` reuses whatever system prompt was passed at init time.
-    public func newConversation(systemPrompt: String? = nil) {
+    /// Start a new conversation: drop the current ctx, open a fresh
+    /// one against the same model. After this you must call
+    /// prefillSystem() again before generate().
+    public func newConversation() throws {
         slm_ctx_destroy(ctx)
-        let nextSys = systemPrompt ?? systemPromptCopy
-        guard let c = SLM.makeCtx(model:        model,
-                                  systemPrompt: nextSys,
-                                  ctrl:         ctrl) else {
-            // ctx_create only fails on unloaded model; the model was
-            // already validated at init time, so this branch is
-            // unreachable. Trap to surface the bug if it ever fires.
-            fatalError("slm_ctx_create returned NULL on loaded model")
+        guard let c = slm_ctx_create(model) else {
+            throw SLMError.ctxCreateFailed
         }
-        ctx               = c
-        systemPromptCopy  = nextSys
-        syncCtrl()
+        ctx = c
     }
 
-    /// Build a fresh ctx; helper for init + newConversation so the
-    /// ctrl-bridge dance lives in one place.
-    private static func makeCtx(model:        OpaquePointer,
-                                systemPrompt: String?,
-                                ctrl:         Ctrl) -> OpaquePointer? {
-        ctrl.effort.withCString { effortPtr -> OpaquePointer? in
-            var c = slm_ctrl(tools:  ctrl.tools,
-                             think:  ctrl.think,
-                             effort: effortPtr,
-                             debug:  ctrl.debug)
-            if let sys = systemPrompt {
-                return sys.withCString { sysPtr in
-                    slm_ctx_create(model, sysPtr, &c)
-                }
-            }
-            return slm_ctx_create(model, nil, &c)
-        }
-    }
-
-    /// Blocking: generate a full completion for `prompt` and return
-    /// it as a single string.
-    public func generate(prompt: String) throws -> String {
-        var collected = ""
-        try generate(prompt: prompt) { piece in
-            collected += piece
-            return true
-        }
-        return collected
-    }
-
-    /// Streaming (content-only): call `onToken` once per generated
-    /// UTF-8 piece of visible reply text. Reasoning, tool_call, and
-    /// tool_response chunks are silently dropped. Convenience for
-    /// callers that just want the bubble text.
-    public func generate(prompt: String,
-                         onToken: @escaping (String) -> Bool) throws {
-        try generate(prompt: prompt) { chunk in
-            var keepGoing = true
-            switch chunk {
-            case .content(let s):
-                keepGoing = onToken(s)
-            case .reasoning, .toolCall, .toolResponse, .prefilled:
-                break  // dropped by the content-only convenience
-            }
-            return keepGoing
-        }
-    }
-
-    /// Streaming (typed): call `onChunk` once per emission. The
-    /// chunk's case identifies the stream (content / reasoning /
-    /// toolCall / toolResponse). Return false to abort generation.
-    public func generate(prompt: String,
-                         onChunk: @escaping (Chunk) -> Bool) throws {
-        // slm_tokenize allocates the id array (worst-case sized);
-        // we free it on the way out. No more hard-coded 4096 cap.
-        var idsPtr: UnsafeMutablePointer<Int32>? = nil
-        let n = Int32(slm_tokenize(ctx, prompt, &idsPtr))
-        defer { free(idsPtr) }
-        guard let ids = idsPtr, n >= 0 else {
-            throw SLMError.generationFailed("tokenize failed")
-        }
-        // Bridge the Swift closure across the C callback boundary
-        // through an Unmanaged box so the callback `user` pointer
-        // stays alive for the duration of slm_generate().
+    /// Sync prefill of the system block. Must be called once per ctx
+    /// before any generate(). After it returns, ctrl.tools / .think
+    /// are frozen. Throws SLMError.systemPromptFailed if cancelled.
+    public func prefillSystem(text: String = "",
+                              onChunk: ((Chunk) -> Bool)? = nil) throws {
         let box = ContinuationBox(onChunk: onChunk)
-        let boxRef = Unmanaged.passRetained(box)
-        defer { boxRef.release() }
-        var s = slm_sampler(
+        let opaque = Unmanaged.passUnretained(box).toOpaque()
+        var cb = slm_stream_callback(
+            that:      opaque,
+            content:   nil, reasoning: nil, call: nil, response: nil,
+            prefilled: false,
+            pp_pos:    0, pp_total: 0,
+            callback:  slmStreamTrampoline)
+        let ok = withUnsafeMutablePointer(to: &cb) { p -> Bool in
+            text.withCString { tp in
+                slm_ctx_system_prompt(ctx, tp, p)
+            }
+        }
+        if !ok {
+            throw SLMError.systemPromptFailed
+        }
+    }
+
+    /// Run one user-turn chat round. Streams emissions through the
+    /// callback closure; return false from the closure to abort.
+    /// Returns the count of decode tokens emitted.
+    @discardableResult
+    public func generate(prompt:  String,
+                         onChunk: @escaping (Chunk) -> Bool) -> Int {
+        let box = ContinuationBox(onChunk: onChunk)
+        let opaque = Unmanaged.passUnretained(box).toOpaque()
+        var cb = slm_stream_callback(
+            that:      opaque,
+            content:   nil, reasoning: nil, call: nil, response: nil,
+            prefilled: false,
+            pp_pos:    0, pp_total: 0,
+            callback:  slmStreamTrampoline)
+        var sp = slm_sampler(
             temperature:        sampler.temperature,
             top_k:              Int32(sampler.topK),
             top_p:              sampler.topP,
             min_p:              sampler.minP,
             repetition_penalty: sampler.repetitionPenalty,
             repetition_window:  Int32(sampler.repetitionWindow))
-        _ = withUnsafePointer(to: &s) { sp -> Int32 in
-            Int32(slm_generate(
-                ctx,
-                ids, n,
-                Int32(sampler.maxNew),
-                Int32(sampler.minNew),
-                sp,
-                sampler.seed,
-                slmChunkTrampoline,
-                UnsafeMutableRawPointer(boxRef.toOpaque())))
+        let n = withUnsafePointer(to: &sp) { spp -> Int32 in
+            withUnsafeMutablePointer(to: &cb) { cbp -> Int32 in
+                prompt.withCString { pp in
+                    slm_generate(ctx, pp,
+                                 Int32(sampler.maxNew),
+                                 Int32(sampler.minNew),
+                                 spp,
+                                 sampler.seed,
+                                 cbp)
+                }
+            }
+        }
+        return Int(n)
+    }
+
+    /// Blocking convenience: collect content-only into a single
+    /// string. Reasoning, tool dialogue, and prefill chunks are
+    /// dropped. Returns the full reply text.
+    public func generate(prompt: String) -> String {
+        var collected = ""
+        _ = generate(prompt: prompt) { chunk in
+            if case .content(let s) = chunk {
+                collected += s
+            }
+            return true
+        }
+        return collected
+    }
+
+    /// Streaming content-only convenience: callback per visible piece.
+    public func generate(prompt:  String,
+                         onToken: @escaping (String) -> Bool) {
+        _ = generate(prompt: prompt) { chunk in
+            var keepGoing = true
+            if case .content(let s) = chunk {
+                keepGoing = onToken(s)
+            }
+            return keepGoing
         }
     }
 
-    // Metadata.
+    // Metadata + stats.
     public var vocabSize: Int { Int(slm_vocab_size(ctx)) }
     public var eosId:     Int { Int(slm_eos_id    (ctx)) }
     public var bosId:     Int { Int(slm_bos_id    (ctx)) }
+    public var ppPerSec:  Double { slm_pp_per_sec(ctx) }
+    public var tgPerSec:  Double { slm_tg_per_sec(ctx) }
+    public var nPrefill:  Int    { Int(slm_n_prefill(ctx)) }
+    public var nGenerated: Int   { Int(slm_n_generated(ctx)) }
 
-    // Throughput stats from the most recent generate() call. Zero
-    // before the first call completes.
-    public var ppPerSec:   Double { slm_pp_per_sec(ctx) }
-    public var tgPerSec:   Double { slm_tg_per_sec(ctx) }
-    public var nPrefill:   Int    { Int(slm_n_prefill(ctx)) }
-    public var nGenerated: Int    { Int(slm_n_generated(ctx)) }
+    /// Number of UTF-8 message fragments accumulated on the ctx.
+    public var messageCount: Int { Int(slm_ctx_messages_count(ctx)) }
+
+    /// i-th message fragment, or nil if out of range.
+    public func message(at i: Int) -> String? {
+        guard let p = slm_ctx_message(ctx, Int32(i)) else { return nil }
+        return String(cString: p)
+    }
 
 }
 
-// Bridge helpers, extracted so the call-site stays readable.
+// Bridge helpers, extracted so the call sites above stay readable.
 
 private final class ContinuationBox {
-    let onChunk: (SLM.Chunk) -> Bool
-    init(onChunk: @escaping (SLM.Chunk) -> Bool) {
+    let onChunk: ((SLM.Chunk) -> Bool)?
+    init(onChunk: ((SLM.Chunk) -> Bool)?) {
         self.onChunk = onChunk
     }
 }
 
-private func slmChunkTrampoline(
-    chunk: UnsafePointer<slm_stream_chunk>?,
-    user: UnsafeMutableRawPointer?
+// Trampoline for the new functor: the runtime hands us the same cb
+// struct it's invoking, with that == our box.
+private func slmStreamTrampoline(
+    cbPtr: UnsafePointer<slm_stream_callback>?
 ) -> Int32 {
-    var rc: Int32 = 1
-    if let chunk = chunk, let user = user {
-        let box = Unmanaged<ContinuationBox>.fromOpaque(user)
+    var rc: Int32 = 0
+    if let cbPtr = cbPtr, let opaque = cbPtr.pointee.that {
+        let box = Unmanaged<ContinuationBox>.fromOpaque(opaque)
                        .takeUnretainedValue()
-        let c = chunk.pointee
+        let cb = cbPtr.pointee
         var keepGoing = true
-        // Exactly one signal is set per emission per slm.h contract.
-        // The `prefilled` bool is checked first because the four
-        // string fields are NULL on that emission.
-        if c.prefilled {
-            keepGoing = box.onChunk(.prefilled)
-        } else if let p = c.content {
-            keepGoing = box.onChunk(.content(String(cString: p)))
-        } else if let p = c.reasoning {
-            keepGoing = box.onChunk(.reasoning(String(cString: p)))
-        } else if let p = c.call {
-            keepGoing = box.onChunk(.toolCall(String(cString: p)))
-        } else if let p = c.response {
-            keepGoing = box.onChunk(.toolResponse(String(cString: p)))
+        if cb.prefilled {
+            keepGoing = box.onChunk?(.prefilled) ?? true
+        } else if cb.pp_total > 0 {
+            keepGoing = box.onChunk?(.pp(Int(cb.pp_pos),
+                                         Int(cb.pp_total))) ?? true
+        } else if let p = cb.content {
+            keepGoing = box.onChunk?(.content(String(cString: p))) ?? true
+        } else if let p = cb.reasoning {
+            keepGoing = box.onChunk?(.reasoning(String(cString: p))) ?? true
+        } else if let p = cb.call {
+            keepGoing = box.onChunk?(.toolCall(String(cString: p))) ?? true
+        } else if let p = cb.response {
+            keepGoing = box.onChunk?(.toolResponse(String(cString: p))) ?? true
         }
         rc = keepGoing ? 0 : 1
     }

@@ -44,6 +44,7 @@
 #include <assert.h>
 
 #include "utils/maps.c"  // oom, struct chars, struct arr, struct map
+#include "utils/text.c"  // struct text (vector of owned UTF-8 strings)
 #include "tensor.c"      // struct tensor + ops (incl. neon.c + chunked.c)
 #include "slm.h"         // struct slm_ctrl + public API types
 #include "gguf.c"        // GGUF v3 reader
@@ -431,6 +432,14 @@ struct slm_model {
     char *                 chat_template;   // see footnote (1)
 };
 
+// Append-only token-id history (see slm_ctx_tokens accessor). Same
+// shape as utils/arrays.c's struct arr but typed for int32_t.
+struct slm_tokens {
+    int32_t * data;
+    size_t    count;
+    size_t    capacity;
+};
+
 struct slm_ctx {
     struct slm_model *     model;           // borrowed; NOT owned
     struct slm_kv          kv;
@@ -443,7 +452,9 @@ struct slm_ctx {
     int32_t                n_generated;
     int32_t                pos;             // see footnote (4)
     struct slm_ctrl        ctrl;            // see footnote (5)
-    char *                 system_prompt;   // see footnote (6)
+    bool                   system_committed; // see footnote (6)
+    struct slm_tokens      ids;             // see footnote (7)
+    struct text            messages;        // see footnote (8)
 };
 
 // slm_model / slm_ctx footnotes:
@@ -451,7 +462,7 @@ struct slm_ctx {
 // (1) chat_template: Jinja string from GGUF KV
 //     `tokenizer.chat_template`, copied as a NUL-terminated heap
 //     string (GGUF stores it length-prefixed). NULL if the GGUF lacks
-//     the KV (base completion models). Freed in slm_model_unload.
+//     the KV. Freed in slm_model_unload.
 //
 // (2) dump_layer: --dump-layer L diagnostic. When >= 0, the forward
 //     path prints the first 8 values of selected intermediate
@@ -465,28 +476,32 @@ struct slm_ctx {
 //     before any call has completed.
 //
 // (4) pos: next free position in the KV cache. Carries across
-//     consecutive slm_generate calls so multi-turn chat does not
-//     need to reformat and re-prefill prior turns — tokenize only
-//     the new delta (e.g. `<|im_start|>user\nQ<|im_end|>\n` +
-//     gen header) and call slm_generate again. A fresh ctx_create
-//     starts pos = 0.
+//     consecutive slm_generate calls — multi-turn chat tokenizes
+//     only the new delta and continues from there.
 //
-// (5) ctrl: per-conversation behavior knobs (tools / think / effort
-//     / debug). Initialized by slm_ctx_create from its `ctrl`
-//     argument (or defaults if NULL); callers can override via
-//     slm_set_ctrl(). slm_generate reads tools and debug from here
-//     on every call. think + effort feed into slm_chat_format_delta
-//     on the first turn; once committed to KV they are locked in
-//     for the rest of the conversation (changing them mid-stream
-//     produces a mixed history — that's why ctx is the granularity
-//     of "switch these settings").
+// (5) ctrl: per-conversation behavior knobs. Mutable via
+//     slm_ctx_ctrl() until slm_ctx_system_prompt commits the
+//     framing; tools/think become read-only after that. debug
+//     stays mutable on the fly.
 //
-// (6) system_prompt: a heap-owned copy of the system prompt passed
-//     to slm_ctx_create. Stored for record / future use (eventual
-//     auto-prefill at ctx_create time). Today the caller still
-//     passes it explicitly via slm_chat_format_delta on the first
-//     turn — the ctx field is informational. NULL if no system
-//     prompt was specified. Freed in slm_ctx_destroy.
+// (6) system_committed: flipped true by slm_ctx_system_prompt on
+//     success. slm_generate checks this and refuses to run if false
+//     (the framing must be prefilled first, even when system text
+//     is empty).
+//
+// (7) ids: append-only history of every token the ctx has seen.
+//     Includes system framing, every prefilled user turn, every
+//     generated assistant token, and every tool dialogue token.
+//     Exposed via slm_ctx_tokens(); pointer stable until the next
+//     ctx call.
+//
+// (8) messages: append-only vector of UTF-8 fragments emitted via
+//     the stream callback. Each user prompt is appended as one
+//     string; each emitted reasoning / content / tool fragment is
+//     appended as its own string. Exposed via
+//     slm_ctx_messages_count / slm_ctx_message. The callback's
+//     content/reasoning/call/response pointers point INTO this
+//     array's owned strings.
 static int g_dump_layer = -1;
 int g_no_q8k_rt = 0;
 // Token-level trace: when set, slm_generate prints each sampled
@@ -1201,32 +1216,22 @@ const char * slm_model_error(const struct slm_model * m) {
     return m == NULL ? "no model" : m->err;
 }
 
-struct slm_ctx * slm_ctx_create(struct slm_model * m,
-                                 const char * system_prompt,
-                                 const struct slm_ctrl * ctrl) {
+struct slm_ctx * slm_ctx_create(struct slm_model * m) {
     struct slm_ctx * c = NULL;
     if (m != NULL && m->loaded) {
         c = (struct slm_ctx *)oom(calloc(1, sizeof(struct slm_ctx)));
         c->model = m;
-        c->ctrl  = (ctrl != NULL) ? *ctrl : slm_ctrl_defaults();
+        c->ctrl  = slm_ctrl_defaults();
         kv_init(&c->kv, m->cfg.n_layers, m->cfg.n_kv_heads,
                 m->cfg.head_dim, m->cfg.max_position);
         ssm_cache_init(&c->ssm, &m->cfg);
         c->arena      = arena_new(64 * 1024 * 1024);
         c->dump_layer = g_dump_layer;
         c->pos        = 0;
-        if (system_prompt != NULL && system_prompt[0] != '\0') {
-            // Record the system prompt as the conversation's
-            // identity. We don't auto-prefill it (yet) — the
-            // caller continues to thread it through
-            // slm_chat_format_delta on turn 1 — but holding a
-            // copy here lets future ctx_create wiring shift the
-            // first-turn framing into the C side without changing
-            // the API again.
-            size_t n = strlen(system_prompt);
-            c->system_prompt = (char *)oom(malloc(n + 1));
-            memcpy(c->system_prompt, system_prompt, n + 1);
-        }
+        c->system_committed = false;
+        // c->ids and c->messages are zero-initialized via calloc;
+        // first append in slm_ctx_system_prompt / slm_generate
+        // grows the vectors on demand.
     }
     return c;
 }
@@ -1235,31 +1240,55 @@ void slm_ctx_destroy(struct slm_ctx * c) {
     if (c != NULL) {
         ssm_cache_free(&c->ssm);
         kv_free(&c->kv);
-        if (c->arena)         { arena_free(c->arena); c->arena = NULL; }
-        if (c->system_prompt) { free(c->system_prompt); }
+        if (c->arena) { arena_free(c->arena); c->arena = NULL; }
+        free(c->ids.data);
+        text_free(&c->messages);
         free(c);
     }
 }
 
-void slm_set_ctrl(struct slm_ctx * c, const struct slm_ctrl * ctrl) {
-    if (c != NULL && ctrl != NULL) { c->ctrl = *ctrl; }
+struct slm_ctrl * slm_ctx_ctrl(struct slm_ctx * c) {
+    return &c->ctrl;
 }
 
-struct slm_ctrl slm_get_ctrl(const struct slm_ctx * c) {
-    return c != NULL ? c->ctrl : slm_ctrl_defaults();
+const int32_t * slm_ctx_tokens(const struct slm_ctx * c, int32_t * out_n) {
+    const int32_t * p = NULL;
+    int32_t n = 0;
+    if (c != NULL && c->ids.count > 0) {
+        p = c->ids.data;
+        n = (int32_t)c->ids.count;
+    }
+    if (out_n != NULL) { *out_n = n; }
+    return p;
 }
 
-// slm_reset: file-internal, NOT exported. Drops the per-ctx pos +
-// SSM ring back to a fresh-conversation state WITHOUT reallocating
-// the KV cache or losing the model pointer. Used by agent.c's
-// iteration loop and the CLI chat-test (which verifies reset
-// reproducibility). The public way to start a new conversation is
-// slm_ctx_destroy + slm_ctx_create.
+int32_t slm_ctx_messages_count(const struct slm_ctx * c) {
+    return c == NULL ? 0 : (int32_t)c->messages.count;
+}
+
+const char * slm_ctx_message(const struct slm_ctx * c, int32_t i) {
+    const char * out = NULL;
+    if (c != NULL && i >= 0 && (size_t)i < c->messages.count) {
+        out = c->messages.data[i];
+    }
+    return out;
+}
+
+// File-internal: append a single int32_t to ctx->ids.
 __attribute__((unused))
-static void slm_reset(struct slm_ctx * c) {
-    if (c != NULL) {
-        ssm_cache_reset(&c->ssm, &c->model->cfg);
-        c->pos = 0;
+static void slm_ctx_ids_put(struct slm_ctx * c, int32_t v) {
+    arr_grow((struct arr *)&c->ids, sizeof(int32_t), c->ids.count + 1);
+    c->ids.data[c->ids.count++] = v;
+}
+
+// File-internal: append a buffer of ids.
+__attribute__((unused))
+static void slm_ctx_ids_append(struct slm_ctx * c,
+                               const int32_t * src, size_t n) {
+    if (n > 0) {
+        arr_grow((struct arr *)&c->ids, sizeof(int32_t), c->ids.count + n);
+        memcpy(c->ids.data + c->ids.count, src, n * sizeof(int32_t));
+        c->ids.count += n;
     }
 }
 

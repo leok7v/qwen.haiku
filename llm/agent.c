@@ -554,17 +554,20 @@ static void agent_dispatch(const struct agent_call * call,
     }
 }
 
-// Streaming-capture callback for the agent's slm_generate calls.
+// Streaming-capture functor for the agent's slm_generate_raw calls.
 // We only care about CONTENT bytes for tool-call parsing —
 // <tool_call> blocks emitted by the model live in content, never
 // inside <think>...</think>. The C-side filter already routes
-// reasoning to chunk->reasoning, which the agent drops (or could
-// surface as trace if needed).
-static int agent_capture_cb(const struct slm_stream_chunk * chunk,
-                            void * user) {
-    struct chars * out = (struct chars *)user;
-    if (chunk->content != NULL) {
-        chars_put(out, chunk->content, strlen(chunk->content));
+// reasoning to chunk->reasoning, which the agent drops.
+struct agent_capture_box {
+    struct slm_stream_callback base;
+    struct chars *             out;
+};
+
+static int agent_capture_cb_fn(const struct slm_stream_callback * cb) {
+    struct agent_capture_box * box = (struct agent_capture_box *)cb;
+    if (cb->content != NULL) {
+        chars_put(box->out, cb->content, strlen(cb->content));
     }
     return 0;
 }
@@ -573,30 +576,27 @@ static int agent_capture_cb(const struct slm_stream_chunk * chunk,
 // out. The loop stops when the model emits an assistant turn with
 // no <tool_call> blocks, or when max_iters is exhausted.
 //
-// `ctx` is reset at the start (fresh KV / SSM state). `print_trace`
-// non-zero echoes per-iteration tool calls + tool_response sizes to
-// stderr so the user can see what the agent is doing.
+// Creates and destroys a fresh ctx per iteration so the full
+// conversation history (rendered via jinja_apply) is re-prefilled
+// each time — the persistent-KV delta path is for slm_generate;
+// the agent's full-history replay needs a clean KV each round.
 //
-// Returns a heap-allocated string (caller frees). Empty string on
-// catastrophic failure; the visible content is whatever the model
-// produced in its last turn, with the <tool_call> blocks stripped
-// out so the user reads only the natural-language answer.
+// `print_trace` non-zero echoes per-iteration tool calls +
+// tool_response sizes to stderr.
+//
+// Returns a heap-allocated string (caller frees).
 __attribute__((unused))
-static char * agent_run(struct slm_ctx * ctx,
+static char * agent_run(struct slm_model * model,
                         const char * question,
                         const struct slm_sampler * sp, uint64_t seed,
                         int max_iters, int max_new,
                         int print_trace) {
-    slm_reset(ctx);
     struct jinja_tool tools[] = {
         { AGENT_TOOL_WEBSEARCH },
         { AGENT_TOOL_FETCH },
         { AGENT_TOOL_DISTILL },
     };
     int n_tools = (int)(sizeof(tools) / sizeof(tools[0]));
-    // Conversation history grows as the loop iterates. Cap at a
-    // generous bound; one tool_call + tool_response pair adds
-    // 2 messages.
     enum { MAX_MSGS = 64 };
     struct jinja_message msgs[MAX_MSGS];
     int n_msgs = 0;
@@ -604,8 +604,6 @@ static char * agent_run(struct slm_ctx * ctx,
     msgs[n_msgs].role    = JINJA_ROLE_USER;
     msgs[n_msgs].content = question;
     n_msgs++;
-    // Heap-allocated strings the loop owns; freed at exit (their
-    // pointers are stored in msgs[i].content via const-cast).
     char * owned[MAX_MSGS];
     int n_owned = 0;
     memset(owned, 0, sizeof(owned));
@@ -614,11 +612,8 @@ static char * agent_run(struct slm_ctx * ctx,
     int32_t * ids =
         (int32_t *)oom(calloc(16384, sizeof(int32_t)));
     // Loop post-condition: `final_text != NULL` is "we converged",
-    // `iter == max_iters` is "we ran out of attempts". No `done` /
-    // `rc_ok` flags — both were structural goto in disguise. A
-    // failed jinja_apply forces iter = max_iters (we can't proceed
-    // and re-trying would just hit the same NULL), which gives the
-    // same post-loop fallback path as natural exhaustion.
+    // `iter == max_iters` is "we ran out of attempts". A failed
+    // jinja_apply forces iter = max_iters (no progress possible).
     while (final_text == NULL && iter < max_iters) {
         iter++;
         char * prompt =
@@ -627,23 +622,35 @@ static char * agent_run(struct slm_ctx * ctx,
                         /*add_generation_prompt=*/1,
                         /*enable_thinking=*/0);
         if (prompt == NULL) {
-            iter = max_iters;   // force loop exit (no progress possible)
+            iter = max_iters;
         } else {
+            // Fresh ctx per iteration: full conversation re-prefilled.
+            struct slm_ctx * ctx = slm_ctx_create(model);
             int32_t n_ids =
                 tokenizer_encode(&ctx->model->tok, prompt, ids, 16384);
-            // Always reset before each iteration so the cumulative
-            // history is re-fed (KV cache rebuilds). Simple and
-            // robust; persistent-KV delta mode is a future
-            // optimisation.
-            slm_reset(ctx);
             struct chars reply = {0};
             if (print_trace) {
                 fprintf(stderr,
                         "agent: iter %d/%d prompt_tokens=%d\n",
                         iter, max_iters, (int)n_ids);
             }
-            slm_generate(ctx, ids, n_ids, max_new, 0, sp, seed,
-                         agent_capture_cb, &reply);
+            // Use slm_generate_raw directly (internal to TU) with
+            // the slm_split_trampoline so tool-call markers are
+            // handled correctly.
+            struct slm_split_box sbox = {0};
+            slm_think_filter_init(&sbox.filter);
+            sbox.filter.recognize_tool_calls = true;
+            sbox.filter.emit_visibility      = false;
+            struct agent_capture_box acbox = {0};
+            acbox.base.callback = agent_capture_cb_fn;
+            acbox.out           = &reply;
+            sbox.cb = &acbox.base;
+            slm_generate_raw(ctx, ids, n_ids, max_new, 0, sp, seed,
+                             slm_split_trampoline, &sbox,
+                             NULL);
+            slm_think_filter_finish(&sbox.filter, &acbox.base);
+            chars_free(&sbox.filter.tool_call);
+            slm_ctx_destroy(ctx);
             chars_put(&reply, "", 0);
             free(prompt);
             // Trim trailing <|im_end|> if present so the assistant
