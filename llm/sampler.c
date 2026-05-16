@@ -17,6 +17,9 @@
 // Greedy fast path: when sampler->temperature <= 0, skip the entire
 // chain and return argmax over the (penalty-adjusted) logits.
 
+#ifndef SAMPLER_C
+#define SAMPLER_C
+
 struct slm_sampler slm_sampler_defaults(void) {
     struct slm_sampler s;
     s.temperature        = 0.7f;
@@ -120,6 +123,7 @@ static void topk_sort_desc(int32_t * idx, float * val, int32_t filled) {
     }
 }
 
+__attribute__((unused))
 static int32_t sample_with(struct tensor * logits,
                            const struct slm_sampler * sp,
                            struct rng * rng,
@@ -165,3 +169,5 @@ static int32_t sample_with(struct tensor * logits,
     }
     return idx[picked];
 }
+
+#endif  // SAMPLER_C

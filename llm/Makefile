@@ -39,7 +39,7 @@ all: $(BIN) $(QWEN_TEST)
 # library needs to be a prerequisite or edits won't trigger a
 # rebuild (made/slm.c-only deps gave a stale binary against the
 # new qwen.c path on 2026-05-15).
-$(BIN): slm.c slm.h qwen.c gguf.c tokenizer.c sampler.c jinja.c \
+$(BIN): slm.c slm.h model.c qwen.c gguf.c tokenizer.c sampler.c jinja.c \
         tensor.c neon.c chunked.c \
         tools.c agent.c \
         utils/arrays.c utils/chars.c utils/maps.c \
@@ -48,7 +48,11 @@ $(BIN): slm.c slm.h qwen.c gguf.c tokenizer.c sampler.c jinja.c \
 
 # qwen.c standalone: not LLM_CLI (no slm.c main()), but QWEN_TESTS
 # (qwen.c's own main() that runs qwen_self_test + chunked_self_test).
-$(QWEN_TEST): qwen.c slm.h gguf.c tensor.c neon.c chunked.c \
+# Pulls in model.c (via #include) and sampler.c (via conditional
+# #include under QWEN_TESTS, for slm_ctrl_defaults referenced from
+# model.c's lifecycle).
+$(QWEN_TEST): qwen.c slm.h model.c gguf.c tokenizer.c sampler.c \
+              tensor.c neon.c chunked.c \
               utils/arrays.c utils/chars.c utils/maps.c \
               | $(BUILD)
 	$(CC) -O3 -std=c17 -Wall -Wextra \

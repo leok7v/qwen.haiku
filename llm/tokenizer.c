@@ -26,6 +26,9 @@
 // principle contain 0x00 bytes (after byte-to-unicode remapping they
 // don't, but the adapter doesn't rely on null termination).
 
+#ifndef TOKENIZER_C
+#define TOKENIZER_C
+
 // ---------------------------------------------------------------------------
 // s2i: thin (data, length, int32) adapter over utils/maps.c.
 // File-internal — only the tokenizer needs explicit-length string
@@ -390,6 +393,7 @@ static int32_t tokenizer_encode_bpe(const struct tokenizer * t,
 // Without the outer scan a marker like `<|im_start|>` is split into
 // six byte pieces, the model sees garbled framing instead of its
 // trained chat envelope, and quality collapses.
+__attribute__((unused))
 static int32_t tokenizer_encode(const struct tokenizer * t,
                           const char * text,
                           int32_t * out_ids, int32_t max_ids) {
@@ -427,6 +431,7 @@ static int32_t tokenizer_encode(const struct tokenizer * t,
 
 // Decode: token id -> raw UTF-8 bytes appended to `out`. Reverses the
 // byte-level remap.
+__attribute__((unused))
 static void tokenizer_decode_one(const struct tokenizer * t,
                            int32_t id, struct chars * out) {
     if (id >= 0 && id < t->vocab_size) {
@@ -448,3 +453,5 @@ static void tokenizer_decode_one(const struct tokenizer * t,
         }
     }
 }
+
+#endif  // TOKENIZER_C

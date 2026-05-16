@@ -75,149 +75,12 @@
 
 // ---------------------------------------------------------------------------
 // Public-ish API used by Swift bridge AND by main()
+//
+// slm_model_load / slm_model_unload / slm_ctx_create / slm_ctx_destroy
+// / slm_set_ctrl / slm_get_ctrl + the file-internal slm_reset() moved
+// to model.c (with the structs they own). The chat-template accessor
+// + chat formatting + the agent loop + the stream filter live below.
 // ---------------------------------------------------------------------------
-
-struct slm_model * slm_model_load(const char * path) {
-    struct slm_model * m =
-        (struct slm_model *)oom(calloc(1, sizeof(struct slm_model)));
-    if (gguf_open(&m->gguf, path) != 0) {
-        snprintf(m->err, sizeof(m->err), "gguf open failed");
-        return m;
-    }
-    if (slm_load_config(&m->gguf, &m->cfg) != 0) {
-        snprintf(m->err, sizeof(m->err), "config load failed");
-        return m;
-    }
-    if (slm_load_weights(&m->gguf, &m->cfg, &m->W) != 0) {
-        snprintf(m->err, sizeof(m->err), "weights resolve failed");
-        return m;
-    }
-    if (tokenizer_load(&m->tok, &m->gguf, &m->cfg) != 0) {
-        snprintf(m->err, sizeof(m->err), "tokenizer load failed");
-        return m;
-    }
-    // Chat-turn stop token: look up `<|im_end|>` in the vocab now
-    // that the tokenizer's string->id map is built. Stays -1 when the
-    // model isn't a chat-tuned vocab.
-    m->cfg.eot_id = s2i_get(&m->tok.vocab_to_id,
-                            "<|im_end|>", 10, -1);
-    // Full end-of-generation set: mirrors what llama.cpp prints on
-    // load as "EOG tokens" for qwen35. Generation stops on any of
-    // these. We can fit 8; the model declares 5.
-    static const char * stop_strs[] = {
-        "<|endoftext|>",
-        "<|im_end|>",
-        "<|fim_pad|>",
-        "<|repo_name|>",
-        "<|file_sep|>",
-        NULL,
-    };
-    m->cfg.n_stop_ids = 0;
-    for (int32_t i = 0; stop_strs[i] != NULL; i++) {
-        int32_t id = s2i_get(&m->tok.vocab_to_id,
-                             stop_strs[i],
-                             (int32_t)strlen(stop_strs[i]), -1);
-        if (id >= 0 && m->cfg.n_stop_ids <
-            (int32_t)(sizeof(m->cfg.stop_ids) / sizeof(m->cfg.stop_ids[0]))) {
-            m->cfg.stop_ids[m->cfg.n_stop_ids++] = id;
-        }
-    }
-    // Stash the Jinja chat template from `tokenizer.chat_template`
-    // as a null-terminated copy. Optional KV - base completion
-    // models won't have one; instruct/chat models do.
-    const struct gguf_kv * ct = gguf_find_kv(&m->gguf,
-                                             "tokenizer.chat_template");
-    if (ct != NULL && ct->v.type == GGUF_VT_STR) {
-        size_t cc = 0;
-        uint64_t n = gr_u64(ct->v.raw, &cc);
-        m->chat_template = (char *)malloc(n + 1);
-        if (m->chat_template != NULL) {
-            memcpy(m->chat_template, ct->v.raw + cc, n);
-            m->chat_template[n] = '\0';
-        }
-    }
-    m->loaded = 1;
-    return m;
-}
-
-void slm_model_unload(struct slm_model * m) {
-    if (m != NULL) {
-        tokenizer_free(&m->tok);
-        slm_free_weights(&m->W);
-        if (m->chat_template) { free(m->chat_template); }
-        gguf_close(&m->gguf);
-        free(m);
-    }
-}
-
-bool slm_model_loaded(const struct slm_model * m) {
-    return m != NULL && m->loaded != 0;
-}
-
-const char * slm_model_error(const struct slm_model * m) {
-    return m == NULL ? "no model" : m->err;
-}
-
-struct slm_ctx * slm_ctx_create(struct slm_model * m,
-                                 const char * system_prompt,
-                                 const struct slm_ctrl * ctrl) {
-    struct slm_ctx * c = NULL;
-    if (m != NULL && m->loaded) {
-        c = (struct slm_ctx *)oom(calloc(1, sizeof(struct slm_ctx)));
-        c->model = m;
-        c->ctrl  = (ctrl != NULL) ? *ctrl : slm_ctrl_defaults();
-        kv_init(&c->kv, m->cfg.n_layers, m->cfg.n_kv_heads,
-                m->cfg.head_dim, m->cfg.max_position);
-        ssm_cache_init(&c->ssm, &m->cfg);
-        c->arena      = arena_new(64 * 1024 * 1024);
-        c->dump_layer = g_dump_layer;
-        c->pos        = 0;
-        if (system_prompt != NULL && system_prompt[0] != '\0') {
-            // Record the system prompt as the conversation's
-            // identity. We don't auto-prefill it (yet) — the
-            // caller continues to thread it through
-            // slm_chat_format_delta on turn 1 — but holding a
-            // copy here lets future ctx_create wiring shift the
-            // first-turn framing into the C side without changing
-            // the API again.
-            size_t n = strlen(system_prompt);
-            c->system_prompt = (char *)oom(malloc(n + 1));
-            memcpy(c->system_prompt, system_prompt, n + 1);
-        }
-    }
-    return c;
-}
-
-void slm_ctx_destroy(struct slm_ctx * c) {
-    if (c != NULL) {
-        ssm_cache_free(&c->ssm);
-        kv_free(&c->kv);
-        if (c->arena)         { arena_free(c->arena); c->arena = NULL; }
-        if (c->system_prompt) { free(c->system_prompt); }
-        free(c);
-    }
-}
-
-void slm_set_ctrl(struct slm_ctx * c, const struct slm_ctrl * ctrl) {
-    if (c != NULL && ctrl != NULL) { c->ctrl = *ctrl; }
-}
-
-struct slm_ctrl slm_get_ctrl(const struct slm_ctx * c) {
-    return c != NULL ? c->ctrl : slm_ctrl_defaults();
-}
-
-// slm_reset: file-internal, NOT exported. Drops the per-ctx pos +
-// SSM ring back to a fresh-conversation state WITHOUT reallocating
-// the KV cache or losing the model pointer. Used by agent.c's
-// iteration loop and the CLI chat-test (which verifies reset
-// reproducibility). The public way to start a new conversation is
-// slm_ctx_destroy + slm_ctx_create.
-static void slm_reset(struct slm_ctx * c) {
-    if (c != NULL) {
-        ssm_cache_reset(&c->ssm, &c->model->cfg);
-        c->pos = 0;
-    }
-}
 
 const char * slm_chat_template(const struct slm_ctx * c) {
     return (c == NULL) ? NULL : c->model->chat_template;
@@ -282,7 +145,7 @@ static int slm_generate_raw(struct slm_ctx * c,
     if (sampler_in != NULL) { sp = *sampler_in; }
     struct rng rng;
     rng_seed(&rng, seed != 0 ? seed : (uint64_t)time(NULL));
-    qwen_trace_open();
+    slm_trace_open();
     int32_t   generated = 0;
     int32_t   pos       = c->pos;        // resume after previous call
     bool      stop      = false;
@@ -311,7 +174,7 @@ static int slm_generate_raw(struct slm_ctx * c,
                                                    prompt_n, pos);
         (void)logits;
         pos += prompt_n;
-        qwen_trace_close();
+        slm_trace_close();
     } else {
         for (int32_t i = 0; i < prompt_n && !stop; i++) {
             struct tensor * logits = slm_forward_step(c, prompt_ids[i], pos);
@@ -319,7 +182,7 @@ static int slm_generate_raw(struct slm_ctx * c,
             // forward pass only - one prompt token -> ~1850 JSONL
             // lines matches the llama-qwen-haiku reference dump
             // shape. Close after step 0 to keep file size bounded.
-            if (i == 0) { qwen_trace_close(); }
+            if (i == 0) { slm_trace_close(); }
             (void)logits;
             pos++;
         }
@@ -393,7 +256,7 @@ static int slm_generate_raw(struct slm_ctx * c,
     c->n_generated = generated;
     c->pos         = pos;                // persist across calls
     free(history);
-    qwen_trace_close();
+    slm_trace_close();
     return generated;
 }
 
