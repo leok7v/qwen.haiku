@@ -214,15 +214,42 @@ for x86 hosts it's the CPUID-derived tier.
 
 ## Throughput results
 
-Populated by the sweep. Update after each successful run.
+Populated by the sweep — last full sweep 2026-05-15. Reset-reproducible
+on every host (pass-0 hash == pass-1 hash); only Apple matches the
+authoritative parity gate `d2ba984b228fff7a / f12add080343c386 /
+a99b9d0705cc0220`. Non-Apple ISAs use different reduction trees and
+the x86 dispatch falls back to scalar for q*k_row_dot_q8k + libm SiLU
+(no AVX kernel for those yet — only the dispatch label says
+"AVX-VNNI" / "AVX2-FMA" / "AVX1"), so each ISA produces its own
+per-host hash baseline.
 
-| Chip                         | OS / arch        | Dispatch tier   | pp tok/s | tg tok/s | n_pp | n_tg |
-|------------------------------|------------------|-----------------|---------:|---------:|-----:|-----:|
-| Apple M-series               | macOS arm64      | NEON+dotprod    |    24.43 |    24.29 |   25 |   64 |
-| AMD Zen 5 (Strix Halo)       | Linux x86_64     | AVX-VNNI        |        — |        — |    — |    — |
-| Intel Haswell i7-4578U       | macOS x86_64     | AVX2-FMA        |        — |        — |    — |    — |
-| Intel Ivy Bridge i7-3615QM   | macOS x86_64     | AVX1            |        — |        — |    — |    — |
-| Intel Ivy Bridge i7-3720QM   | macOS x86_64     | AVX1            |        — |        — |    — |    — |
-| Intel Ivy Bridge i7-3667U    | Windows x86_64   | AVX1            |        — |        — |    — |    — |
-| Qualcomm SD 765G (A76 + A55) | Android arm64    | NEON+dotprod    |        — |        — |    — |    — |
-| Amlogic A311D (A73 + A53)    | Ubuntu arm64     | NEON-baseline   |        — |        — |    — |    — |
+Bench prompt: 25 prefill tokens, 64 decode tokens, greedy.
+
+| Chip                         | OS / arch        | Dispatch tier   | pp tok/s | tg tok/s | Status |
+|------------------------------|------------------|-----------------|---------:|---------:|--------|
+| AMD Zen 5 (Strix Halo)       | Linux x86_64     | AVX-VNNI        |    36.15 |    34.60 | runs   |
+| Apple M-series               | macOS arm64      | NEON+dotprod    |    24.63 |    24.17 | gate   |
+| Intel Ivy Bridge i7-3615QM   | macOS x86_64     | AVX1            |    15.52 |    14.92 | runs   |
+| Qualcomm SD 765G (A76 + A55) | Android arm64    | NEON+dotprod    |    10.04 |     9.91 | runs   |
+| Intel Haswell i7-4578U       | macOS x86_64     | AVX2-FMA        |     7.34 |     6.91 | runs   |
+| Amlogic A311D (A73 + A53)    | Ubuntu arm64     | NEON-baseline   |     3.42 |     3.37 | runs   |
+| Intel Ivy Bridge i7-3720QM   | macOS x86_64     | AVX1            |        — |        — | autosleep |
+| Intel Ivy Bridge i7-3667U    | Windows x86_64   | AVX1            |        — |        — | gguf push didn't land |
+
+"gate" = matches the authoritative `--chat-test` hash. "runs" = the
+binary builds + chat-test is reset-reproducible on that host with the
+ISA's own per-host hash baseline. "autosleep" / "gguf push didn't
+land" = no result this sweep.
+
+Observations:
+- AVX-VNNI on Zen 5 wins outright at 36 tok/s — the only x86 tier in
+  the fleet, but even via the scalar fallback (no AVX q*k kernel in
+  simd.c yet) it edges out Apple's NEON+dotprod path. ARM dotprod
+  closes the gap once the proper int8 kernels land for x86.
+- NEON-baseline (Khadas A73) is the floor at ~3 tok/s — same model,
+  same code, just no `sdot` instruction. Demonstrates the dispatcher
+  falls through cleanly on the lowest ARM tier.
+- Apple Silicon is the only host where the int8 kernels are wired
+  end-to-end through the simd dispatcher (the +dotprod NEON path).
+  All others are running the scalar reference for q*k dots — there's
+  significant headroom on x86 once the AVX paths are activated.

@@ -1,0 +1,45 @@
+host: Amlogic A311D (Khadas), khadas
+--- build
+make: Entering directory '/home/leo/qwen.haiku/llm'
+clang -O3 -std=c17 -Wall -Wextra -Wno-unused-parameter -Wno-missing-braces -DLLM_CLI -fvectorize -fslp-vectorize -o ../Build/cli/llm slm.c -lm -lcurl
+make: Leaving directory '/home/leo/qwen.haiku/llm'
+--- self-test
+[dump] [F]post_atn:       nan       nan       nan       nan ...     -nan      -nan      -nan   sum=nan
+[dump] [F]ffn_out :       nan       nan       nan       nan ...      nan       nan       nan   sum=nan
+[dump] [F]post_ffn:       nan       nan       nan       nan ...     -nan      -nan      -nan   sum=nan
+self-test: 256 non-finite logits at pos 2
+self-test: forward pass for 3 tokens...
+--- think-test
+think-test: PASS (6 fixtures)
+--- jinja-test
+jinja-test: PASS (10 fixtures)
+--- chunked-test
+chunked-test t=6: chunk[0..3] = -1196.606 -2393.093 -3589.341 -4785.23
+chunked-test t=7: auto[0..3] = 4150.437 8300.458 12449.71 16597.81
+chunked-test t=7: chunk[0..3] = 4150.43 8300.469 12449.73 16597.82
+chunked-test: max |Δ_out| = 0.875 at t=7 e=127 (rel 2.457e-06)
+chunked-test: max |Δ_state| = 0.04102 at d=109 e=121
+--- agent-test
+agent-test: PASS (parser fixtures)
+--- chat-test (hash gate)
+llm: qwen35 hybrid (Mamba-2/DeltaNet + attention). SSM math is best-guess.
+chat-test pass 0 turn 1: gen=34 hash=f9bb3483e7ccf46b pos=57
+chat-test pass 0 turn 2: gen=11 hash=bf6d36a2cb597fc1 pos=90
+chat-test pass 0 turn 3: gen=15 hash=897b408ae029bc38 pos=123
+chat-test pass 1 turn 1: gen=34 hash=f9bb3483e7ccf46b pos=57
+chat-test pass 1 turn 2: gen=11 hash=bf6d36a2cb597fc1 pos=90
+chat-test pass 1 turn 3: gen=15 hash=897b408ae029bc38 pos=123
+chat-test: PASS (3 turns x 2 passes, hashes match across slm_reset)
+--- qwen-test
+qwen-self-test: PASS
+self-test: forward pass for 3 tokens...
+  pos=0 tok=7 argmax=65 logit=14.8437
+  pos=1 tok=13 argmax=67 logit=8.1609
+  pos=2 tok=42 argmax=68 logit=3.5067
+--- bench
+llm: qwen35 hybrid (Mamba-2/DeltaNet + attention). SSM math is best-guess.
+  run 1: pp=3.38 tg=3.37
+  run 2: pp=3.42 tg=3.38
+  run 3: pp=3.42 tg=3.37
+bench: pp=3.42 tg=3.37 n_pp=25 n_tg=64 dispatch=NEON-baseline
+summary: Amlogic A311D (Khadas): FAIL | pp=3.42 tg=3.37 n_pp=25 n_tg=64 dispatch=NEON-baseline | hashes=f9bb3483e7ccf46b bf6d36a2cb597fc1 897b408ae029bc38

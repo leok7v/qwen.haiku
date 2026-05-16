@@ -20,7 +20,9 @@
 #define TENSOR_C
 
 #include <assert.h>
+#ifdef __APPLE__
 #include <dispatch/dispatch.h>
+#endif
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -43,6 +45,24 @@
 
 #define TENSOR_MAX_DIMS 4
 #define TENSOR_ALIGN    64
+
+// Parallel-for over [0, N). On Apple we use GCD (dispatch_apply with
+// a clang block); elsewhere we fall back to a sequential loop. The
+// non-Apple path is correct but un-threaded — a future pass can wire
+// OpenMP or pthreads. The macro keeps call sites identical across
+// platforms; the body is a `{}` block referencing the loop var.
+//
+// Usage:
+//   LLM_PAR_FOR(N, jj, {
+//       ... body referencing jj ...
+//   });
+#ifdef __APPLE__
+  #define LLM_PAR_FOR(N, var, BODY) \
+      dispatch_apply((size_t)(N), DISPATCH_APPLY_AUTO, ^(size_t var) BODY)
+#else
+  #define LLM_PAR_FOR(N, var, BODY) \
+      do { for (size_t var = 0; var < (size_t)(N); var++) BODY } while (0)
+#endif
 
 struct arena;
 
@@ -504,7 +524,7 @@ struct tensor * tensor_matmul_f32(struct tensor * w, struct tensor * x) {
     for (int64_t t = 0; t < n; t++) {
         const float * xr = x->data + t * k;
         float * or_      = out->data + t * out_f;
-        dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
+        LLM_PAR_FOR(out_f, jj, {
             int64_t j = (int64_t)jj;
             const float * wr = w->data + j * k;
             float acc = 0.0f;
@@ -539,7 +559,7 @@ struct tensor * tensor_matmul_q4_f32(const q4_block * w_blocks,
     for (int64_t t = 0; t < n; t++) {
         const float * xr = x->data + t * k;
         float * or_      = out->data + t * out_f;
-        dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
+        LLM_PAR_FOR(out_f, jj, {
             int64_t j = (int64_t)jj;
             const q4_block * row = w_blocks + j * nb_per_row;
             float acc = 0.0f;
@@ -821,7 +841,7 @@ struct tensor * tensor_matmul_q4k_f32(const q4k_block * w_blocks,
         // exactly. The previous per-block-then-outer-sum pattern was
         // mathematically equivalent but rounded differently, producing
         // 1 ULP drift on some weight matrices (visible at attn_gate).
-        dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
+        LLM_PAR_FOR(out_f, jj, {
             int64_t j = (int64_t)jj;
             const q4k_block * row = w_blocks + j * nb_per_row;
             or_[j] = simd_q4k_row_dot_q8k((int)nb_per_row, row, xq8);
@@ -887,7 +907,7 @@ struct tensor * tensor_matmul_q5k_f32(const q5k_block * w_blocks,
     for (int64_t t = 0; t < n; t++) {
         quantize_row_q8_K(x->data + t * k, xq8, k);
         float * or_ = out->data + t * out_f;
-        dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
+        LLM_PAR_FOR(out_f, jj, {
             int64_t j = (int64_t)jj;
             const q5k_block * row = w_blocks + j * nb_per_row;
             or_[j] = simd_q5k_row_dot_q8k((int)nb_per_row, row, xq8);
@@ -949,7 +969,7 @@ struct tensor * tensor_matmul_q8_0_f32(const q8_0_block * w_blocks,
     for (int64_t t = 0; t < n; t++) {
         tensor_quantize_row_q8_0(x->data + t * k, xq, k);
         float * or_ = out->data + t * out_f;
-        dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
+        LLM_PAR_FOR(out_f, jj, {
             int64_t j = (int64_t)jj;
             const q8_0_block * row = w_blocks + j * nb_per_row;
             or_[j] = simd_q8_0_dot_q8_0(row, xq, k);
@@ -1001,7 +1021,7 @@ struct tensor * tensor_matmul_q6k_f32(const q6k_block * w_blocks,
     for (int64_t t = 0; t < n; t++) {
         quantize_row_q8_K(x->data + t * k, xq8, k);
         float * or_ = out->data + t * out_f;
-        dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
+        LLM_PAR_FOR(out_f, jj, {
             int64_t j = (int64_t)jj;
             const q6k_block * row = w_blocks + j * nb_per_row;
             or_[j] = simd_q6k_row_dot_q8k((int)nb_per_row, row, xq8);

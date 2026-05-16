@@ -1,0 +1,43 @@
+host: Intel Haswell, x
+--- build
+make: Nothing to be done for `all'.
+--- self-test
+[dump] [F]post_ffn:   -0.0047    0.0031   -0.0017    0.0024 ...  -0.0001    0.0237    0.0219   sum=-498007.948111
+self-test: forward pass for 3 tokens...
+  pos=0 tok=7 argmax=65 logit=2430516.0000
+  pos=1 tok=13 argmax=66 logit=3934054.0000
+  pos=2 tok=42 argmax=47 logit=3793068.5000
+--- think-test
+think-test: PASS (6 fixtures)
+--- jinja-test
+jinja-test: PASS (10 fixtures)
+--- chunked-test
+chunked-test t=6: chunk[0..3] = -1196.608 -2393.096 -3589.346 -4785.237
+chunked-test t=7: auto[0..3] = 4150.438 8300.472 12449.71 16597.81
+chunked-test t=7: chunk[0..3] = 4150.438 8300.484 12449.76 16597.85
+chunked-test: max |Δ_out| = 1.469 at t=7 e=121 (rel 4.112e-06)
+chunked-test: max |Δ_state| = 0.07812 at d=111 e=121
+--- agent-test
+agent-test: PASS (parser fixtures)
+--- chat-test (hash gate)
+llm: qwen35 hybrid (Mamba-2/DeltaNet + attention). SSM math is best-guess.
+chat-test pass 0 turn 1: gen=17 hash=f18b3aaa408cf631 pos=40
+chat-test pass 0 turn 2: gen=39 hash=aafa64c983bbc2aa pos=101
+chat-test pass 0 turn 3: gen=31 hash=fb7cec527f72f095 pos=150
+chat-test pass 1 turn 1: gen=17 hash=f18b3aaa408cf631 pos=40
+chat-test pass 1 turn 2: gen=39 hash=aafa64c983bbc2aa pos=101
+chat-test pass 1 turn 3: gen=31 hash=fb7cec527f72f095 pos=150
+chat-test: PASS (3 turns x 2 passes, hashes match across slm_reset)
+--- qwen-test
+qwen-self-test: PASS
+self-test: forward pass for 3 tokens...
+  pos=0 tok=7 argmax=65 logit=197554536972288.0000
+  pos=1 tok=13 argmax=66 logit=210898195054592.0000
+  pos=2 tok=42 argmax=47 logit=203324808757248.0000
+--- bench
+llm: qwen35 hybrid (Mamba-2/DeltaNet + attention). SSM math is best-guess.
+  run 1: pp=3.28 tg=6.91
+  run 2: pp=7.34 tg=7.14
+  run 3: pp=7.77 tg=0.35
+bench: pp=7.34 tg=6.91 n_pp=25 n_tg=64 dispatch=AVX2-FMA
+summary: Intel Haswell: FAIL | pp=7.34 tg=6.91 n_pp=25 n_tg=64 dispatch=AVX2-FMA | hashes=f18b3aaa408cf631 aafa64c983bbc2aa fb7cec527f72f095

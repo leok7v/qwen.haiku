@@ -27,6 +27,22 @@
 #ifndef QWEN_C
 #define QWEN_C
 
+// Feature-test macros must precede any system header. When qwen.c is
+// the TU root (qwen-test standalone), slm.c isn't there to set them.
+// Same shape as slm.c's block — see comments there.
+#if defined(__APPLE__)
+  #ifndef _DARWIN_C_SOURCE
+  #define _DARWIN_C_SOURCE
+  #endif
+#else
+  #ifndef _POSIX_C_SOURCE
+  #define _POSIX_C_SOURCE 200809L
+  #endif
+  #ifndef _GNU_SOURCE
+  #define _GNU_SOURCE
+  #endif
+#endif
+
 #include "model.c"       // shared structs, attn, KV, rng, lifecycle
 
 

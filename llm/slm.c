@@ -35,6 +35,24 @@
 // tokenizer, Q4_K_M weight loader, forward pass, RNG primitives)
 // lives in qwen.c, `#include`d below.
 
+// Feature-test macros must be defined BEFORE any system header is
+// processed (transitively via utils/maps.c → arrays.c → stdlib.h).
+// Linux glibc gates clock_gettime/CLOCK_MONOTONIC behind POSIX
+// 2001+ and memmem() behind _GNU_SOURCE. macOS gates BSD types
+// (u_char/u_short used by sys/proc.h) behind _DARWIN_C_SOURCE.
+#if defined(__APPLE__)
+  #ifndef _DARWIN_C_SOURCE
+  #define _DARWIN_C_SOURCE
+  #endif
+#else
+  #ifndef _POSIX_C_SOURCE
+  #define _POSIX_C_SOURCE 200809L
+  #endif
+  #ifndef _GNU_SOURCE
+  #define _GNU_SOURCE
+  #endif
+#endif
+
 // Include utils/maps.c FIRST so the `oom()` allocator wrapper and
 // struct chars / struct arr layouts are in scope before tensor.c
 // (chunked.c's self-test, included via tensor.c, calls `oom()` on

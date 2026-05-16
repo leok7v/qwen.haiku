@@ -95,7 +95,10 @@
 #ifndef CHUNKED_C
 #define CHUNKED_C
 
+#if defined(__aarch64__) || defined(__arm__)
 #include <arm_neon.h>
+#define CHUNKED_NEON 1
+#endif
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -125,6 +128,7 @@
 // the threshold that affects sampling.
 // ---------------------------------------------------------------------------
 
+#ifdef CHUNKED_NEON
 static inline float chunked_dot_f32(const float * a, const float * b, int k) {
     float32x4_t acc = vdupq_n_f32(0.0f);
     int i = 0;
@@ -175,6 +179,27 @@ static inline void chunked_scal_f32(float * y, const float * x,
     }
     for (; i < k; i++) { y[i] = alpha * x[i]; }
 }
+#else
+// Portable scalar fallbacks. clang -O3 -fvectorize hoists these into
+// SSE/AVX automatically on x86; on plain scalar hosts the loops run
+// as written. fp32 reduction order is "left to right per row", which
+// is what ggml's GEN-branch reference uses (vs the 4-lane parallel
+// chain we use on NEON). The relative-error tolerance the chunked
+// kernel ships with (1e-5) absorbs the ULP-per-multiply drift.
+static inline float chunked_dot_f32(const float * a, const float * b, int k) {
+    float s = 0.0f;
+    for (int i = 0; i < k; i++) { s += a[i] * b[i]; }
+    return s;
+}
+static inline void chunked_axpy_f32(float * y, const float * x,
+                                    float alpha, int k) {
+    for (int i = 0; i < k; i++) { y[i] += alpha * x[i]; }
+}
+static inline void chunked_scal_f32(float * y, const float * x,
+                                    float alpha, int k) {
+    for (int i = 0; i < k; i++) { y[i] = alpha * x[i]; }
+}
+#endif
 
 // Forward substitution on a strict-lower-triangular system (I - L)X = B
 // where L has zero diagonal. Solution overwrites X (B may be the same

@@ -41,39 +41,18 @@
 //   - tool_result lifetime: caller frees `body` and `error` via
 //     tools_result_free.
 
-#include <ctype.h>
-#include <curl/curl.h>
+// Always-available headers + ts_buf helpers (used by agent.c too —
+// must stay visible regardless of LLM_NO_TOOLS).
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>  // sleep()
 
-#ifndef TOOLS_FETCH_CAP
-#define TOOLS_FETCH_CAP (200 * 1024)
-#endif
-
-struct tool_result {
-    int    ok;       // 1 on success, 0 on error
-    char * body;     // heap-allocated UTF-8 (caller frees), may be NULL
-    char * error;    // heap-allocated UTF-8 (caller frees), may be NULL
-    long   status;   // HTTP status code (0 if no HTTP call was made)
-};
-
-static void tools_result_free(struct tool_result * r) {
-    if (r != NULL) {
-        free(r->body);
-        free(r->error);
-        r->body   = NULL;
-        r->error  = NULL;
-        r->ok     = 0;
-        r->status = 0;
-    }
-}
-
-// Internal grow-as-needed string buffer (same shape jinja-template.c
-// uses; replicated here to keep tools.c truly standalone — drop-in
-// usable in a project that doesn't include jinja-template.c).
+// Internal grow-as-needed string buffer; shared by tools.c and
+// agent.c (the JSON-args unescape path). Same shape as the one
+// jinja-template.c uses, kept here so tools.c is drop-in usable
+// in projects that omit jinja-template.c.
 struct ts_buf {
     char * data;
     size_t count;
@@ -103,10 +82,12 @@ static void ts_put(struct ts_buf * b, const char * s, size_t n) {
     }
 }
 
+__attribute__((unused))
 static void ts_puts(struct ts_buf * b, const char * s) {
     if (s != NULL && s[0] != '\0') { ts_put(b, s, strlen(s)); }
 }
 
+__attribute__((unused))
 static void ts_printf(struct ts_buf * b, const char * fmt, ...) {
     char    tmp[1024];
     va_list ap;
@@ -117,6 +98,43 @@ static void ts_printf(struct ts_buf * b, const char * fmt, ...) {
         ts_put(b, tmp, (size_t)n < sizeof(tmp) ? (size_t)n : sizeof(tmp) - 1);
     }
 }
+
+// LLM_NO_TOOLS: opt-out for builds that can't link libcurl (Android
+// NDK, embedded targets). When set, this file emits stub
+// implementations that return "tool unavailable" results; agent.c
+// continues to compile against the same prototypes. The Apple /
+// Linux dev path leaves LLM_NO_TOOLS undefined and links libcurl
+// as before.
+#ifndef LLM_NO_TOOLS
+
+#include <ctype.h>
+#include <curl/curl.h>
+#include <unistd.h>  // sleep()
+
+#ifndef TOOLS_FETCH_CAP
+#define TOOLS_FETCH_CAP (200 * 1024)
+#endif
+
+struct tool_result {
+    int    ok;       // 1 on success, 0 on error
+    char * body;     // heap-allocated UTF-8 (caller frees), may be NULL
+    char * error;    // heap-allocated UTF-8 (caller frees), may be NULL
+    long   status;   // HTTP status code (0 if no HTTP call was made)
+};
+
+static void tools_result_free(struct tool_result * r) {
+    if (r != NULL) {
+        free(r->body);
+        free(r->error);
+        r->body   = NULL;
+        r->error  = NULL;
+        r->ok     = 0;
+        r->status = 0;
+    }
+}
+
+// ts_buf + ts_grow/ts_put/ts_puts/ts_printf hoisted above the
+// LLM_NO_TOOLS gate so agent.c sees them in both build modes.
 
 // libcurl write-callback into a ts_buf. Caps writes once the buffer
 // hits TOOLS_FETCH_CAP so a runaway server can't make us allocate
@@ -781,3 +799,73 @@ static int32_t tools_self_test(void) {
     }
     return (failures > 0) ? 1 : 0;
 }
+
+#else  // LLM_NO_TOOLS — stub implementations (no libcurl dependency)
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct tool_result {
+    int    ok;
+    char * body;
+    char * error;
+    long   status;
+};
+
+static char * tools_dup_msg(const char * s) {
+    size_t n = strlen(s);
+    char * out = (char *)malloc(n + 1);
+    if (out != NULL) { memcpy(out, s, n + 1); }
+    return out;
+}
+
+static void tools_result_free(struct tool_result * r) {
+    if (r != NULL) {
+        free(r->body);
+        free(r->error);
+        r->body = NULL;
+        r->error = NULL;
+    }
+}
+
+__attribute__((unused))
+static void tools_global_init(void)    { /* no-op */ }
+__attribute__((unused))
+static void tools_global_cleanup(void) { /* no-op */ }
+
+static void tools_websearch(const char * query, int max_results,
+                            struct tool_result * out) {
+    (void)query; (void)max_results;
+    out->ok     = 0;
+    out->body   = NULL;
+    out->error  = tools_dup_msg("tools disabled in this build");
+    out->status = 0;
+}
+
+static void tools_fetch(const char * url, int timeout_s,
+                        struct tool_result * out) {
+    (void)url; (void)timeout_s;
+    out->ok     = 0;
+    out->body   = NULL;
+    out->error  = tools_dup_msg("tools disabled in this build");
+    out->status = 0;
+}
+
+static void tools_distill(const char * html, size_t n,
+                          struct tool_result * out) {
+    (void)html; (void)n;
+    out->ok     = 0;
+    out->body   = NULL;
+    out->error  = tools_dup_msg("tools disabled in this build");
+    out->status = 0;
+}
+
+__attribute__((unused))
+static int32_t tools_self_test(void) {
+    printf("tools-test: SKIP (built with -DLLM_NO_TOOLS)\n");
+    return 0;
+}
+
+#endif  // LLM_NO_TOOLS

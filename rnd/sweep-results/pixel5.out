@@ -1,0 +1,16 @@
+host: Pixel 5 (Snapdragon 765G), NEON+dotprod, Android arm64
+--- chat-test
+llm: qwen35 hybrid (Mamba-2/DeltaNet + attention). SSM math is best-guess.
+chat-test pass 0 turn 1: gen=38 hash=cec33165e385aa8d pos=61
+chat-test pass 0 turn 2: gen=37 hash=c979af519eb1e836 pos=120
+chat-test pass 0 turn 3: gen=61 hash=6ffe3e4275badb32 pos=199
+chat-test pass 1 turn 1: gen=38 hash=cec33165e385aa8d pos=61
+chat-test pass 1 turn 2: gen=37 hash=c979af519eb1e836 pos=120
+chat-test pass 1 turn 3: gen=61 hash=6ffe3e4275badb32 pos=199
+chat-test: PASS (3 turns x 2 passes, hashes match across reset)
+--- bench
+  run 1: pp=9.86 tg=9.96
+  run 2: pp=10.04 tg=9.82
+  run 3: pp=10.07 tg=9.91
+bench: pp=10.04 tg=9.91 n_pp=25 n_tg=64 dispatch=NEON+dotprod
+summary: Pixel 5: RUNS (per-ISA baseline) | pp=10.04 tg=9.91 n_pp=25 n_tg=64 dispatch=NEON+dotprod | hashes=cec33165e385aa8d c979af519eb1e836 6ffe3e4275badb32

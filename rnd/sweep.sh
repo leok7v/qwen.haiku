@@ -45,17 +45,23 @@ sync_to() {
 }
 
 # Run the standard battery; emit a final "summary:" line for grepability.
+# NOTE on quoting: $path and $gguf often contain '$HOME' as a literal,
+# which the remote shell must expand. So we drop single-quotes inside
+# the ssh command body — the outer double-quote of the ssh argument
+# expands $path locally to the LITERAL `$HOME/qwen.haiku` string, then
+# remote bash sees `cd $HOME/qwen.haiku` and expands properly.
 remote_battery() {
     local h=$1 path=$2 gguf=$3
-    ssh "$h" "set -e; cd '$path' && make -C llm 2>&1 | tail -10 && \
+    ssh "$h" "set -e; cd $path && \
+        echo '--- build'            && make -C llm 2>&1 | tail -10 && \
         echo '--- self-test'        && ./Build/cli/llm --self-test    2>&1 | tail -5  && \
         echo '--- think-test'       && ./Build/cli/llm --think-test   2>&1 | tail -3  && \
         echo '--- jinja-test'       && ./Build/cli/llm --jinja-test   2>&1 | tail -3  && \
         echo '--- chunked-test'     && ./Build/cli/llm --chunked-test 2>&1 | tail -5  && \
         echo '--- agent-test'       && ./Build/cli/llm --agent-test   2>&1 | tail -3  && \
-        echo '--- chat-test (hash gate)' && QWEN_GGUF='$gguf' ./Build/cli/llm --chat-test 2>&1 | tail -10 && \
+        echo '--- chat-test (hash gate)' && QWEN_GGUF=$gguf ./Build/cli/llm --chat-test 2>&1 | tail -10 && \
         echo '--- qwen-test'        && ./Build/cli/qwen-test          2>&1 | tail -5  && \
-        echo '--- bench'            && QWEN_GGUF='$gguf' ./Build/cli/llm --bench       2>&1 | tail -5"
+        echo '--- bench'            && QWEN_GGUF=$gguf ./Build/cli/llm --bench         2>&1 | tail -5"
 }
 
 # Extract the three chat-test hashes (pass 0 only) and the bench line,
@@ -128,13 +134,15 @@ run_pixel5() {
         echo "summary: pixel5: SKIPPED (NDK not found at $NDK)" >> "$out"
         return
     fi
-    # Build Android target (no libcurl; tools.c compiled out via -DLLM_NO_TOOLS).
+    # Build Android target (no libcurl; tools.c compiled out via
+    # -DLLM_NO_TOOLS). Drop -static — bionic libc doesn't statically
+    # link cleanly; the binary just uses the system libc on-device.
     "$NDK/bin/clang" --target=aarch64-linux-android24 \
         -O3 -std=c17 -Wall -Wextra \
         -Wno-unused-parameter -Wno-missing-braces \
         -DLLM_CLI -DLLM_NO_TOOLS \
         -fvectorize -fslp-vectorize \
-        llm/slm.c -lm -static -o Build/cli/llm-android 2>&1 | tail -5 >> "$out"
+        llm/slm.c -lm -o Build/cli/llm-android 2>&1 | tail -5 >> "$out"
     adb push Build/cli/llm-android /data/local/tmp/llm 2>&1 | tail -3 >> "$out"
     # If GGUF isn't already on-device, push it (~530MB; one-time).
     if ! adb shell '[ -f /data/local/tmp/qwen.gguf ]' 2>/dev/null; then
@@ -144,6 +152,8 @@ run_pixel5() {
     {
         echo '--- chat-test'
         adb shell 'taskset -a f0 sh -c "QWEN_GGUF=/data/local/tmp/qwen.gguf /data/local/tmp/llm --chat-test"' 2>&1 | tail -10
+        echo '--- bench'
+        adb shell 'taskset -a f0 sh -c "QWEN_GGUF=/data/local/tmp/qwen.gguf /data/local/tmp/llm --bench"' 2>&1 | tail -8
     } >> "$out"
     summarize "$out" "Pixel 5"
 }
@@ -156,7 +166,7 @@ for h in $HOSTS; do
     case "$h" in
         apple)        run_apple ;;
         halo2)        run_ssh_host halo2        "AMD Zen 5 (Strix Halo)"  '$HOME/qwen.haiku' '$HOME/qwen.haiku/tmp/Qwen3.5-0.8B-Q4_K_M.gguf' ;;
-        x)            run_ssh_host x            "Intel Haswell"           '$HOME/qwen.haiku' "$GGUF_MAC" ;;
+        x)            run_ssh_host x            "Intel Haswell"           '$HOME/qwen.haiku' '$HOME/qwen.haiku/tmp/Qwen3.5-0.8B-Q4_K_M.gguf' ;;
         mbp15)        run_ssh_host mbp15        "Intel Ivy Bridge (mbp15)" '/Users/agi/qwen.haiku' '/Users/agi/qwen.haiku/tmp/Qwen3.5-0.8B-Q4_K_M.gguf' ;;
         agi)          run_ssh_host agi          "Intel Ivy Bridge (agi)"   '$HOME/qwen.haiku' '$HOME/qwen.haiku/tmp/Qwen3.5-0.8B-Q4_K_M.gguf' ;;
         mb-air-2012)  run_ssh_host mb-air-2012  "Intel Ivy Bridge (Win)"   '/c/Users/leo/qwen.haiku' '/c/Users/leo/qwen.haiku/tmp/Qwen3.5-0.8B-Q4_K_M.gguf' ;;
