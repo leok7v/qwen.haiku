@@ -11,7 +11,7 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		B3F4AAAA2F904FAC00000017 /* Exceptions for "llm" folder in "QwenHaiku" target */ = {
+		B3F4AAAA2F904FAC00000017 /* Exceptions for "slm" folder in "QwenHaiku" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				agent.c,
@@ -25,10 +25,6 @@
 				tensor.c,
 				tokenizer.c,
 				tools.c,
-				utils/arrays.c,
-				utils/chars.c,
-				utils/maps.c,
-				utils/text.c,
 			);
 			target = B3F4AAAA2F904FAC00000006 /* QwenHaiku */;
 		};
@@ -40,12 +36,12 @@
 			path = app;
 			sourceTree = "<group>";
 		};
-		B3F4AAAA2F904FAC00000011 /* llm */ = {
+		B3F4AAAA2F904FAC00000011 /* slm */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				B3F4AAAA2F904FAC00000017 /* Exceptions for "llm" folder in "QwenHaiku" target */,
+				B3F4AAAA2F904FAC00000017 /* Exceptions for "slm" folder in "QwenHaiku" target */,
 			);
-			path = llm;
+			path = slm;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -65,7 +61,7 @@
 			isa = PBXGroup;
 			children = (
 				B3F4AAAA2F904FAC00000010 /* app */,
-				B3F4AAAA2F904FAC00000011 /* llm */,
+				B3F4AAAA2F904FAC00000011 /* slm */,
 				B3F4AAAA2F904FAC00000004 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -95,7 +91,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				B3F4AAAA2F904FAC00000010 /* app */,
-				B3F4AAAA2F904FAC00000011 /* llm */,
+				B3F4AAAA2F904FAC00000011 /* slm */,
 			);
 			name = QwenHaiku;
 			packageProductDependencies = (
@@ -300,7 +296,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/llm";
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/slm";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
@@ -351,7 +347,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/llm";
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/slm";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;

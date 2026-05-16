@@ -4,7 +4,7 @@ Build/
 DerivedData/
 *.o
 *.a
-llm/llm
+slm/slm
 tools/dump_kvs
 tools/q4k_diff
 tools/q5k_diff

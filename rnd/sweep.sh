@@ -53,7 +53,7 @@ sync_to() {
 remote_battery() {
     local h=$1 path=$2 gguf=$3
     ssh "$h" "set -e; cd $path && \
-        echo '--- build'            && make -C llm 2>&1 | tail -10 && \
+        echo '--- build'            && make -C slm 2>&1 | tail -10 && \
         echo '--- self-test'        && ./Build/cli/llm --self-test    2>&1 | tail -5  && \
         echo '--- think-test'       && ./Build/cli/llm --think-test   2>&1 | tail -3  && \
         echo '--- jinja-test'       && ./Build/cli/llm --jinja-test   2>&1 | tail -3  && \
@@ -90,7 +90,7 @@ run_apple() {
     local out=rnd/sweep-results/apple.out
     echo "host: Apple M-series (local), NEON+dotprod, macOS arm64" > "$out"
     {
-        make -C llm 2>&1 | tail -10
+        make -C slm 2>&1 | tail -10
         echo '--- self-test'    ; ./Build/cli/llm --self-test    2>&1 | tail -5
         echo '--- think-test'   ; ./Build/cli/llm --think-test   2>&1 | tail -3
         echo '--- jinja-test'   ; ./Build/cli/llm --jinja-test   2>&1 | tail -3
@@ -142,7 +142,7 @@ run_pixel5() {
         -Wno-unused-parameter -Wno-missing-braces \
         -DLLM_CLI -DLLM_NO_TOOLS \
         -fvectorize -fslp-vectorize \
-        llm/slm.c -lm -o Build/cli/llm-android 2>&1 | tail -5 >> "$out"
+        slm/slm.c -lm -o Build/cli/llm-android 2>&1 | tail -5 >> "$out"
     adb push Build/cli/llm-android /data/local/tmp/llm 2>&1 | tail -3 >> "$out"
     # If GGUF isn't already on-device, push it (~530MB; one-time).
     if ! adb shell '[ -f /data/local/tmp/qwen.gguf ]' 2>/dev/null; then

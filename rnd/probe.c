@@ -54,7 +54,7 @@ _Static_assert(sizeof(q8_0_block) == 34, "q8_0_block size drift");
 
 // llm/neon.c's `static inline` kernels live behind its own header
 // guard; pull them in directly.
-#include "../llm/neon.c"
+#include "../rnd/archive/neon.c"
 
 // simd/simd.c brings the dispatcher + simd/neon.c (or avx.c).
 #include "../simd/simd.c"
