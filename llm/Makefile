@@ -39,10 +39,16 @@ all: $(BIN) $(QWEN_TEST)
 # library needs to be a prerequisite or edits won't trigger a
 # rebuild (made/slm.c-only deps gave a stale binary against the
 # new qwen.c path on 2026-05-15).
+# SIMD dispatcher pieces (`../simd/simd.c` includes the per-ISA
+# kernel pack from there); listed as prereqs so a kernel edit
+# rebuilds the binary.
+SIMD_SRCS := ../simd/simd.c ../simd/neon.c ../simd/avx.c ../simd/quants.h
+
 $(BIN): slm.c slm.h model.c qwen.c gguf.c tokenizer.c sampler.c jinja.c \
-        tensor.c neon.c chunked.c \
+        tensor.c chunked.c \
         tools.c agent.c \
         utils/arrays.c utils/chars.c utils/maps.c \
+        $(SIMD_SRCS) \
         | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ slm.c $(LDFLAGS)
 
@@ -52,8 +58,9 @@ $(BIN): slm.c slm.h model.c qwen.c gguf.c tokenizer.c sampler.c jinja.c \
 # #include under QWEN_TESTS, for slm_ctrl_defaults referenced from
 # model.c's lifecycle).
 $(QWEN_TEST): qwen.c slm.h model.c gguf.c tokenizer.c sampler.c \
-              tensor.c neon.c chunked.c \
+              tensor.c chunked.c \
               utils/arrays.c utils/chars.c utils/maps.c \
+              $(SIMD_SRCS) \
               | $(BUILD)
 	$(CC) -O3 -std=c17 -Wall -Wextra \
 	      -Wno-unused-parameter -Wno-missing-braces \

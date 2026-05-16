@@ -397,7 +397,7 @@ static struct tensor * slm_forward_ssm(struct slm_ctx * c,
     // x / (1 + expf(-x)) differs by 1-2 ULPs and compounds through
     // 24 layers to visible drift, so we use ggml's vectorized variant
     // exclusively for parity.
-    neon_silu_vec_f32(conv_dim, mixed->data, mixed->data);
+    simd_silu_f32(conv_dim, mixed->data, mixed->data);
     // 5. Split mixed into Q, K, V. Per the Python reference's
     //    `mixed_qkv = torch.cat((query, key, value), dim=-1)` after
     //    reshape, the FLAT layout in memory is block-concatenated
@@ -588,7 +588,7 @@ static struct tensor * slm_forward_ssm(struct slm_ctx * c,
     const float * norm_w = (const float *)Lw->ssm_norm.data;
     struct tensor * y_norm = tensor_new_2d(a, V_dim, 1);
     float z_silu[2048];
-    neon_silu_vec_f32(V_dim, z_silu, z->data);
+    simd_silu_f32(V_dim, z_silu, z->data);
     for (int32_t h2 = 0; h2 < n_heads; h2++) {
         double ssq = 0.0;
         float * yh = out_flat + h2 * v_hd;
@@ -715,7 +715,7 @@ static struct tensor * slm_forward_ssm_batch(struct slm_ctx * c,
         slm_trace_batch(nm, "CONV1D", mixed->data, conv_dim, n);
     }
     // 4. SiLU on all tokens at once.
-    neon_silu_vec_f32(n * conv_dim, mixed->data, mixed->data);
+    simd_silu_f32(n * conv_dim, mixed->data, mixed->data);
     {
         char nm[48];
         snprintf(nm, sizeof(nm), "conv_silu-%d", (int)L);
@@ -865,7 +865,7 @@ static struct tensor * slm_forward_ssm_batch(struct slm_ctx * c,
     struct tensor * y_norm = tensor_new_2d(a, V_dim, n);
     float z_silu_buf[2048];
     for (int32_t t = 0; t < n; t++) {
-        neon_silu_vec_f32(V_dim, z_silu_buf, z->data + (size_t)t * V_dim);
+        simd_silu_f32(V_dim, z_silu_buf, z->data + (size_t)t * V_dim);
         for (int32_t h2 = 0; h2 < n_heads; h2++) {
             double ssq = 0.0;
             float * yh = out_flat + (size_t)t * V_dim + (size_t)h2 * v_hd;
@@ -1007,7 +1007,7 @@ static struct tensor * slm_forward_step(struct slm_ctx * c,
         // FFN SwiGLU uses NEON-poly SiLU (bit-exact with ggml's
         // GGML_OP_SILU). Scalar libm would drift 1-2 ULP per element.
         struct tensor * gate_act = tensor_new_nd(a, gate->ndim, gate->ne);
-        neon_silu_vec_f32((int)tensor_nelements(gate),
+        simd_silu_f32((int)tensor_nelements(gate),
                           gate_act->data, gate->data);
         struct tensor * ffn_in   = tensor_mul(gate_act, up);
         struct tensor * ffn_out  = matmul_dispatch(&Lw->ffn_down, ffn_in);
@@ -1057,7 +1057,7 @@ static struct tensor * slm_forward_step(struct slm_ctx * c,
 //                pos_start so query t attends only to keys
 //                0..pos_start+t).
 //   - FFN: shape [hidden, n] flows through tensor_rms_norm,
-//          matmul_dispatch, tensor_mul, neon_silu_vec_f32 untouched -
+//          matmul_dispatch, tensor_mul, simd_silu_f32 untouched -
 //          all four operate over the `n` axis natively.
 //
 // Caller invariants:
@@ -1142,7 +1142,7 @@ static struct tensor * slm_forward_batch(struct slm_ctx * c,
         struct tensor * gate     = matmul_dispatch(&Lw->ffn_gate, h_ffn_norm);
         struct tensor * up       = matmul_dispatch(&Lw->ffn_up,   h_ffn_norm);
         struct tensor * gate_act = tensor_new_2d(a, gate->ne[0], gate->ne[1]);
-        neon_silu_vec_f32((int)tensor_nelements(gate),
+        simd_silu_f32((int)tensor_nelements(gate),
                           gate_act->data, gate->data);
         struct tensor * ffn_in   = tensor_mul(gate_act, up);
         struct tensor * ffn_out  = matmul_dispatch(&Lw->ffn_down, ffn_in);

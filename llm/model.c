@@ -1117,6 +1117,10 @@ static inline float rng_uniform(struct rng * r) {
 // ---------------------------------------------------------------------------
 
 struct slm_model * slm_model_load(const char * path) {
+    // Pick the best int8 dot / SiLU implementation for this CPU. Safe
+    // to call multiple times (early-return if already initialized);
+    // a no-op when the same model is reloaded.
+    simd_init();
     struct slm_model * m =
         (struct slm_model *)oom(calloc(1, sizeof(struct slm_model)));
     if (gguf_open(&m->gguf, path) != 0) {

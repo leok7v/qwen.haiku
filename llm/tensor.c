@@ -19,7 +19,6 @@
 #ifndef TENSOR_C
 #define TENSOR_C
 
-#include <arm_neon.h>
 #include <assert.h>
 #include <dispatch/dispatch.h>
 #include <math.h>
@@ -30,6 +29,13 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+// Shared K-quant + Q8_0 block typedefs (q4k_block / q5k_block /
+// q6k_block / q8_0_block / q8k_block + QK_K / QK8_0 + fp16 helpers).
+// Single source of truth used by both tensor.c (matmul wrappers) and
+// the simd/ dispatcher (the kernels they call). Byte-compatible with
+// llama.cpp's ggml-quants.c layout.
+#include "../simd/quants.h"
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -614,7 +620,10 @@ void q4_pack_row(const float * src, int64_t k, q4_block * out) {
 // Total: 128 + 64 + 16 + 2 = 210 bytes per 256 weights = ~6.56 bpw.
 // ---------------------------------------------------------------------------
 
-#define QK_K 256
+// QK_K + the K-quant / Q8_0 / Q8_K block typedefs (q4k_block,
+// q5k_block, q6k_block, q8_0_block, q8k_block) come from
+// `../simd/quants.h` via the top-of-file include. Single source of
+// truth across the runtime + SIMD dispatcher.
 
 // Q8_K activation quantization round-trip, matching llama.cpp's
 // internal MUL_MAT path. Activations are quantized to Q8_K (256-elem
@@ -645,16 +654,6 @@ static inline int32_t q8k_nearest_int(float fval) {
     memcpy(&i, &val, sizeof(i));
     return (i & 0x007fffff) - 0x00400000;
 }
-// Q8_K activation block. Matches ggml's block_q8_K layout so the
-// NEON int8 dot kernels port cleanly. Built by quantize_row_q8_K
-// from an fp32 activation row; consumed by q4k_dot_q8k_neon (and
-// later q5k / q6k variants).
-typedef struct {
-    float   d;                 // 1 / iscale where iscale = -127/xmax
-    int8_t  qs[QK_K];          // 256 int8 weights
-    int16_t bsums[QK_K / 16];  // 16 pre-computed sums of 16-element chunks
-} q8k_block;
-
 // Quantize an fp32 row into Q8_K blocks (int8 + per-block fp32 scale
 // + pre-computed 16-wide sub-block sums). Mirrors llama.cpp's
 // quantize_row_q8_K_ref. Output is the NEON-friendly format consumed
@@ -735,42 +734,24 @@ static inline void q8k_round_trip(const float * src, float * dst,
     }
 }
 
-typedef struct {
-    _Float16 d;
-    _Float16 dmin;
-    uint8_t  scales[12];
-    uint8_t  qs[QK_K / 2];
-} q4k_block;
-
-typedef struct {
-    uint8_t  ql[QK_K / 2];
-    uint8_t  qh[QK_K / 4];
-    int8_t   scales[QK_K / 16];
-    _Float16 d;
-} q6k_block;
-
-typedef struct {
-    _Float16 d;
-    _Float16 dmin;
-    uint8_t  scales[12];
-    uint8_t  qh[QK_K / 8];
-    uint8_t  qs[QK_K / 2];
-} q5k_block;
-
-typedef struct {
-    _Float16 d;
-    int8_t   qs[32];
-} q8_0_block;
+// q4k_block / q5k_block / q6k_block / q8_0_block typedefs come from
+// `../simd/quants.h` (included at top of this file). Single source of
+// truth shared with the simd dispatcher.
 
 #define Q8_0_BLOCK_SIZE 32
 
-// NEON int8 dot kernels (and ggml-ported elementwise helpers like
-// silu/exp) live in neon.c, included here as a single-file library
-// so all block typedefs above are in scope. neon.c is the ONLY place
-// in this codebase that includes <arm_neon.h>; tensor.c and slm.c
-// stay scalar / portable. To add another SIMD variant (avx2.c
-// later), add a sibling file and switch the include with #if.
-#include "neon.c"
+// SIMD dispatcher: picks the best int8 dot + SiLU implementation
+// available on the current CPU at runtime (NEON dotprod / NEON
+// baseline / AVX-VNNI / AVX2-FMA / AVX1 / scalar). Single-file
+// library; all `#include`-d C kernels live in `../simd/`. tensor.c
+// calls the dispatched entry points (`simd_q4k_row_dot_q8k`,
+// `simd_silu_f32`, ...) instead of binding directly to an ISA tier.
+//
+// `simd_init()` is called once by `slm_model_load()` (in model.c).
+// If a caller invokes a dispatched function before init, the
+// pointer table still resolves to the scalar reference path —
+// correct but slow — until init runs.
+#include "../simd/simd.c"
 
 // Chunked Gated DeltaNet SSM kernel (qwen3-next batched prefill).
 // Pure scalar fp32 reference port of `build_delta_net_chunking` from
@@ -787,16 +768,8 @@ typedef struct {
 //                                  | ((scales[j-4] >> 6) << 4)
 //                              m  = (scales[j+4] >> 4)
 //                                  | ((scales[j]   >> 6) << 4)
-static inline void q4k_get_scale_min(const uint8_t * sc, int32_t j,
-                                     uint8_t * out_d, uint8_t * out_m) {
-    if (j < 4) {
-        *out_d = sc[j]     & 63;
-        *out_m = sc[j + 4] & 63;
-    } else {
-        *out_d = (sc[j + 4] & 0x0f) | ((sc[j - 4] >> 6) << 4);
-        *out_m = (sc[j + 4] >> 4)   | ((sc[j]     >> 6) << 4);
-    }
-}
+// q4k_get_scale_min comes from `../simd/quants.h` (single source of
+// truth with the simd dispatcher).
 
 // Q4_K dequant: port of ggml-quants.c dequantize_row_q4_K. Per
 // super-block (256 weights) iterate 4 chunks of 64. Each chunk uses
@@ -851,7 +824,7 @@ struct tensor * tensor_matmul_q4k_f32(const q4k_block * w_blocks,
         dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
             int64_t j = (int64_t)jj;
             const q4k_block * row = w_blocks + j * nb_per_row;
-            or_[j] = q4k_row_dot_q8k_neon((int)nb_per_row, row, xq8);
+            or_[j] = simd_q4k_row_dot_q8k((int)nb_per_row, row, xq8);
         });
     }
     return out;
@@ -917,10 +890,41 @@ struct tensor * tensor_matmul_q5k_f32(const q5k_block * w_blocks,
         dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
             int64_t j = (int64_t)jj;
             const q5k_block * row = w_blocks + j * nb_per_row;
-            or_[j] = q5k_row_dot_q8k_neon((int)nb_per_row, row, xq8);
+            or_[j] = simd_q5k_row_dot_q8k((int)nb_per_row, row, xq8);
         });
     }
     return out;
+}
+
+// Legacy quantize-row-Q8_0 using libc roundf (away-from-zero on
+// halves), kept here in tensor.c rather than upgraded to the
+// banker's-rounding `q_quantize_row_q8_0` in simd/quants.h. The
+// switch from roundf to banker's was tried 2026-05-15 and shifted
+// the --chat-test hashes (790adfc7 etc.) away from the load-bearing
+// reference (d2ba984b). roundf is technically inconsistent with our
+// own q8_K path (which uses banker's via q8k_nearest_int) — but it's
+// the rounding mode the parity gate was set with, so we keep it
+// until the parity reference is intentionally re-baselined.
+static inline void tensor_quantize_row_q8_0(const float * x,
+                                            q8_0_block * y, int64_t k) {
+    const int nb = (int)(k / QK8_0);
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK8_0; j++) {
+            float v = fabsf(x[i * QK8_0 + j]);
+            if (v > amax) { amax = v; }
+        }
+        float d  = amax / ((1 << 7) - 1);
+        float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+        y[i].d = (_Float16)d;
+        for (int j = 0; j < QK8_0; j++) {
+            float    x0 = x[i * QK8_0 + j] * id;
+            int32_t  qv = (int32_t)roundf(x0);
+            if (qv > 127)  { qv = 127;  }
+            if (qv < -128) { qv = -128; }
+            y[i].qs[j] = (int8_t)qv;
+        }
+    }
 }
 
 struct tensor * tensor_matmul_q8_0_f32(const q8_0_block * w_blocks,
@@ -943,12 +947,12 @@ struct tensor * tensor_matmul_q8_0_f32(const q8_0_block * w_blocks,
     q8_0_block * xq = (q8_0_block *)arena_alloc(
         x->arena, (size_t)nb_per_row * sizeof(q8_0_block));
     for (int64_t t = 0; t < n; t++) {
-        quantize_row_q8_0(x->data + t * k, xq, k);
+        tensor_quantize_row_q8_0(x->data + t * k, xq, k);
         float * or_ = out->data + t * out_f;
         dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
             int64_t j = (int64_t)jj;
             const q8_0_block * row = w_blocks + j * nb_per_row;
-            or_[j] = q8_0_dot_q8_0_neon(row, xq, k);
+            or_[j] = simd_q8_0_dot_q8_0(row, xq, k);
         });
     }
     return out;
@@ -1000,7 +1004,7 @@ struct tensor * tensor_matmul_q6k_f32(const q6k_block * w_blocks,
         dispatch_apply((size_t)out_f, DISPATCH_APPLY_AUTO, ^(size_t jj) {
             int64_t j = (int64_t)jj;
             const q6k_block * row = w_blocks + j * nb_per_row;
-            or_[j] = q6k_row_dot_q8k_neon((int)nb_per_row, row, xq8);
+            or_[j] = simd_q6k_row_dot_q8k((int)nb_per_row, row, xq8);
         });
     }
     return out;

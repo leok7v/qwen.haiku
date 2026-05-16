@@ -20,7 +20,6 @@
 				jinja.c,
 				Makefile,
 				model.c,
-				neon.c,
 				qwen.c,
 				sampler.c,
 				tensor.c,
