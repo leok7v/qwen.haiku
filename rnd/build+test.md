@@ -229,12 +229,12 @@ Bench prompt: 25 prefill tokens, 64 decode tokens, greedy.
 |------------------------------|------------------|-----------------|---------:|---------:|--------|
 | AMD Zen 5 (Strix Halo)       | Linux x86_64     | AVX-VNNI        |    36.15 |    34.60 | runs   |
 | Apple M-series               | macOS arm64      | NEON+dotprod    |    24.63 |    24.17 | gate   |
+| Intel Ivy Bridge i7-3720QM   | macOS x86_64     | AVX1            |    16.61 |    16.08 | runs   |
 | Intel Ivy Bridge i7-3615QM   | macOS x86_64     | AVX1            |    15.52 |    14.92 | runs   |
 | Qualcomm SD 765G (A76 + A55) | Android arm64    | NEON+dotprod    |    10.04 |     9.91 | runs   |
 | Intel Haswell i7-4578U       | macOS x86_64     | AVX2-FMA        |     7.34 |     6.91 | runs   |
 | Amlogic A311D (A73 + A53)    | Ubuntu arm64     | NEON-baseline   |     3.42 |     3.37 | runs   |
-| Intel Ivy Bridge i7-3720QM   | macOS x86_64     | AVX1            |        — |        — | autosleep |
-| Intel Ivy Bridge i7-3667U    | Windows x86_64   | AVX1            |        — |        — | gguf push didn't land |
+| Intel Ivy Bridge i7-3667U    | Windows x86_64   | AVX1            |        — |        — | sys/mman.h missing under MSYS2 mingw — needs VirtualAlloc shim |
 
 "gate" = matches the authoritative `--chat-test` hash. "runs" = the
 binary builds + chat-test is reset-reproducible on that host with the
@@ -242,10 +242,16 @@ ISA's own per-host hash baseline. "autosleep" / "gguf push didn't
 land" = no result this sweep.
 
 Observations:
-- AVX-VNNI on Zen 5 wins outright at 36 tok/s — the only x86 tier in
-  the fleet, but even via the scalar fallback (no AVX q*k kernel in
-  simd.c yet) it edges out Apple's NEON+dotprod path. ARM dotprod
-  closes the gap once the proper int8 kernels land for x86.
+- AVX-VNNI on Zen 5 wins outright at 36 tok/s — even via the scalar
+  fallback (no AVX q*k kernel in simd.c yet) it edges out Apple's
+  NEON+dotprod path. ARM dotprod closes the gap once the proper int8
+  AVX kernels land.
+- The two Ivy Bridge laptops (i7-3720QM and i7-3615QM) produce
+  BYTE-IDENTICAL --chat-test hashes (`50022bf4 / 2823f0ae /
+  1d84d6a5`) — same AVX1 ISA tier → same reduction tree → same
+  bits. Confirms the dispatcher is ISA-tier-deterministic. They
+  differ only in throughput (~7% from the i7-3720QM's ~13% higher
+  clock).
 - NEON-baseline (Khadas A73) is the floor at ~3 tok/s — same model,
   same code, just no `sdot` instruction. Demonstrates the dispatcher
   falls through cleanly on the lowest ARM tier.
@@ -253,3 +259,7 @@ Observations:
   end-to-end through the simd dispatcher (the +dotprod NEON path).
   All others are running the scalar reference for q*k dots — there's
   significant headroom on x86 once the AVX paths are activated.
+- Windows MSYS2 mingw doesn't ship `<sys/mman.h>`. The tensor.c
+  arena uses `mmap(MAP_ANON)`; needs a `VirtualAlloc`-based shim or
+  drop mmap entirely and use `aligned_alloc + memset(0)` for the
+  slab buffer. Deferred.
