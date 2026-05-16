@@ -366,16 +366,20 @@ struct ContentView: View {
             Button(showSystem ? "done" : "edit") { showSystem.toggle() }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+            // `.checkbox` is macOS-only — on iOS the toggle falls
+            // back to its default switch appearance via the .automatic
+            // style. ToggleStyle/.automatic is the documented cross-
+            // platform alias; using it directly avoids #if branches.
             Toggle("Tools", isOn: $vm.tools)
-                .toggleStyle(.checkbox)
+                .toggleStyle(.automatic)
                 .font(.caption.monospaced())
                 .disabled(vm.state == .generating)
             Toggle("Think", isOn: $vm.think)
-                .toggleStyle(.checkbox)
+                .toggleStyle(.automatic)
                 .font(.caption.monospaced())
                 .disabled(vm.state == .generating)
             Toggle("Debug", isOn: $vm.debug)
-                .toggleStyle(.checkbox)
+                .toggleStyle(.automatic)
                 .font(.caption.monospaced())
         }
     }
