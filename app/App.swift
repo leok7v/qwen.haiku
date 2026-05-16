@@ -451,10 +451,14 @@ struct ContentView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                         .textSelection(.enabled)
                 }
-                Text(m.content.isEmpty ? "..." : m.content)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .foregroundStyle(m.content.isEmpty ? .secondary : .primary)
-                    .textSelection(.enabled)
+                if m.content.isEmpty {
+                    ShinyWhimsyView()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Text(m.content)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
             }
         }
     }
