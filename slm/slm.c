@@ -165,11 +165,18 @@ static int slm_cb_emit(struct slm_stream_callback * cb,
     return rc;
 }
 
+static double seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 // File-internal token-stream callback. slm_generate_raw emits one
 // utf8 piece per generated token to this; slm_generate trampolines
 // into the <think>-filter on top of this (see further down in this
 // file). `utf8` is a NUL-terminated UTF-8 piece. Return non-zero to
 // abort generation.
+
 typedef int (*slm_token_cb)(const char * utf8, void * user);
 
 static int slm_generate_raw(struct slm_ctx * c,
@@ -187,7 +194,7 @@ static int slm_generate_raw(struct slm_ctx * c,
     int32_t   generated = 0;
     int32_t   pos       = c->pos;        // resume after previous call
     bool      stop      = false;
-    double    t0        = slm_monotonic_seconds();
+    double    t0        = seconds();
     // Repetition-penalty history: include the full prompt so the
     // model is discouraged from immediately echoing the input back,
     // plus everything it generates in this call.
@@ -222,7 +229,7 @@ static int slm_generate_raw(struct slm_ctx * c,
         slm_cb_emit(progress_cb, NULL, NULL, NULL, NULL,
                     /*prefilled=*/true, 0, 0);
     }
-    double t1 = slm_monotonic_seconds();
+    double t1 = seconds();
     c->t_prefill_s = t1 - t0;
     c->n_prefill   = prompt_n;
     int32_t last = prompt_n > 0 ? prompt_ids[prompt_n - 1] : c->model->cfg.bos_id;
@@ -258,7 +265,9 @@ static int slm_generate_raw(struct slm_ctx * c,
         }
         pos++;
         generated++;
-        if (g_trace_tokens) { fprintf(stderr, "[tok] %d\n", (int)next); }
+        if (c->ctrl.trace_tokens) {
+            fprintf(stderr, "[tok] %d\n", (int)next);
+        }
         bool is_stop = (next == c->model->cfg.eos_id ||
                         next == c->model->cfg.eot_id);
         for (int32_t si = 0; !is_stop && si < c->model->cfg.n_stop_ids; si++) {
@@ -277,7 +286,7 @@ static int slm_generate_raw(struct slm_ctx * c,
             last = next;
         }
     }
-    double t2 = slm_monotonic_seconds();
+    double t2 = seconds();
     c->t_gen_s     = t2 - t1;
     c->n_generated = generated;
     c->pos         = pos;
@@ -349,6 +358,7 @@ static void slm_think_filter_init(struct slm_think_filter * f) {
 // per the filter's current mode. Mode TOOL_CALL routes bytes into
 // the filter's internal tool_call buffer instead of firing cb.
 // Returns the callback's return value, or 0 when no work/no cb.
+
 static int slm_think_emit(struct slm_think_filter * f,
                           const char * start, int n,
                           struct slm_stream_callback * cb) {
@@ -1056,8 +1066,8 @@ static void strip_reasoning_for_history(struct chars * s) {
 static int32_t run_chat(const char ** prompts, int32_t n_prompts,
                         const char * system_prompt,
                         const struct slm_sampler * sp, uint64_t seed,
-                        int32_t max_new,
-                        bool with_tools, bool with_think) {
+                        int32_t max_new, bool with_tools,
+                        bool with_think, bool trace_tokens) {
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
     int32_t r = 0;
     if (!slm_model_loaded(m)) {
@@ -1083,10 +1093,10 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
             fprintf(stderr, "slm: ctx create failed\n");
             r = 1;
         } else {
-            const char * sys =
-                (system_prompt != NULL) ? system_prompt : "";
+            const char * sys = (system_prompt != NULL) ? system_prompt : "";
             slm_ctx_ctrl(c)->tools = false;
             slm_ctx_ctrl(c)->think = with_think;
+            slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
             slm_ctx_system_prompt(c, sys, NULL);
             struct capture_cb_box capbox = {0};
             capbox.base.callback = capture_cb_fn;
@@ -1168,7 +1178,7 @@ static int chat_test_cb_fn(const struct slm_stream_callback * cb) {
 //
 // The hashes WILL differ from the old slm_reset-based gate because
 // the system framing changed. Print them; the new set is the gate.
-static int32_t run_chat_test(int32_t max_new) {
+static int32_t run_chat_test(int32_t max_new, bool trace_tokens) {
     static const char * const turns[] = {
         "Hi! Just say hello back.",
         "What did I just ask?",
@@ -1198,6 +1208,7 @@ static int32_t run_chat_test(int32_t max_new) {
                 r = 1;
             } else {
                 slm_ctx_system_prompt(c, "", NULL);
+                slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
                 for (int32_t t = 0; t < N_TURNS && r == 0; t++) {
                     struct chat_test_capture * cap = &caps[t];
                     cap->hash = 0xcbf29ce484222325ULL;
@@ -1267,7 +1278,8 @@ static int32_t run_ask(const char * question,
 
 static int32_t run_single(const char * prompt, int32_t max_new,
                           const struct slm_sampler * sp, uint64_t seed,
-                          bool with_tools, bool with_think) {
+                          bool with_tools, bool with_think,
+                          bool trace_tokens) {
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
     int32_t r = 0;
     if (!slm_model_loaded(m)) {
@@ -1307,6 +1319,7 @@ static int32_t run_single(const char * prompt, int32_t max_new,
                    (int)c->model->cfg.rope_sections[3]);
             slm_ctx_ctrl(c)->tools = false;
             slm_ctx_ctrl(c)->think = with_think;
+            slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
             slm_ctx_system_prompt(c, "", NULL);
             struct print_cb_box pbox = {0};
             pbox.base.callback = repl_cb_fn;
@@ -1326,7 +1339,7 @@ static int32_t run_single(const char * prompt, int32_t max_new,
     return r;
 }
 
-static int32_t run_bench(void) {
+static int32_t run_bench(bool trace_tokens) {
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
     int32_t r = 0;
     if (!slm_model_loaded(m)) {
@@ -1348,6 +1361,7 @@ static int32_t run_bench(void) {
             struct slm_ctx * c = slm_ctx_create(m);
             if (c != NULL) {
                 slm_ctx_system_prompt(c, "", NULL);
+                slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
                 slm_generate(c, prompt, bench_max_new, 0, &sp,
                              /*seed=*/1u, /*cb=*/NULL);
                 pps[run] = (float)slm_pp_per_sec(c);
@@ -1389,7 +1403,7 @@ static int32_t run_bench(void) {
 //     before calling here (T=0.0, top_p=1.0, rep=1.0).
 static int32_t run_repl(const struct slm_sampler * sp,
                         uint64_t seed, int32_t max_new,
-                        bool with_tools, bool with_think) {
+                        bool with_tools, bool with_think, bool trace_tokens) {
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
     int32_t r = 0;
     if (!slm_model_loaded(m)) {
@@ -1429,6 +1443,7 @@ static int32_t run_repl(const struct slm_sampler * sp,
         } else {
             slm_ctx_ctrl(c)->tools = false;
             slm_ctx_ctrl(c)->think = with_think;
+            slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
             slm_ctx_system_prompt(c, "You are a helpful assistant.",
                                   NULL);
             struct print_cb_box pbox = {0};
@@ -1597,9 +1612,9 @@ int main(int argc, char ** argv) {
             sp.repetition_penalty = 1.0f;
         }
     }
-    g_dump_layer   = dump_layer;
-    g_no_q8k_rt    = getenv("NO_Q8K_RT")       != NULL;
-    g_trace_tokens = getenv("LLM_TRACE_TOKENS") != NULL;
+    g_dump_layer      = dump_layer;
+    g_no_q8k_rt       = getenv("NO_Q8K_RT")       != NULL;
+    bool trace_tokens = getenv("LLM_TRACE_TOKENS") != NULL;
     int rc = 0;
     if (mode == CLI_SELF_TEST) {
         rc = qwen_self_test();
@@ -1607,9 +1622,9 @@ int main(int argc, char ** argv) {
         rc = chunked_self_test();
     } else if (mode == CLI_SINGLE) {
         rc = run_single(prompt, max_new, &sp, seed,
-                        with_tools, with_think);
+                        with_tools, with_think, trace_tokens);
     } else if (mode == CLI_REPL) {
-        rc = run_repl(&sp, seed, max_new, with_tools, with_think);
+        rc = run_repl(&sp, seed, max_new, with_tools, with_think, trace_tokens);
     } else if (mode == CLI_CHAT) {
         if (chat_n == 0) {
             fprintf(stderr, "llm: --chat needs at least one -p/--prompt\n");
@@ -1617,10 +1632,10 @@ int main(int argc, char ** argv) {
         } else {
             rc = run_chat(chat_prompts, chat_n, system_prompt,
                           &sp, seed, max_new,
-                          with_tools, with_think);
+                          with_tools, with_think, trace_tokens);
         }
     } else if (mode == CLI_CHAT_TEST) {
-        rc = run_chat_test(max_new);
+        rc = run_chat_test(max_new, trace_tokens);
     } else if (mode == CLI_PRINT_TEMPLATE) {
         struct slm_model * m = slm_model_load(slm_cli_gguf_path());
         struct slm_ctx * c = slm_model_loaded(m) ? slm_ctx_create(m) : NULL;
@@ -1646,7 +1661,7 @@ int main(int argc, char ** argv) {
     } else if (mode == CLI_THINK_TEST) {
         rc = slm_think_test();
     } else if (mode == CLI_BENCH) {
-        rc = run_bench();
+        rc = run_bench(trace_tokens);
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  slm --self-test\n"

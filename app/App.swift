@@ -141,7 +141,7 @@ final class SLMViewModel {
                                       minP:              0.05,
                                       repetitionPenalty: 1.25,
                                       repetitionWindow:  64,
-                                      maxNew:            512,
+                                      maxNew:            2048,
                                       minNew:            8)
             let toolsOn = self.tools
             let thinkOn = self.think
@@ -177,6 +177,7 @@ final class SLMViewModel {
             self.messages.append(
                 ChatMessage(role: .assistant, content: ""))
             let assistantIdx = self.messages.count - 1
+            let assistantID  = self.messages[assistantIdx].id
             self.state         = .generating
             self.stopRequested = false
             self.prefilling    = true
@@ -185,11 +186,13 @@ final class SLMViewModel {
             // down so the next generate() sees the current toggle.
             self.slm?.ctrl.pointee.debug = self.debug ? 1 : 0
             await self.streamAssistant(prompt: trimmedUser,
-                                       at: assistantIdx)
+                                       at: assistantIdx,
+                                       id: assistantID)
         }
     }
 
-    private func streamAssistant(prompt: String, at idx: Int) async {
+    private func streamAssistant(prompt: String, at idx: Int,
+                                 id: UUID) async {
         if let slm = self.slm {
             let debugOn = self.debug
             let thinkOn = self.think
@@ -197,24 +200,41 @@ final class SLMViewModel {
                 // The C side already strips <think>...</think> /
                 // <tool_call>...</tool_call> markers; chunks land in
                 // the right enum case. No client-side state machine.
+                //
+                // Per-chunk UI updates dispatch via DispatchQueue.main
+                // rather than `Task { @MainActor in ... }` — the
+                // unstructured-Task path gets coalesced by Swift's
+                // executor when the detached task is hot (every token
+                // dispatches a new Task and the MainActor batches them,
+                // producing visible "no-streaming" jumps). DispatchQueue
+                // .main is FIFO + runloop-integrated, so each block
+                // becomes its own SwiftUI render tick.
+                //
+                // Each dispatch carries the assistant message's UUID
+                // so a stale block from a prior session (interrupted
+                // by Stop / Clear) can't accidentally write to the new
+                // assistant bubble that ends up at the same idx. The
+                // appendAssistant/Reasoning guards re-check id.
                 _ = slm.generate(prompt: prompt) { chunk in
                     var keepGoing = true
                     switch chunk {
                     case .content(let s):
-                        Task { @MainActor in
-                            self?.appendAssistant(s, at: idx)
+                        DispatchQueue.main.async {
+                            self?.appendAssistant(s, at: idx, id: id)
                         }
                     case .reasoning(let s):
                         if thinkOn {
-                            Task { @MainActor in
-                                self?.appendReasoning(s, at: idx)
+                            DispatchQueue.main.async {
+                                self?.appendReasoning(s, at: idx,
+                                                      id: id)
                             }
                         }
                     case .toolCall(let body):
                         if debugOn {
                             let line = "\n[tool: " + body + "]\n"
-                            Task { @MainActor in
-                                self?.appendAssistant(line, at: idx)
+                            DispatchQueue.main.async {
+                                self?.appendAssistant(line, at: idx,
+                                                      id: id)
                             }
                         }
                     case .toolResponse(let body):
@@ -222,12 +242,13 @@ final class SLMViewModel {
                             let n = min(body.count, 400)
                             let prefix = String(body.prefix(n))
                             let line = "\n[result: " + prefix + "]\n"
-                            Task { @MainActor in
-                                self?.appendAssistant(line, at: idx)
+                            DispatchQueue.main.async {
+                                self?.appendAssistant(line, at: idx,
+                                                      id: id)
                             }
                         }
                     case .prefilled:
-                        Task { @MainActor in
+                        DispatchQueue.main.async {
                             self?.prefilling = false
                         }
                     case .pp:
@@ -245,21 +266,28 @@ final class SLMViewModel {
                 let tg = slm.tgPerSec
                 let np = slm.nPrefill
                 let ng = slm.nGenerated
-                Task { @MainActor in
+                DispatchQueue.main.async {
                     self?.finishTurn(pp: pp, tg: tg, np: np, ng: ng)
                 }
             }.value
         }
     }
 
-    private func appendAssistant(_ piece: String, at idx: Int) {
-        if idx < self.messages.count {
+    // Per-chunk mutators carry the assistant message's UUID so stale
+    // dispatch blocks from a prior session (interrupted by Stop /
+    // Clear) can't accidentally land on the new assistant bubble that
+    // happens to occupy the same idx after Clear. We compare against
+    // the live message's id; mismatch → discard.
+    private func appendAssistant(_ piece: String, at idx: Int,
+                                 id: UUID) {
+        if idx < self.messages.count && self.messages[idx].id == id {
             self.messages[idx].content += piece
         }
     }
 
-    private func appendReasoning(_ piece: String, at idx: Int) {
-        if idx < self.messages.count {
+    private func appendReasoning(_ piece: String, at idx: Int,
+                                 id: UUID) {
+        if idx < self.messages.count && self.messages[idx].id == id {
             let prev = self.messages[idx].reasoning ?? ""
             self.messages[idx].reasoning = prev + piece
         }
@@ -276,6 +304,11 @@ final class SLMViewModel {
     func stopGeneration() { self.stopRequested = true }
 
     func clearChat() {
+        // Reset transient flags before tearing down the C ctx so any
+        // in-flight chunk callback (already past its abort check) sees
+        // clean state. The per-chunk UUID guard catches the rest.
+        self.stopRequested = false
+        self.prefilling    = false
         self.messages.removeAll()
         if let slm = self.slm {
             let sysText = self.systemPrompt
@@ -345,7 +378,7 @@ struct ContentView: View {
 //      "Search Internet to find what rock band from which country"
 //          + " recorded HelloWorld album?",
 //      "What is bitcoin price today?",
-        "Write me a haiku.",
+        "Compose a haiku.",
     ]
 
     var body: some View {
@@ -621,4 +654,120 @@ fileprivate func residentBytes() -> UInt64 {
 
 fileprivate func formatMB(_ bytes: UInt64) -> String {
     String(format: "%.0f MB", Double(bytes) / 1024.0 / 1024.0)
+}
+
+// Whimsy - thinking-state placeholder UI.
+//
+// "..." was boring. Whimsy loads `whimsicals.txt` once at startup
+// (~370 emoji-flanked verbs like "🧽 Absorbing 🧽") and renders a
+// shimmering, sparkling view that cycles through a fresh random
+// verb every ~2s while the model is prefilling or decoding the
+// first token of a turn.
+
+import Combine
+
+enum Whimsy {
+
+    /// All loaded entries. Loaded lazily on first access from the
+    /// app bundle. One verb per line; blank lines are skipped. Falls
+    /// back to a tiny built-in set if the resource is missing — the
+    /// app should never show a sad empty placeholder.
+    static let all: [String] = {
+        let fallback = ["🧽 Absorbing 🧽",
+                        "🧠 Cogitating 🧠",
+                        "🎬 Actioning 🎬"]
+        if let url = Bundle.main.url(forResource: "Whimsicals",
+                                     withExtension: "txt"),
+           let raw = try? String(contentsOf: url, encoding: .utf8) {
+            let lines = raw
+                .split(whereSeparator: \.isNewline)
+                .map { String($0).trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            if !lines.isEmpty { return lines }
+        }
+        return fallback
+    }()
+
+    /// One random verb, or the first fallback if the list is empty.
+    static func pick() -> String {
+        Whimsy.all.randomElement() ?? "🧠 Cogitating 🧠"
+    }
+
+}
+
+/// Animated "thinking" placeholder: cycling random whimsy verb with
+/// a horizontal shimmer sweep through the text. Replaces the
+/// pre-2026 "..." string while the assistant bubble is still empty.
+struct ShinyWhimsyView: View {
+
+    /// Picks a fresh verb on each tick. The body re-renders on
+    /// `.id(whim)` so the .transition fires.
+    @State private var whim: String = Whimsy.pick()
+    /// 0 -> 1 cycle that drives the shimmer position.
+    @State private var phase: CGFloat = 0
+    /// Re-pick a verb roughly every 2 seconds. Slightly randomised
+    /// so multiple thinking bubbles on screen don't lock-step.
+    private let pickEvery = Timer.publish(every: 2.0, on: .main,
+                                          in: .common).autoconnect()
+
+    var body: some View {
+        HStack(spacing: 6) {
+            // Sparkle on the left — SF Symbols' built-in `sparkle`
+            // effect pulses without us writing any animation code.
+            Image(systemName: "sparkles")
+                .symbolRenderingMode(.multicolor)
+                .symbolEffect(.variableColor.iterative, isActive: true)
+                .imageScale(.medium)
+            Text(whim)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(shimmer)
+                .id(whim)                            // restart transition
+                .transition(.opacity.combined(with:
+                    .scale(scale: 0.96, anchor: .leading)))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(.background.secondary)
+                .overlay(
+                    // Subtle outer gradient pulse for "alive" feel.
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(LinearGradient(
+                            colors: [.purple.opacity(0.35),
+                                     .blue.opacity(0.35),
+                                     .pink.opacity(0.35)],
+                            startPoint: .leading,
+                            endPoint:   .trailing),
+                                lineWidth: 1)))
+        .onAppear {
+            withAnimation(.linear(duration: 1.6)
+                            .repeatForever(autoreverses: false)) {
+                phase = 1.0
+            }
+        }
+        .onReceive(pickEvery) { _ in
+            withAnimation(.easeInOut(duration: 0.35)) {
+                whim = Whimsy.pick()
+            }
+        }
+        .accessibilityLabel("Thinking: \(whim)")
+    }
+
+    /// Diagonal moving gradient mask used as the text foreground —
+    /// a light highlight sweeps from left to right across the verb.
+    private var shimmer: LinearGradient {
+        let mid = CGFloat(phase)
+        return LinearGradient(
+            stops: [
+                .init(color: .secondary,                location: 0.00),
+                .init(color: .secondary,                location: max(0, mid - 0.20)),
+                .init(color: .primary,                  location: mid),
+                .init(color: .secondary,                location: min(1, mid + 0.20)),
+                .init(color: .secondary,                location: 1.00),
+            ],
+            startPoint: .leading,
+            endPoint:   .trailing)
+    }
+
 }

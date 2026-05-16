@@ -32,11 +32,12 @@ struct slm_sampler slm_sampler_defaults(void) {
 }
 
 struct slm_ctrl slm_ctrl_defaults(void) {
-    struct slm_ctrl c;
+    struct slm_ctrl c = {0};
     c.tools  = true;
     c.think  = false;
     c.effort = NULL;   // == "medium" (no hint)
     c.debug  = 1;      // visibility chunks on by default
+    c.trace_tokens = false;
     return c;
 }
 

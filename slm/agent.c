@@ -149,7 +149,7 @@ static char * agent_json_string(const char ** pp) {
     const char * p = *pp;
     if (*p == '"') {
         p++;
-        struct ts_buf buf = {0};
+        struct chars buf = {0};
         bool closed = false;
         bool err = false;
         while (!closed && !err && *p != '\0') {
@@ -160,13 +160,13 @@ static char * agent_json_string(const char ** pp) {
             } else if (c == '\\') {
                 p++;
                 char e = *p;
-                if (e == 'n')      { ts_put(&buf, "\n", 1); p++; }
-                else if (e == 'r') { ts_put(&buf, "\r", 1); p++; }
-                else if (e == 't') { ts_put(&buf, "\t", 1); p++; }
-                else if (e == 'b') { ts_put(&buf, "\b", 1); p++; }
-                else if (e == 'f') { ts_put(&buf, "\f", 1); p++; }
+                if (e == 'n')      { chars_put(&buf, "\n", 1); p++; }
+                else if (e == 'r') { chars_put(&buf, "\r", 1); p++; }
+                else if (e == 't') { chars_put(&buf, "\t", 1); p++; }
+                else if (e == 'b') { chars_put(&buf, "\b", 1); p++; }
+                else if (e == 'f') { chars_put(&buf, "\f", 1); p++; }
                 else if (e == '"' || e == '\\' || e == '/') {
-                    ts_put(&buf, &e, 1); p++;
+                    chars_put(&buf, &e, 1); p++;
                 } else if (e == 'u') {
                     p++;
                     unsigned cp = 0;
@@ -182,24 +182,24 @@ static char * agent_json_string(const char ** pp) {
                     }
                     if (!ok) { err = true; }
                     else if (cp < 0x80) {
-                        char ch = (char)cp; ts_put(&buf, &ch, 1);
+                        char ch = (char)cp; chars_put(&buf, &ch, 1);
                     } else if (cp < 0x800) {
                         char two[2];
                         two[0] = (char)(0xC0 | (cp >> 6));
                         two[1] = (char)(0x80 | (cp & 0x3F));
-                        ts_put(&buf, two, 2);
+                        chars_put(&buf, two, 2);
                     } else {
                         char three[3];
                         three[0] = (char)(0xE0 | (cp >> 12));
                         three[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
                         three[2] = (char)(0x80 | (cp & 0x3F));
-                        ts_put(&buf, three, 3);
+                        chars_put(&buf, three, 3);
                     }
                 } else {
                     err = true;
                 }
             } else {
-                ts_put(&buf, &c, 1);
+                chars_put(&buf, &c, 1);
                 p++;
             }
         }

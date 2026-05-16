@@ -109,7 +109,16 @@ struct slm_ctrl {
     int32_t      debug;          // verbosity (0 quiet, 9 chatty). Free
                                  // to flip on the fly; gates call /
                                  // response visibility chunks.
+    bool         trace_tokens;   // internal debug flag
 };
+
+// Token-level trace: when set, slm_generate prints each sampled
+// token ID to stderr as "[tok] %d\n". Used by tools/bench.sh's
+// token-level parity mode, which survives ULP drift across
+// perf rewrites that change the underlying logits but keep the
+// argmax stable. Default OFF so non-CLI consumers (test-nihs etc.)
+// get clean output; slm.c's main() sets it from the LLM_TRACE_TOKENS
+// env var when LLM_CLI is defined.
 
 // Defaults: tools=true, think=false, effort=NULL, debug=1.
 struct slm_ctrl slm_ctrl_defaults(void);

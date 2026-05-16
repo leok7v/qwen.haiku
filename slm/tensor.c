@@ -663,7 +663,9 @@ void q4_pack_row(const float * src, int64_t k, q4_block * out) {
 // max is the SIGNED value of the largest-|x|. Asymmetric: dominant
 // magnitude lands at -128, opposite-sign extreme at +127. Range
 // [-128, 127]. We use the same convention for byte-for-byte parity.
+
 extern int g_no_q8k_rt;
+
 // Banker's rounding to match llama.cpp's nearest_int() exactly.
 // Half-values round to even; differs from roundf which rounds half away
 // from zero. The off-by-1 from roundf vs nearest_int compounds through

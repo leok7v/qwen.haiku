@@ -294,6 +294,14 @@
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
+				"GCC_PREPROCESSOR_DEFINITIONS[sdk=iphone*]" = (
+					"$(inherited)",
+					"LLM_NO_TOOLS=1",
+				);
+				"GCC_PREPROCESSOR_DEFINITIONS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"LLM_NO_TOOLS=1",
+				);
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(SRCROOT)/slm";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
@@ -311,7 +319,7 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1;
-				"OTHER_LDFLAGS[sdk=macosx*]" = "-lcurl"; "GCC_PREPROCESSOR_DEFINITIONS[sdk=iphone*]" = ("$(inherited)", "LLM_NO_TOOLS=1"); "GCC_PREPROCESSOR_DEFINITIONS[sdk=iphonesimulator*]" = ("$(inherited)", "LLM_NO_TOOLS=1");
+				"OTHER_LDFLAGS[sdk=macosx*]" = "-lcurl";
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.leok7v.QwenHaiku;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -344,6 +352,14 @@
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
+				"GCC_PREPROCESSOR_DEFINITIONS[sdk=iphone*]" = (
+					"$(inherited)",
+					"LLM_NO_TOOLS=1",
+				);
+				"GCC_PREPROCESSOR_DEFINITIONS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"LLM_NO_TOOLS=1",
+				);
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(SRCROOT)/slm";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
@@ -361,7 +377,7 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1;
-				"OTHER_LDFLAGS[sdk=macosx*]" = "-lcurl"; "GCC_PREPROCESSOR_DEFINITIONS[sdk=iphone*]" = ("$(inherited)", "LLM_NO_TOOLS=1"); "GCC_PREPROCESSOR_DEFINITIONS[sdk=iphonesimulator*]" = ("$(inherited)", "LLM_NO_TOOLS=1");
+				"OTHER_LDFLAGS[sdk=macosx*]" = "-lcurl";
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.leok7v.QwenHaiku;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";

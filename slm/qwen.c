@@ -182,17 +182,17 @@ static int32_t slm_load_weights(const struct gguf * g,
     // output.weight is optional; absent => tied embeddings.
     slm_resolve_tensor(g, "output.weight", &w->output, 0);
     if (w->output.data == NULL) { w->output = w->tok_embd; }
-    w->layers = (struct slm_layer_w *)oom(
-        calloc((size_t)cfg->n_layers, sizeof(struct slm_layer_w)));
+    w->layers = (struct slm_layer *)oom(
+        calloc((size_t)cfg->n_layers, sizeof(struct slm_layer)));
     char nm[64];
     for (int32_t L = 0; L < cfg->n_layers; L++) {
-        struct slm_layer_w * Lw = &w->layers[L];
+        struct slm_layer * Lw = &w->layers[L];
         // Layer-type detection: in qwen35 the SSM layers carry an
         // ssm_a tensor; the attention layers don't. (We could also
         // use full_attn_interval modulo, but probing the GGUF is
         // the safer signal.)
         snprintf(nm, sizeof(nm), "blk.%d.ssm_a", L);
-        struct slm_tensor_ref probe = {0};
+        struct slm_tensor probe = {0};
         Lw->is_ssm = (cfg->is_hybrid
                       && slm_resolve_tensor(g, nm, &probe, 0) == 0
                       && probe.data != NULL) ? 1 : 0;
@@ -320,7 +320,7 @@ static struct tensor * slm_forward_ssm(struct slm_ctx * c,
                                        int32_t L,
                                        struct tensor * h) {
     struct arena * a = c->arena;
-    struct slm_layer_w * Lw = &c->model->W.layers[L];
+    struct slm_layer * Lw = &c->model->W.layers[L];
     int32_t n_heads  = c->model->cfg.linear_n_heads;     // 16
     int32_t k_hd     = c->model->cfg.linear_k_head_dim;  // 128
     int32_t v_hd     = c->model->cfg.linear_v_head_dim;  // 128
@@ -667,7 +667,7 @@ static struct tensor * slm_forward_ssm_batch(struct slm_ctx * c,
                                               int32_t L, int32_t n,
                                               struct tensor * h) {
     struct arena * a = c->arena;
-    struct slm_layer_w * Lw = &c->model->W.layers[L];
+    struct slm_layer * Lw = &c->model->W.layers[L];
     int32_t n_heads  = c->model->cfg.linear_n_heads;
     int32_t k_hd     = c->model->cfg.linear_k_head_dim;
     int32_t v_hd     = c->model->cfg.linear_v_head_dim;
@@ -978,7 +978,7 @@ static struct tensor * slm_forward_step(struct slm_ctx * c,
         use_ssm_batch = (getenv("LLM_USE_SSM_BATCH") != NULL) ? 1 : 0;
     }
     for (int32_t L = 0; L < c->model->cfg.n_layers; L++) {
-        struct slm_layer_w * Lw = &c->model->W.layers[L];
+        struct slm_layer * Lw = &c->model->W.layers[L];
         struct tensor * mix;
         if (Lw->is_ssm) {
             // Single-token forward: route to the chunked-SSM batched
@@ -1120,7 +1120,7 @@ static struct tensor * slm_forward_batch(struct slm_ctx * c,
     slm_trace_batch("inp_embd", "GET_ROWS", h->data, hidden_dim, n);
     // 2. Per-layer.
     for (int32_t L = 0; L < c->model->cfg.n_layers; L++) {
-        struct slm_layer_w * Lw = &c->model->W.layers[L];
+        struct slm_layer * Lw = &c->model->W.layers[L];
         struct tensor * mix;
         if (Lw->is_ssm) {
             // SSM: process all n tokens via chunked kernel. Internal
@@ -1460,8 +1460,8 @@ static int32_t qwen_self_test(void) {
     float * out_norm = ARENA_F32(hidden);
     for (int32_t i = 0; i < hidden; i++) out_norm[i] = 1.0f + RNDF();
     // Per-layer weights:
-    struct slm_layer_w * layers = (struct slm_layer_w *)oom(
-        calloc(cfg.n_layers, sizeof(struct slm_layer_w)));
+    struct slm_layer * layers = (struct slm_layer *)oom(
+        calloc(cfg.n_layers, sizeof(struct slm_layer)));
     #define ALLOC_F32(dst, n0, n1) do {                                 \
         size_t _bytes = (size_t)(n0) * (n1) * sizeof(float);           \
         float * _p = (float *)arena_alloc(a, _bytes);                   \

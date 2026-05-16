@@ -4,8 +4,8 @@
 //
 // `#include`-d from qwen.c (or any other sibling arch file) as
 // part of the single-TU build. Owns:
-//   - the shared struct definitions (slm_config, slm_layer_w,
-//     slm_weights, slm_kv, slm_model, slm_ctx, slm_tensor_ref)
+//   - the shared struct definitions (slm_config, slm_layer,
+//     slm_weights, slm_kv, slm_model, slm_ctx, slm_tensor)
 //   - generic weight resolution (slm_resolve_tensor) and matmul
 //     dispatch (matmul_dispatch + weights_as_f32_view)
 //   - KV cache management (kv_init/kv_free/kv_row_*)
@@ -49,19 +49,13 @@
 #include "slm.h"         // struct slm_ctrl + public API types
 #include "gguf.c"        // GGUF v3 reader
 
-__attribute__((unused))
-static double slm_monotonic_seconds(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
-
 // Arch-specific entry points provided by the sibling architecture
 // file (qwen.c / smollm.c / lfm2.c). model.c calls these from
 // slm_model_load; the sibling defines them after model.c is
 // included. Static at the TU level — they're not API surface.
 struct slm_config;
 struct slm_weights;
+
 static int32_t slm_load_config(const struct gguf * g, struct slm_config * c);
 static int32_t slm_load_weights(const struct gguf * g,
                                 const struct slm_config * cfg,
@@ -135,49 +129,50 @@ struct slm_config {
 // Model weights - pointers into the mmap'd GGUF, plus type tags.
 // ---------------------------------------------------------------------------
 
-struct slm_tensor_ref {
+struct slm_tensor {
     const void * data;
     int32_t      type;        // GGUF_TT_*
     int32_t      n_dims;
     int64_t      shape[4];
 };
 
-struct slm_layer_w {
+struct slm_layer {
     int32_t               is_ssm;       // 1 for qwen35 SSM layer, 0 for attention
     // Common (both attention and SSM):
-    struct slm_tensor_ref attn_norm;    // RMSNorm before mixer
-    struct slm_tensor_ref ffn_norm;     // RMSNorm before FFN (called
+    struct slm_tensor attn_norm;    // RMSNorm before mixer
+    struct slm_tensor ffn_norm;     // RMSNorm before FFN (called
                                         // post_attention_norm in qwen35)
-    struct slm_tensor_ref ffn_gate;
-    struct slm_tensor_ref ffn_up;
-    struct slm_tensor_ref ffn_down;
+    struct slm_tensor ffn_gate;
+    struct slm_tensor ffn_up;
+    struct slm_tensor ffn_down;
     // Attention-only:
-    struct slm_tensor_ref attn_q;
-    struct slm_tensor_ref attn_k;
-    struct slm_tensor_ref attn_v;
-    struct slm_tensor_ref attn_q_norm;
-    struct slm_tensor_ref attn_k_norm;
-    struct slm_tensor_ref attn_out;
+    struct slm_tensor attn_q;
+    struct slm_tensor attn_k;
+    struct slm_tensor attn_v;
+    struct slm_tensor attn_q_norm;
+    struct slm_tensor attn_k_norm;
+    struct slm_tensor attn_out;
     // SSM-only (qwen35 hybrid):
-    struct slm_tensor_ref attn_qkv;     // 1024 -> 6144 input projection
-    struct slm_tensor_ref attn_gate;    // 1024 -> 2048 output gate
-    struct slm_tensor_ref ssm_a;        // (16,) per-group A_log
-    struct slm_tensor_ref ssm_alpha;    // 1024 -> 16 (DeltaNet alpha)
-    struct slm_tensor_ref ssm_beta;     // 1024 -> 16 (DeltaNet beta)
-    struct slm_tensor_ref ssm_conv1d;   // (4, 6144) depthwise causal conv
-    struct slm_tensor_ref ssm_dt_bias;  // (16,) per-group dt bias
-    struct slm_tensor_ref ssm_norm;     // (128,) group-wise RMSNorm
-    struct slm_tensor_ref ssm_out;      // 2048 -> 1024 output projection
+    struct slm_tensor attn_qkv;     // 1024 -> 6144 input projection
+    struct slm_tensor attn_gate;    // 1024 -> 2048 output gate
+    struct slm_tensor ssm_a;        // (16,) per-group A_log
+    struct slm_tensor ssm_alpha;    // 1024 -> 16 (DeltaNet alpha)
+    struct slm_tensor ssm_beta;     // 1024 -> 16 (DeltaNet beta)
+    struct slm_tensor ssm_conv1d;   // (4, 6144) depthwise causal conv
+    struct slm_tensor ssm_dt_bias;  // (16,) per-group dt bias
+    struct slm_tensor ssm_norm;     // (128,) group-wise RMSNorm
+    struct slm_tensor ssm_out;      // 2048 -> 1024 output projection
 };
 
 struct slm_weights {
-    struct slm_tensor_ref tok_embd;
-    struct slm_tensor_ref output_norm;
-    struct slm_tensor_ref output;       // may equal tok_embd (tied)
-    struct slm_layer_w * layers;        // [n_layers]
+    struct slm_tensor tok_embd;
+    struct slm_tensor output_norm;
+    struct slm_tensor output;       // may equal tok_embd (tied)
+    struct slm_layer * layers;        // [n_layers]
 };
+
 static int32_t slm_resolve_tensor(const struct gguf * g, const char * name,
-                                  struct slm_tensor_ref * out,
+                                  struct slm_tensor * out,
                                   int32_t required) {
     const struct gguf_tensor * t = gguf_find_tensor(g, name);
     int32_t r = 0;
@@ -196,16 +191,18 @@ static int32_t slm_resolve_tensor(const struct gguf * g, const char * name,
     }
     return r;
 }
+
 static void slm_free_weights(struct slm_weights * w) {
     if (w->layers) {
         free(w->layers);
         w->layers = NULL;
     }
 }
+
 // Dispatch matmul based on weight tensor's quantization type. Weight
 // shape in GGUF is (in_features, out_features) - first dim is the
 // inner dim that contracts with x.
-static struct tensor * matmul_dispatch(const struct slm_tensor_ref * w,
+static struct tensor * matmul_dispatch(const struct slm_tensor * w,
                                        struct tensor * x) {
     int64_t k     = w->shape[0];
     int64_t out_f = w->shape[1];
@@ -254,7 +251,7 @@ static struct tensor * matmul_dispatch(const struct slm_tensor_ref * w,
 
 // Cast an mmap'd weights ref to a struct tensor (read-only view) for
 // RMSNorm weight tensors etc., which GGUF stores as F32.
-static struct tensor weights_as_f32_view(const struct slm_tensor_ref * w,
+static struct tensor weights_as_f32_view(const struct slm_tensor * w,
                                          struct arena * a) {
     struct tensor t;
     memset(&t, 0, sizeof(t));
@@ -270,6 +267,7 @@ static struct tensor weights_as_f32_view(const struct slm_tensor_ref * w,
     t.arena = a;
     return t;
 }
+
 // ---------------------------------------------------------------------------
 // KV cache (fp16 storage; fp32 working buffers for now)
 // ---------------------------------------------------------------------------
@@ -316,6 +314,7 @@ static _Float16 * kv_row_v(struct slm_kv * c, int32_t L, int32_t pos) {
     size_t row     = (size_t)L * c->max_position + pos;
     return c->v + row * per_row;
 }
+
 // ---------------------------------------------------------------------------
 // SSM state cache (qwen35 hybrid only)
 //
@@ -380,6 +379,12 @@ static void ssm_cache_free(struct slm_ssm_cache * s) {
 // Reset recurrent state to "fresh conversation". The KV cache is
 // overwritten by the next forward pass so it does not need
 // clearing here; only the SSM/conv recurrent buffers do.
+
+// ssm_cache_reset is not in the current architecture.
+// Reason it could come back is branched conversations
+// "save SSM snapshot, run a hypothetical, restore".
+// That needs a slm_ssm_cache_clone + slm_ssm_cache_assign, not a zero-reset.
+
 __attribute__((unused))
 static void ssm_cache_reset(struct slm_ssm_cache * s,
                             const struct slm_config * cfg) {
@@ -398,6 +403,7 @@ static void ssm_cache_reset(struct slm_ssm_cache * s,
         memset(s->conv_head, 0, (size_t)s->n_layers * sizeof(int32_t));
     }
 }
+
 // ---------------------------------------------------------------------------
 // Forward pass - single token, with KV cache update.
 //
@@ -423,6 +429,7 @@ static void ssm_cache_reset(struct slm_ssm_cache * s,
 // `slm_reset` is gone: drop the old ctx and create a fresh one for
 // a new conversation. The model survives unchanged so the GGUF
 // doesn't need to be re-mmapped.
+
 struct slm_model {
     struct gguf            gguf;
     struct slm_config      cfg;
@@ -433,13 +440,7 @@ struct slm_model {
     char *                 chat_template;   // see footnote (1)
 };
 
-// Append-only token-id history (see slm_ctx_tokens accessor). Same
-// shape as utils/arrays.c's struct arr but typed for int32_t.
-struct slm_tokens {
-    int32_t * data;
-    size_t    count;
-    size_t    capacity;
-};
+define_array(int32_t, slm_tokens);
 
 struct slm_ctx {
     struct slm_model *     model;           // borrowed; NOT owned
@@ -505,14 +506,7 @@ struct slm_ctx {
 //     array's owned strings.
 static int g_dump_layer = -1;
 int g_no_q8k_rt = 0;
-// Token-level trace: when set, slm_generate prints each sampled
-// token ID to stderr as "[tok] %d\n". Used by tools/bench.sh's
-// token-level parity mode, which survives ULP drift across
-// perf rewrites that change the underlying logits but keep the
-// argmax stable. Default OFF so non-CLI consumers (test-nihs etc.)
-// get clean output; slm.c's main() sets it from the LLM_TRACE_TOKENS
-// env var when LLM_CLI is defined.
-static int g_trace_tokens = 0;
+
 __attribute__((unused)) static int g_min_new = 0;
 
 // DUMP(label, data, n) - one-line dump-when-this-layer-is-selected.
@@ -705,7 +699,7 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
                                         int32_t L, int32_t pos,
                                         struct tensor * h) {
     struct arena * a = c->arena;
-    struct slm_layer_w * Lw = &c->model->W.layers[L];
+    struct slm_layer * Lw = &c->model->W.layers[L];
     int32_t hd         = c->model->cfg.head_dim;
     int32_t n_h        = c->model->cfg.n_heads;
     int32_t n_kvh      = c->model->cfg.n_kv_heads;
@@ -904,7 +898,7 @@ static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
                                               int32_t n,
                                               struct tensor * h) {
     struct arena * a = c->arena;
-    struct slm_layer_w * Lw = &c->model->W.layers[L];
+    struct slm_layer * Lw = &c->model->W.layers[L];
     int32_t hd         = c->model->cfg.head_dim;
     int32_t n_h        = c->model->cfg.n_heads;
     int32_t n_kvh      = c->model->cfg.n_kv_heads;
@@ -1107,7 +1101,7 @@ static uint64_t rng_next(struct rng * r) {
 }
 
 // SplitMix64 to expand a single 64-bit seed into the two-word state.
-__attribute__((unused))
+
 static void rng_seed(struct rng * r, uint64_t seed) {
     uint64_t z = seed + 0x9e3779b97f4a7c15ULL;
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;

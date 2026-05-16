@@ -49,56 +49,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Internal grow-as-needed string buffer; shared by tools.c and
-// agent.c (the JSON-args unescape path). Same shape as the one
-// jinja-template.c uses, kept here so tools.c is drop-in usable
-// in projects that omit jinja-template.c.
-struct ts_buf {
-    char * data;
-    size_t count;
-    size_t capacity;
-};
-
-static void ts_grow(struct ts_buf * b, size_t need) {
-    size_t cap = b->capacity == 0 ? 256 : b->capacity;
-    while (cap < need + 1) { cap *= 2; }
-    if (cap > b->capacity) {
-        char * nd = (char *)realloc(b->data, cap);
-        if (nd != NULL) {
-            b->data = nd;
-            b->capacity = cap;
-        }
-    }
-}
-
-static void ts_put(struct ts_buf * b, const char * s, size_t n) {
-    if (n > 0) {
-        ts_grow(b, b->count + n);
-        if (b->data != NULL) {
-            memcpy(b->data + b->count, s, n);
-            b->count += n;
-            b->data[b->count] = '\0';
-        }
-    }
-}
-
-__attribute__((unused))
-static void ts_puts(struct ts_buf * b, const char * s) {
-    if (s != NULL && s[0] != '\0') { ts_put(b, s, strlen(s)); }
-}
-
-__attribute__((unused))
-static void ts_printf(struct ts_buf * b, const char * fmt, ...) {
-    char    tmp[1024];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
-    va_end(ap);
-    if (n > 0) {
-        ts_put(b, tmp, (size_t)n < sizeof(tmp) ? (size_t)n : sizeof(tmp) - 1);
-    }
-}
-
 // LLM_NO_TOOLS: opt-out for builds that can't link libcurl (Android
 // NDK, embedded targets). When set, this file emits stub
 // implementations that return "tool unavailable" results; agent.c
@@ -133,7 +83,7 @@ static void tools_result_free(struct tool_result * r) {
     }
 }
 
-// ts_buf + ts_grow/ts_put/ts_puts/ts_printf hoisted above the
+// ts_buf + ts_grow/ts_put/ts_puts/chars_printf hoisted above the
 // LLM_NO_TOOLS gate so agent.c sees them in both build modes.
 
 // libcurl write-callback into a ts_buf. Caps writes once the buffer
@@ -142,13 +92,13 @@ static void tools_result_free(struct tool_result * r) {
 // notice is appended by the caller).
 static size_t tools_curl_write(void * ptr, size_t size, size_t nmemb,
                                void * user) {
-    struct ts_buf * b = (struct ts_buf *)user;
+    struct chars * b = (struct chars *)user;
     size_t total = size * nmemb;
     size_t cap   = TOOLS_FETCH_CAP;
     size_t avail = (b->count < cap) ? (cap - b->count) : 0;
     size_t take  = (total < avail) ? total : avail;
     if (take > 0) {
-        ts_put(b, (const char *)ptr, take);
+        chars_put(b, (const char *)ptr, take);
     }
     // Tell curl we accepted everything so it doesn't error out;
     // we'll surface truncation in the body itself.
@@ -175,7 +125,7 @@ static void tools_global_cleanup(void) {
 }
 
 // URL-encode `q` into `out`. RFC 3986 unreserved set only.
-static void tools_url_encode(const char * q, struct ts_buf * out) {
+static void tools_url_encode(const char * q, struct chars * out) {
     const char * p = q;
     while (*p != '\0') {
         unsigned char c = (unsigned char)*p;
@@ -186,11 +136,11 @@ static void tools_url_encode(const char * q, struct ts_buf * out) {
                       ||  c == '.' || c == '~';
         if (unreserved) {
             char ch = (char)c;
-            ts_put(out, &ch, 1);
+            chars_put(out, &ch, 1);
         } else {
             char hex[4];
             snprintf(hex, sizeof(hex), "%%%02X", c);
-            ts_puts(out, hex);
+            chars_puts(out, hex);
         }
         p++;
     }
@@ -201,7 +151,7 @@ static void tools_url_encode(const char * q, struct ts_buf * out) {
 // entity. Recognises &amp; &lt; &gt; &quot; &apos; &nbsp; and
 // numeric &#NNN; / &#xHH;.
 static size_t tools_decode_entity(const char * s, size_t i, size_t n,
-                                  struct ts_buf * out) {
+                                  struct chars * out) {
     size_t adv = 0;
     if (i < n && s[i] == '&') {
         size_t end = i + 1;
@@ -210,17 +160,17 @@ static size_t tools_decode_entity(const char * s, size_t i, size_t n,
             size_t len = end - i - 1;
             const char * body = s + i + 1;
             if (len == 3 && memcmp(body, "amp", 3) == 0) {
-                ts_put(out, "&", 1); adv = 4;
+                chars_put(out, "&", 1); adv = 4;
             } else if (len == 2 && memcmp(body, "lt", 2) == 0) {
-                ts_put(out, "<", 1); adv = 3;
+                chars_put(out, "<", 1); adv = 3;
             } else if (len == 2 && memcmp(body, "gt", 2) == 0) {
-                ts_put(out, ">", 1); adv = 3;
+                chars_put(out, ">", 1); adv = 3;
             } else if (len == 4 && memcmp(body, "quot", 4) == 0) {
-                ts_put(out, "\"", 1); adv = 5;
+                chars_put(out, "\"", 1); adv = 5;
             } else if (len == 4 && memcmp(body, "apos", 4) == 0) {
-                ts_put(out, "'", 1); adv = 5;
+                chars_put(out, "'", 1); adv = 5;
             } else if (len == 4 && memcmp(body, "nbsp", 4) == 0) {
-                ts_put(out, " ", 1); adv = 5;
+                chars_put(out, " ", 1); adv = 5;
             } else if (len >= 2 && body[0] == '#') {
                 int cp = 0;
                 if (body[1] == 'x' || body[1] == 'X') {
@@ -242,25 +192,25 @@ static size_t tools_decode_entity(const char * s, size_t i, size_t n,
                 // Emit as UTF-8.
                 if (cp >= 0 && cp < 0x80) {
                     char c = (char)cp;
-                    ts_put(out, &c, 1);
+                    chars_put(out, &c, 1);
                 } else if (cp < 0x800) {
                     char b[2];
                     b[0] = (char)(0xC0 | (cp >> 6));
                     b[1] = (char)(0x80 | (cp & 0x3F));
-                    ts_put(out, b, 2);
+                    chars_put(out, b, 2);
                 } else if (cp < 0x10000) {
                     char b[3];
                     b[0] = (char)(0xE0 | (cp >> 12));
                     b[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
                     b[2] = (char)(0x80 | (cp & 0x3F));
-                    ts_put(out, b, 3);
+                    chars_put(out, b, 3);
                 } else {
                     char b[4];
                     b[0] = (char)(0xF0 | (cp >> 18));
                     b[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
                     b[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
                     b[3] = (char)(0x80 | (cp & 0x3F));
-                    ts_put(out, b, 4);
+                    chars_put(out, b, 4);
                 }
                 adv = len + 2;  // &...;
             }
@@ -273,7 +223,7 @@ static size_t tools_decode_entity(const char * s, size_t i, size_t n,
 // Newlines, tabs, and \r collapse to a single space; whitespace
 // run-collapsing happens in the caller if needed.
 static void tools_html_strip(const char * s, size_t n,
-                             struct ts_buf * out) {
+                             struct chars * out) {
     size_t i = 0;
     while (i < n) {
         char c = s[i];
@@ -286,14 +236,14 @@ static void tools_html_strip(const char * s, size_t n,
             if (adv > 0) {
                 i += adv;
             } else {
-                ts_put(out, &c, 1);
+                chars_put(out, &c, 1);
                 i++;
             }
         } else if (c == '\r' || c == '\n' || c == '\t') {
-            ts_put(out, " ", 1);
+            chars_put(out, " ", 1);
             i++;
         } else {
-            ts_put(out, &c, 1);
+            chars_put(out, &c, 1);
             i++;
         }
     }
@@ -301,8 +251,8 @@ static void tools_html_strip(const char * s, size_t n,
 
 // Collapse runs of ASCII whitespace inside `in` into a single space;
 // trim leading and trailing whitespace. Writes into `out`.
-static void tools_collapse_ws(const struct ts_buf * in,
-                              struct ts_buf * out) {
+static void tools_collapse_ws(const struct chars * in,
+                              struct chars * out) {
     size_t i = 0;
     bool   in_ws    = true;  // start as "just saw ws" so leading is dropped
     size_t emitted  = 0;
@@ -311,13 +261,13 @@ static void tools_collapse_ws(const struct ts_buf * in,
         bool is_ws = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
         if (is_ws) {
             if (!in_ws && emitted > 0) {
-                ts_put(out, " ", 1);
+                chars_put(out, " ", 1);
                 emitted++;
             }
             in_ws = true;
         } else {
             char ch = (char)c;
-            ts_put(out, &ch, 1);
+            chars_put(out, &ch, 1);
             emitted++;
             in_ws = false;
         }
@@ -382,7 +332,7 @@ static const struct tools_ua_slot * tools_pick_ua(void) {
 // browser-nav headers passes more often. Still no substitute for a
 // proper search API; this is best-effort scraping.
 static int tools_http_get(const char * url, long timeout_ms,
-                          struct ts_buf * body, long * status) {
+                          struct chars * body, long * status) {
     int rc = -1;
     *status = 0;
     CURL * h = curl_easy_init();
@@ -475,7 +425,7 @@ static int tools_http_get(const char * url, long timeout_ms,
 // + tools_ddg_emit_snippets — DDG-lite's markup hasn't moved in
 // years, but if it does, this is the one function to update.
 static int tools_ddg_parse(const char * h, size_t n, int max_results,
-                           struct ts_buf * out) {
+                           struct chars * out) {
     int  seen = 0;
     size_t i  = 0;
     bool more = true;
@@ -497,12 +447,12 @@ static int tools_ddg_parse(const char * h, size_t n, int max_results,
                 more = false;
             } else {
                 size_t end = (size_t)(pe - h);
-                struct ts_buf title = {0};
+                struct chars title = {0};
                 tools_html_strip(h + gt + 1, end - gt - 1, &title);
                 if (title.count > 5) {
-                    struct ts_buf clean = {0};
+                    struct chars clean = {0};
                     tools_collapse_ws(&title, &clean);
-                    ts_printf(out, "- %s\n",
+                    chars_printf(out, "- %s\n",
                               clean.data ? clean.data : "");
                     free(clean.data);
                     seen++;
@@ -543,12 +493,12 @@ static int tools_ddg_parse(const char * h, size_t n, int max_results,
                 if (!found_close) {
                     more = false;
                 } else {
-                    struct ts_buf snip = {0};
+                    struct chars snip = {0};
                     tools_html_strip(h + gt + 1, end - gt - 1, &snip);
                     if (snip.count > 10) {
-                        struct ts_buf clean = {0};
+                        struct chars clean = {0};
                         tools_collapse_ws(&snip, &clean);
-                        ts_printf(out, "  %s\n\n",
+                        chars_printf(out, "  %s\n\n",
                                   clean.data ? clean.data : "");
                         free(clean.data);
                         snip_emitted++;
@@ -575,9 +525,9 @@ static void tools_websearch(const char * query, int max_results,
     } else {
         int cap = (max_results > 0 && max_results <= 16)
                 ? max_results : 8;
-        struct ts_buf eq = {0};
+        struct chars eq = {0};
         tools_url_encode(query, &eq);
-        struct ts_buf url = {0};
+        struct chars url = {0};
         // Match the URL shape Leo's Safari Incognito captured for a
         // real DDG search: ia=web (instant-answer category), origin=
         // funnel_home_website (came from DDG home page), t=h_ (DDG's
@@ -585,12 +535,12 @@ static void tools_websearch(const char * query, int max_results,
         // The lite endpoint is forgiving and accepts a bare ?q=,
         // but adding the funnel params makes the request match an
         // organic-navigation profile.
-        ts_puts(&url,
+        chars_puts(&url,
             "https://lite.duckduckgo.com/lite/"
             "?ia=web&origin=funnel_home_website&t=h_&q=");
-        if (eq.data != NULL) { ts_puts(&url, eq.data); }
-        ts_puts(&url, "&chip-select=search");
-        struct ts_buf body = {0};
+        if (eq.data != NULL) { chars_puts(&url, eq.data); }
+        chars_puts(&url, "&chip-select=search");
+        struct chars body = {0};
         long status = 0;
         int rc = tools_http_get(url.data, 15000, &body, &status);
         if (rc != 0) {
@@ -618,12 +568,12 @@ static void tools_websearch(const char * query, int max_results,
                 " (rate-limited — try again in a few minutes)");
             out->status = status;
         } else {
-            struct ts_buf result = {0};
-            ts_printf(&result, "Web results for: %s\n\n", query);
+            struct chars result = {0};
+            chars_printf(&result, "Web results for: %s\n\n", query);
             int titles = tools_ddg_parse(body.data, body.count,
                                          cap, &result);
             if (titles == 0) {
-                ts_printf(&result,
+                chars_printf(&result,
                     "No results found for: %s\n", query);
             }
             out->body   = result.data;
@@ -651,19 +601,19 @@ static void tools_fetch(const char * url, int timeout_s,
         long ms = (long)(timeout_s > 0 ? timeout_s : 30) * 1000L;
         if (ms < 1000)   { ms = 1000;   }
         if (ms > 300000) { ms = 300000; }
-        struct ts_buf body = {0};
+        struct chars body = {0};
         long status = 0;
         int rc = tools_http_get(url, ms, &body, &status);
         if (rc != 0) {
             out->error = strdup("fetch: libcurl request failed");
         } else {
-            struct ts_buf result = {0};
-            ts_printf(&result, "HTTP %ld\n\n", status);
+            struct chars result = {0};
+            chars_printf(&result, "HTTP %ld\n\n", status);
             if (body.data != NULL && body.count > 0) {
-                ts_put(&result, body.data, body.count);
+                chars_put(&result, body.data, body.count);
             }
             if (body.count >= TOOLS_FETCH_CAP) {
-                ts_printf(&result,
+                chars_printf(&result,
                     "\n\n[... truncated at %d bytes]",
                     (int)TOOLS_FETCH_CAP);
             }
@@ -693,9 +643,9 @@ static void tools_distill(const char * html, size_t n,
     if (html == NULL) {
         out->error = strdup("distill: input is NULL");
     } else {
-        struct ts_buf stripped = {0};
+        struct chars stripped = {0};
         tools_html_strip(html, n, &stripped);
-        struct ts_buf clean = {0};
+        struct chars clean = {0};
         tools_collapse_ws(&stripped, &clean);
         out->body = clean.data;
         out->ok   = 1;
