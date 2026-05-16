@@ -1,0 +1,11 @@
+llm: qwen35 hybrid (Mamba-2/DeltaNet + attention). SSM math is best-guess.
+nihs-test: sentinel="BANANA42", 20 cells
+dispatch: NEON+dotprod
+
+repeats        pos=0.00  pos=0.25  pos=0.50  pos=0.75  pos=1.00 
+repeat=1       PASS( 152)  PASS( 152)  PASS( 152)  PASS( 152)  PASS( 167)
+repeat=4       PASS( 330)  PASS( 329)  PASS( 329)  PASS( 329)  PASS( 344)
+repeat=12      PASS( 800)  PASS( 800)  PASS( 801)  PASS( 801)  PASS( 830)
+repeat=32      PASS(2018)  PASS(1984)  PASS(1984)  PASS(1984)  PASS(1992)
+
+nihs-test: 20/20 cells PASS (100%)

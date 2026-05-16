@@ -32,6 +32,11 @@ BIN   := $(BUILD)/slm
 # main() runs `qwen_self_test` / `chunked_self_test` without the
 # slm.c TU.
 QWEN_TEST := $(BUILD)/qwen-test
+# Needle-in-a-Haystack test binary: tests/test-nihs.c #includes slm.c
+# WITHOUT -DLLM_CLI so slm.c's main() is excluded and test-nihs.c's
+# main() drives the sweep. NOT in `all` because it requires QWEN_GGUF
+# + a real model on disk; explicit `make -C slm nihs-test`.
+NIHS_TEST := $(BUILD)/nihs-test
 
 all: $(BIN) $(QWEN_TEST)
 
@@ -69,13 +74,27 @@ $(QWEN_TEST): qwen.c slm.h model.c gguf.c tokenizer.c sampler.c \
 	      $(if $(filter arm64,$(shell uname -m)),-mcpu=apple-m1,) \
 	      -o $@ qwen.c -lm
 
+$(NIHS_TEST): ../tests/test-nihs.c slm.c slm.h model.c qwen.c gguf.c \
+              tokenizer.c sampler.c jinja.c tensor.c chunked.c \
+              tools.c agent.c \
+              utils/arrays.c utils/chars.c utils/maps.c utils/text.c \
+              $(SIMD_SRCS) \
+              | $(BUILD)
+	$(CC) -O3 -std=c17 -Wall -Wextra \
+	      -Wno-unused-parameter -Wno-missing-braces \
+	      -fvectorize -fslp-vectorize \
+	      $(if $(filter arm64,$(shell uname -m)),-mcpu=apple-m1,) \
+	      -o $@ ../tests/test-nihs.c -lm -lcurl
+
 $(BUILD):
 	mkdir -p $@
 
 run: $(BIN)
 	$(BIN) --self-test
 
+nihs-test: $(NIHS_TEST)
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all clean run
+.PHONY: all clean run nihs-test

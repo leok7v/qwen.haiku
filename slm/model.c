@@ -509,8 +509,10 @@ int g_no_q8k_rt = 0;
 // token ID to stderr as "[tok] %d\n". Used by tools/bench.sh's
 // token-level parity mode, which survives ULP drift across
 // perf rewrites that change the underlying logits but keep the
-// argmax stable.
-static int g_trace_tokens = 1;
+// argmax stable. Default OFF so non-CLI consumers (test-nihs etc.)
+// get clean output; slm.c's main() sets it from the LLM_TRACE_TOKENS
+// env var when LLM_CLI is defined.
+static int g_trace_tokens = 0;
 __attribute__((unused)) static int g_min_new = 0;
 
 // DUMP(label, data, n) - one-line dump-when-this-layer-is-selected.
