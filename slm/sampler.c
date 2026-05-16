@@ -33,11 +33,12 @@ struct slm_sampler slm_sampler_defaults(void) {
 
 struct slm_ctrl slm_ctrl_defaults(void) {
     struct slm_ctrl c = {0};
-    c.tools  = true;
-    c.think  = false;
-    c.effort = NULL;   // == "medium" (no hint)
-    c.debug  = 1;      // visibility chunks on by default
+    c.tools        = true;
+    c.think        = false;
+    c.effort       = NULL;   // == "medium" (no hint)
+    c.debug        = 1;      // visibility chunks on by default
     c.trace_tokens = false;
+    c.dump_layer   = -1;     // diagnostic dump off
     return c;
 }
 
@@ -48,14 +49,15 @@ struct slm_ctrl slm_ctrl_defaults(void) {
 static void apply_rep_penalty(struct tensor * logits,
                               const int32_t * history, int32_t hist_n,
                               float penalty, int32_t window) {
-    if (penalty == 1.0f || hist_n == 0) { return; }
-    int32_t start = (window > 0 && window < hist_n) ? hist_n - window : 0;
-    int64_t vlen  = tensor_nelements(logits);
-    for (int32_t i = start; i < hist_n; i++) {
-        int32_t t = history[i];
-        if (t >= 0 && (int64_t)t < vlen) {
-            float lv = logits->data[t];
-            logits->data[t] = (lv > 0.0f) ? (lv / penalty) : (lv * penalty);
+    if (penalty != 1.0f && hist_n != 0) {
+        int32_t start = (window > 0 && window < hist_n) ? hist_n - window : 0;
+        int64_t vlen  = tensor_nelements(logits);
+        for (int32_t i = start; i < hist_n; i++) {
+            int32_t t = history[i];
+            if (t >= 0 && (int64_t)t < vlen) {
+                float lv = logits->data[t];
+                logits->data[t] = (lv > 0.0f) ? (lv / penalty) : (lv * penalty);
+            }
         }
     }
 }
@@ -67,7 +69,7 @@ static void apply_rep_penalty(struct tensor * logits,
 
 static int32_t topk_collect(const struct tensor * logits, int32_t k,
                             int32_t * idx, float * val) {
-    int64_t n      = tensor_nelements(logits);
+    int64_t n = tensor_nelements(logits);
     if (k <= 0 || k > SLM_SAMPLE_TOPK_MAX) { k = SLM_SAMPLE_TOPK_MAX; }
     int32_t filled = 0;
     for (int64_t i = 0; i < n; i++) {
@@ -109,6 +111,7 @@ static void topk_softmax(float * val, int32_t filled, float temperature) {
 
 // Sort (idx, val) pairs by val descending using insertion sort
 // (filled <= 256 in practice; cheaper than qsort overhead).
+
 static void topk_sort_desc(int32_t * idx, float * val, int32_t filled) {
     for (int32_t i = 1; i < filled; i++) {
         float   v = val[i];
@@ -131,44 +134,47 @@ static int32_t sample_with(struct tensor * logits,
                            const int32_t * history, int32_t hist_n) {
     apply_rep_penalty(logits, history, hist_n,
                       sp->repetition_penalty, sp->repetition_window);
+    int32_t result;
     if (sp->temperature <= 0.0f) {
-        return sample_argmax(logits);
-    }
-    int32_t idx[SLM_SAMPLE_TOPK_MAX];
-    float   val[SLM_SAMPLE_TOPK_MAX];
-    int32_t k = sp->top_k > 0 ? sp->top_k : SLM_SAMPLE_TOPK_MAX;
-    if (k > SLM_SAMPLE_TOPK_MAX) { k = SLM_SAMPLE_TOPK_MAX; }
-    int32_t filled = topk_collect(logits, k, idx, val);
-    topk_softmax(val, filled, sp->temperature);
-    topk_sort_desc(idx, val, filled);
-    // Top-p (nucleus): keep the smallest prefix whose cumulative
-    // probability >= top_p. Effective only when 0 < top_p < 1.
-    int32_t cutoff = filled;
-    if (sp->top_p > 0.0f && sp->top_p < 1.0f) {
-        float acc = 0.0f;
-        for (int32_t j = 0; j < filled; j++) {
-            acc += val[j];
-            if (acc >= sp->top_p) { cutoff = j + 1; j = filled; }
+        result = sample_argmax(logits);
+    } else {
+        int32_t idx[SLM_SAMPLE_TOPK_MAX];
+        float   val[SLM_SAMPLE_TOPK_MAX];
+        int32_t k = sp->top_k > 0 ? sp->top_k : SLM_SAMPLE_TOPK_MAX;
+        if (k > SLM_SAMPLE_TOPK_MAX) { k = SLM_SAMPLE_TOPK_MAX; }
+        int32_t filled = topk_collect(logits, k, idx, val);
+        topk_softmax(val, filled, sp->temperature);
+        topk_sort_desc(idx, val, filled);
+        // Top-p (nucleus): keep the smallest prefix whose cumulative
+        // probability >= top_p. Effective only when 0 < top_p < 1.
+        int32_t cutoff = filled;
+        if (sp->top_p > 0.0f && sp->top_p < 1.0f) {
+            float acc = 0.0f;
+            for (int32_t j = 0; j < filled; j++) {
+                acc += val[j];
+                if (acc >= sp->top_p) { cutoff = j + 1; j = filled; }
+            }
         }
+        // Min-p: drop tokens whose probability < min_p * top_prob.
+        if (sp->min_p > 0.0f) {
+            float thresh = sp->min_p * val[0];
+            int32_t j2   = 1;
+            while (j2 < cutoff && val[j2] >= thresh) { j2++; }
+            cutoff = j2;
+        }
+        // Re-normalize and roulette-wheel sample from the surviving set.
+        float sum = 0.0f;
+        for (int32_t j = 0; j < cutoff; j++) { sum += val[j]; }
+        float u = rng_uniform(rng) * sum;
+        float c = 0.0f;
+        int32_t picked = 0;
+        for (int32_t j = 0; j < cutoff; j++) {
+            c += val[j];
+            if (u <= c) { picked = j; j = cutoff; }
+        }
+        result = idx[picked];
     }
-    // Min-p: drop tokens whose probability < min_p * top_prob.
-    if (sp->min_p > 0.0f) {
-        float thresh = sp->min_p * val[0];
-        int32_t j2   = 1;
-        while (j2 < cutoff && val[j2] >= thresh) { j2++; }
-        cutoff = j2;
-    }
-    // Re-normalize and roulette-wheel sample from the surviving set.
-    float sum = 0.0f;
-    for (int32_t j = 0; j < cutoff; j++) { sum += val[j]; }
-    float u = rng_uniform(rng) * sum;
-    float c = 0.0f;
-    int32_t picked = 0;
-    for (int32_t j = 0; j < cutoff; j++) {
-        c += val[j];
-        if (u <= c) { picked = j; j = cutoff; }
-    }
-    return idx[picked];
+    return result;
 }
 
 #endif  // SAMPLER_C

@@ -91,36 +91,58 @@ struct slm_sampler slm_sampler_defaults(void);
 // Per-conversation behavior knobs. Mutable until the system block
 // has been committed to KV (via slm_ctx_system_prompt). After that,
 // changes to tools/think are ignored by the runtime — the
-// in-context framing is already locked in. debug stays live.
+// in-context framing is already locked in. debug stays live; the
+// diagnostic knobs (trace_tokens, dump_layer) are mutable on the fly.
 struct slm_ctrl {
-    bool         tools;          // advertise tools in system framing,
-                                 // recognise <tool_call> in stream,
-                                 // run embedded agent dispatch.
-    bool         think;          // ask for reasoning. With true, the
-                                 // assistant turn opens `<think>\n`;
-                                 // with false, pre-fills the empty
-                                 // `<think>\n\n</think>\n\n` and the
-                                 // model jumps to content.
-    const char * effort;         // "low" / "medium" / "high" / NULL.
-                                 // Prepended as a hint to the system
-                                 // block: "(brief: 1-2 sentences)\n\n"
-                                 // / no prefix / "(think carefully
-                                 // step-by-step…)\n\n". NULL = medium.
-    int32_t      debug;          // verbosity (0 quiet, 9 chatty). Free
-                                 // to flip on the fly; gates call /
-                                 // response visibility chunks.
-    bool         trace_tokens;   // internal debug flag
+    bool         tools;          // see footnote (1)
+    bool         think;          // see footnote (2)
+    const char * effort;         // see footnote (3)
+    int32_t      debug;          // see footnote (4)
+    bool         trace_tokens;   // see footnote (5)
+    int32_t      dump_layer;     // see footnote (6)
 };
 
-// Token-level trace: when set, slm_generate prints each sampled
-// token ID to stderr as "[tok] %d\n". Used by tools/bench.sh's
-// token-level parity mode, which survives ULP drift across
-// perf rewrites that change the underlying logits but keep the
-// argmax stable. Default OFF so non-CLI consumers (test-nihs etc.)
-// get clean output; slm.c's main() sets it from the LLM_TRACE_TOKENS
-// env var when LLM_CLI is defined.
+// slm_ctrl footnotes:
+//
+// (1) tools: advertise tools in the system framing, recognise
+//     `<tool_call>` blocks in the stream, run the embedded agent
+//     dispatch loop. With false, the model never sees a tools
+//     advertisement and the `<tool_call>` filter is disabled.
+//     Locked in by slm_ctx_system_prompt.
+//
+// (2) think: ask for reasoning. With true, the assistant turn opens
+//     `<think>\n` and the model is free to fill in reasoning before
+//     `</think>`. With false, the runtime pre-fills the empty
+//     `<think>\n\n</think>\n\n` block so the model jumps straight
+//     to content. Locked in by slm_ctx_system_prompt.
+//
+// (3) effort: prepended as a hint to the system block. Recognised:
+//     "low"    -> "(brief: 1-2 sentences)\n\n"
+//     "medium" or NULL -> no prefix
+//     "high"   -> "(think carefully step-by-step ...)\n\n"
+//     Locked in by slm_ctx_system_prompt.
+//
+// (4) debug: verbosity level (0 = quiet, 9 = chatty). Free to flip
+//     on the fly between generate calls. Gates whether tool-call /
+//     tool-response visibility chunks fire in the stream callback.
+//
+// (5) trace_tokens: when set, slm_generate prints each sampled token
+//     id to stderr as "[tok] %d\n". Used by tools/bench.sh's token-
+//     level parity mode, which survives ULP drift across perf
+//     rewrites that change the underlying logits but keep the
+//     argmax stable. Default OFF so non-CLI consumers (test-nihs
+//     etc.) get clean output; slm.c's main() sets it from the
+//     LLM_TRACE_TOKENS env var when LLM_CLI is defined. Mutable on
+//     the fly.
+//
+// (6) dump_layer: -1 = off; >= 0 = dump per-op intermediate tensors
+//     for that layer to stderr (one line per op, head + tail + sum
+//     mirroring llama-eval-callback's format). Parity-diff knob —
+//     drive two implementations with the same dump_layer and the
+//     first divergence is layer-local. Mutable on the fly.
 
-// Defaults: tools=true, think=false, effort=NULL, debug=1.
+// Defaults: tools=true, think=false, effort=NULL, debug=1,
+// trace_tokens=false, dump_layer=-1.
 struct slm_ctrl slm_ctrl_defaults(void);
 
 // Read-write access to the ctx's ctrl. Mutate fields BEFORE the

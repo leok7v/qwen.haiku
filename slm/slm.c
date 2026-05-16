@@ -188,8 +188,11 @@ static int slm_generate_raw(struct slm_ctx * c,
                  struct slm_stream_callback * progress_cb) {
     struct slm_sampler sp = {0};
     if (sampler_in != NULL) { sp = *sampler_in; }
-    struct rng rng;
-    rng_seed(&rng, seed != 0 ? seed : (uint64_t)time(NULL));
+    // rng lives on the ctx (seeded in slm_ctx_create from time(NULL)).
+    // Caller-supplied non-zero `seed` re-seeds it before this call —
+    // that's the parity-gate / reproducibility path. seed=0 advances
+    // c->rng across calls in the same ctx (real chat sampling).
+    if (seed != 0) { rng_seed(&c->rng, seed); }
     slm_trace_open();
     int32_t   generated = 0;
     int32_t   pos       = c->pos;        // resume after previous call
@@ -251,7 +254,7 @@ static int slm_generate_raw(struct slm_ctx * c,
                 logits->data[c->model->cfg.eot_id] = -INFINITY;
             }
         }
-        int32_t next = sample_with(logits, &sp, &rng, history, hist_n);
+        int32_t next = sample_with(logits, &sp, &c->rng, history, hist_n);
         history[hist_n++] = next;
         if (mask) {
             if (c->model->cfg.eos_id >= 0 &&
@@ -974,19 +977,18 @@ static const char * slm_cli_gguf_path(void) {
     return SLM_GGUF_PATH_DEFAULT;
 }
 
-// print_cb: wrap as a functor with that=NULL (just needs base).
+// print_cb: handles all five chunk types so the `--tools` cascade and
+// `--repl` agent loop don't silently swallow tool dialogue. Construct
+// with `pbox.verbose = 1` to flip every channel to stdout instead of
+// stderr (so a piped consumer sees everything).
 struct print_cb_box {
     struct slm_stream_callback base;
+    int                        verbose;
 };
 
-// REPL / single / cascade callback. Handles all five chunk types so the
-// `--tools` cascade and `--repl` agent loop don't silently swallow
-// tool dialogue. `that` is set to &g_verbose (an `int`) — non-zero
-// flips every channel to stdout instead of stderr so a piped consumer
-// sees everything.
-static int g_verbose = 0;
 static int repl_cb_fn(const struct slm_stream_callback * cb) {
-    FILE * side = g_verbose ? stdout : stderr;
+    const struct print_cb_box * box = (const struct print_cb_box *)cb;
+    FILE * side = box->verbose ? stdout : stderr;
     if (cb->content != NULL) {
         // Content always goes to stdout (it's the visible reply).
         fputs(cb->content, stdout);
@@ -1066,8 +1068,10 @@ static void strip_reasoning_for_history(struct chars * s) {
 static int32_t run_chat(const char ** prompts, int32_t n_prompts,
                         const char * system_prompt,
                         const struct slm_sampler * sp, uint64_t seed,
-                        int32_t max_new, bool with_tools,
-                        bool with_think, bool trace_tokens) {
+                        int32_t max_new, int32_t min_new,
+                        int32_t dump_layer, int32_t verbose,
+                        bool with_tools, bool with_think,
+                        bool trace_tokens) {
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
     int32_t r = 0;
     if (!slm_model_loaded(m)) {
@@ -1076,13 +1080,14 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
     } else if (with_tools) {
         struct print_cb_box pbox = {0};
         pbox.base.callback = repl_cb_fn;
+        pbox.verbose       = verbose;
         for (int32_t t = 0; t < n_prompts && r == 0; t++) {
             printf("\n--- turn %d/%d ---\n",
                    (int)(t + 1), (int)n_prompts);
             printf("[user] %s\n[assistant] ", prompts[t]);
             fflush(stdout);
             char * answer = agent_cascade_run(m, prompts[t], sp, seed,
-                                              max_new, g_verbose,
+                                              max_new, verbose,
                                               &pbox.base);
             printf("\n");
             free(answer);
@@ -1094,9 +1099,10 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
             r = 1;
         } else {
             const char * sys = (system_prompt != NULL) ? system_prompt : "";
-            slm_ctx_ctrl(c)->tools = false;
-            slm_ctx_ctrl(c)->think = with_think;
+            slm_ctx_ctrl(c)->tools        = false;
+            slm_ctx_ctrl(c)->think        = with_think;
             slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
+            slm_ctx_ctrl(c)->dump_layer   = dump_layer;
             slm_ctx_system_prompt(c, sys, NULL);
             struct capture_cb_box capbox = {0};
             capbox.base.callback = capture_cb_fn;
@@ -1111,7 +1117,7 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
                 fflush(stdout);
                 struct chars reply = {0};
                 capbox.out = &reply;
-                slm_generate(c, prompts[t], max_new, g_min_new,
+                slm_generate(c, prompts[t], max_new, min_new,
                              sp, seed, &capbox.base);
                 chars_put(&reply, "", 0);
                 strip_reasoning_for_history(&reply);
@@ -1178,7 +1184,8 @@ static int chat_test_cb_fn(const struct slm_stream_callback * cb) {
 //
 // The hashes WILL differ from the old slm_reset-based gate because
 // the system framing changed. Print them; the new set is the gate.
-static int32_t run_chat_test(int32_t max_new, bool trace_tokens) {
+static int32_t run_chat_test(int32_t max_new, int32_t min_new,
+                             int32_t dump_layer, bool trace_tokens) {
     static const char * const turns[] = {
         "Hi! Just say hello back.",
         "What did I just ask?",
@@ -1209,12 +1216,13 @@ static int32_t run_chat_test(int32_t max_new, bool trace_tokens) {
             } else {
                 slm_ctx_system_prompt(c, "", NULL);
                 slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
+                slm_ctx_ctrl(c)->dump_layer   = dump_layer;
                 for (int32_t t = 0; t < N_TURNS && r == 0; t++) {
                     struct chat_test_capture * cap = &caps[t];
                     cap->hash = 0xcbf29ce484222325ULL;
                     cbbox.cap = cap;
                     int32_t gen = slm_generate(c, turns[t], max_new,
-                                               g_min_new, &sp, seed,
+                                               min_new, &sp, seed,
                                                &cbbox.base);
                     chars_put(&cap->text, "", 0);
                     fprintf(stderr,
@@ -1277,6 +1285,8 @@ static int32_t run_ask(const char * question,
 }
 
 static int32_t run_single(const char * prompt, int32_t max_new,
+                          int32_t min_new, int32_t dump_layer,
+                          int32_t verbose,
                           const struct slm_sampler * sp, uint64_t seed,
                           bool with_tools, bool with_think,
                           bool trace_tokens) {
@@ -1288,10 +1298,11 @@ static int32_t run_single(const char * prompt, int32_t max_new,
     } else if (with_tools) {
         struct print_cb_box pbox = {0};
         pbox.base.callback = repl_cb_fn;
+        pbox.verbose       = verbose;
         printf("[user] %s\n", prompt);
         fflush(stdout);
         char * answer = agent_cascade_run(m, prompt, sp, seed,
-                                          max_new, g_verbose,
+                                          max_new, verbose,
                                           &pbox.base);
         printf("\n");
         free(answer);
@@ -1317,15 +1328,17 @@ static int32_t run_single(const char * prompt, int32_t max_new,
                    (int)c->model->cfg.rope_sections[1],
                    (int)c->model->cfg.rope_sections[2],
                    (int)c->model->cfg.rope_sections[3]);
-            slm_ctx_ctrl(c)->tools = false;
-            slm_ctx_ctrl(c)->think = with_think;
+            slm_ctx_ctrl(c)->tools        = false;
+            slm_ctx_ctrl(c)->think        = with_think;
             slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
+            slm_ctx_ctrl(c)->dump_layer   = dump_layer;
             slm_ctx_system_prompt(c, "", NULL);
             struct print_cb_box pbox = {0};
             pbox.base.callback = repl_cb_fn;
+            pbox.verbose       = verbose;
             printf("---\n%s", prompt);
             fflush(stdout);
-            slm_generate(c, prompt, max_new, g_min_new, sp, seed,
+            slm_generate(c, prompt, max_new, min_new, sp, seed,
                          &pbox.base);
             printf("\n");
             fprintf(stderr,
@@ -1339,7 +1352,7 @@ static int32_t run_single(const char * prompt, int32_t max_new,
     return r;
 }
 
-static int32_t run_bench(bool trace_tokens) {
+static int32_t run_bench(int32_t dump_layer, bool trace_tokens) {
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
     int32_t r = 0;
     if (!slm_model_loaded(m)) {
@@ -1362,6 +1375,7 @@ static int32_t run_bench(bool trace_tokens) {
             if (c != NULL) {
                 slm_ctx_system_prompt(c, "", NULL);
                 slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
+                slm_ctx_ctrl(c)->dump_layer   = dump_layer;
                 slm_generate(c, prompt, bench_max_new, 0, &sp,
                              /*seed=*/1u, /*cb=*/NULL);
                 pps[run] = (float)slm_pp_per_sec(c);
@@ -1375,13 +1389,13 @@ static int32_t run_bench(bool trace_tokens) {
         }
         #define SORT3(a) do {                                           \
             if ((a)[0] > (a)[1]) {                                      \
-                float t = (a)[0]; (a)[0] = (a)[1]; (a)[1] = t;         \
+                float t = (a)[0]; (a)[0] = (a)[1]; (a)[1] = t;          \
             }                                                           \
             if ((a)[1] > (a)[2]) {                                      \
-                float t = (a)[1]; (a)[1] = (a)[2]; (a)[2] = t;         \
+                float t = (a)[1]; (a)[1] = (a)[2]; (a)[2] = t;          \
             }                                                           \
             if ((a)[0] > (a)[1]) {                                      \
-                float t = (a)[0]; (a)[0] = (a)[1]; (a)[1] = t;         \
+                float t = (a)[0]; (a)[0] = (a)[1]; (a)[1] = t;          \
             }                                                           \
         } while (0)
         SORT3(pps);
@@ -1402,8 +1416,10 @@ static int32_t run_bench(bool trace_tokens) {
 //     cascade is question-answering, not chat. Sampler is auto-clamped
 //     before calling here (T=0.0, top_p=1.0, rep=1.0).
 static int32_t run_repl(const struct slm_sampler * sp,
-                        uint64_t seed, int32_t max_new,
-                        bool with_tools, bool with_think, bool trace_tokens) {
+                        uint64_t seed, int32_t max_new, int32_t min_new,
+                        int32_t dump_layer, int32_t verbose,
+                        bool with_tools, bool with_think,
+                        bool trace_tokens) {
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
     int32_t r = 0;
     if (!slm_model_loaded(m)) {
@@ -1412,6 +1428,7 @@ static int32_t run_repl(const struct slm_sampler * sp,
     } else if (with_tools) {
         struct print_cb_box pbox = {0};
         pbox.base.callback = repl_cb_fn;
+        pbox.verbose       = verbose;
         char line[4096];
         printf("repl: --tools mode (Router → Eval → Synth cascade)."
                " Each turn is independent.\n"
@@ -1424,7 +1441,7 @@ static int32_t run_repl(const struct slm_sampler * sp,
             }
             if (n > 0) {
                 char * answer = agent_cascade_run(m, line, sp, seed,
-                                                  max_new, g_verbose,
+                                                  max_new, verbose,
                                                   &pbox.base);
                 // The synthesizer already streamed via pbox; the
                 // returned string is the fully-concatenated answer.
@@ -1441,13 +1458,15 @@ static int32_t run_repl(const struct slm_sampler * sp,
             fprintf(stderr, "slm: ctx create failed\n");
             r = 1;
         } else {
-            slm_ctx_ctrl(c)->tools = false;
-            slm_ctx_ctrl(c)->think = with_think;
+            slm_ctx_ctrl(c)->tools        = false;
+            slm_ctx_ctrl(c)->think        = with_think;
             slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
+            slm_ctx_ctrl(c)->dump_layer   = dump_layer;
             slm_ctx_system_prompt(c, "You are a helpful assistant.",
                                   NULL);
             struct print_cb_box pbox = {0};
             pbox.base.callback = repl_cb_fn;
+            pbox.verbose       = verbose;
             char line[4096];
             printf("repl: type a message, Enter to send,"
                    " Ctrl-D to exit.\n> ");
@@ -1461,7 +1480,7 @@ static int32_t run_repl(const struct slm_sampler * sp,
                 if (n > 0) {
                     printf("\nassistant: ");
                     fflush(stdout);
-                    slm_generate(c, line, max_new, g_min_new, sp, seed,
+                    slm_generate(c, line, max_new, min_new, sp, seed,
                                  &pbox.base);
                     printf("\n\n> ");
                     fflush(stdout);
@@ -1501,11 +1520,13 @@ int main(int argc, char ** argv) {
     struct slm_sampler sp = slm_sampler_defaults();
     uint64_t seed         = 0;
     int32_t  max_new      = 64;
+    int32_t  min_new      = 0;         // --min-new N (replaces g_min_new)
     int32_t  max_iters    = 4;
     int32_t  trace_agent  = 0;
-    int32_t  dump_layer   = -1;
+    int32_t  dump_layer   = -1;        // --dump-layer L (replaces g_dump_layer)
     bool     with_tools   = false;     // CLI --tools / --no-tools
     bool     with_think   = false;     // CLI --think / --no-think
+    int32_t  verbose      = 0;         // CLI --verbose
     bool     repl_max_new_set = false; // user set --max-new explicitly
     for (int32_t i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--self-test") == 0) {
@@ -1576,7 +1597,7 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "--trace") == 0) {
             trace_agent = 1;
         } else if (strcmp(argv[i], "--verbose") == 0) {
-            g_verbose = 1;
+            verbose = 1;
         } else if (strcmp(argv[i], "--tools") == 0) {
             with_tools = true;
         } else if (strcmp(argv[i], "--no-tools") == 0) {
@@ -1586,7 +1607,7 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "--no-think") == 0) {
             with_think = false;
         } else if (strcmp(argv[i], "--min-new") == 0 && i + 1 < argc) {
-            g_min_new = atoi(argv[++i]);
+            min_new = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--dump-layer") == 0 && i + 1 < argc) {
             dump_layer = atoi(argv[++i]);
         } else if (argv[i][0] != '-' &&
@@ -1612,7 +1633,6 @@ int main(int argc, char ** argv) {
             sp.repetition_penalty = 1.0f;
         }
     }
-    g_dump_layer      = dump_layer;
     g_no_q8k_rt       = getenv("NO_Q8K_RT")       != NULL;
     bool trace_tokens = getenv("LLM_TRACE_TOKENS") != NULL;
     int rc = 0;
@@ -1621,21 +1641,22 @@ int main(int argc, char ** argv) {
     } else if (mode == CLI_CHUNKED_TEST) {
         rc = chunked_self_test();
     } else if (mode == CLI_SINGLE) {
-        rc = run_single(prompt, max_new, &sp, seed,
-                        with_tools, with_think, trace_tokens);
+        rc = run_single(prompt, max_new, min_new, dump_layer, verbose,
+                        &sp, seed, with_tools, with_think, trace_tokens);
     } else if (mode == CLI_REPL) {
-        rc = run_repl(&sp, seed, max_new, with_tools, with_think, trace_tokens);
+        rc = run_repl(&sp, seed, max_new, min_new, dump_layer, verbose,
+                      with_tools, with_think, trace_tokens);
     } else if (mode == CLI_CHAT) {
         if (chat_n == 0) {
-            fprintf(stderr, "llm: --chat needs at least one -p/--prompt\n");
+            fprintf(stderr, "slm: --chat needs at least one -p/--prompt\n");
             rc = 1;
         } else {
             rc = run_chat(chat_prompts, chat_n, system_prompt,
-                          &sp, seed, max_new,
-                          with_tools, with_think, trace_tokens);
+                          &sp, seed, max_new, min_new, dump_layer,
+                          verbose, with_tools, with_think, trace_tokens);
         }
     } else if (mode == CLI_CHAT_TEST) {
-        rc = run_chat_test(max_new, trace_tokens);
+        rc = run_chat_test(max_new, min_new, dump_layer, trace_tokens);
     } else if (mode == CLI_PRINT_TEMPLATE) {
         struct slm_model * m = slm_model_load(slm_cli_gguf_path());
         struct slm_ctx * c = slm_model_loaded(m) ? slm_ctx_create(m) : NULL;
@@ -1661,7 +1682,7 @@ int main(int argc, char ** argv) {
     } else if (mode == CLI_THINK_TEST) {
         rc = slm_think_test();
     } else if (mode == CLI_BENCH) {
-        rc = run_bench(trace_tokens);
+        rc = run_bench(dump_layer, trace_tokens);
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  slm --self-test\n"

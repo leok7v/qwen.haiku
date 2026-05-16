@@ -546,11 +546,11 @@ static void agent_dispatch(const struct agent_call * call,
             tools_distill(html, strlen(html), out);
         }
     } else {
-        char tmp[160];
-        snprintf(tmp, sizeof(tmp),
-                 "agent: unknown function '%s' (available:"
-                 " websearch, fetch, distill)", call->name);
-        out->error = strdup(tmp);
+        struct chars tmp = {0};
+        chars_printf(&tmp,
+                     "agent: unknown function '%s' (available:"
+                     " websearch, fetch, distill)", call->name);
+        out->error = tmp.data;     // transfer ownership; no chars_free
     }
 }
 
@@ -923,15 +923,16 @@ static char * agent_cascade_run(struct slm_model * model,
                                                  calls, 2);
             if (n_calls > 0) {
                 if (verbose && cb != NULL) {
-                    char trace[256];
+                    struct chars trace = {0};
                     const char * q = agent_call_param(&calls[0], "query");
-                    snprintf(trace, sizeof(trace),
-                             "{\"name\":\"%s\",\"arguments\":"
-                             "{\"query\":\"%.180s\"}}",
-                             calls[0].name != NULL ? calls[0].name : "?",
-                             q != NULL ? q : "");
-                    slm_cb_emit(cb, NULL, NULL, trace, NULL,
+                    chars_printf(&trace,
+                                 "{\"name\":\"%s\",\"arguments\":"
+                                 "{\"query\":\"%s\"}}",
+                                 calls[0].name != NULL ? calls[0].name : "?",
+                                 q != NULL ? q : "");
+                    slm_cb_emit(cb, NULL, NULL, trace.data, NULL,
                                 false, 0, 0);
+                    chars_free(&trace);
                 }
                 agent_dispatch(&calls[0], &search_res);
                 if (verbose && cb != NULL &&

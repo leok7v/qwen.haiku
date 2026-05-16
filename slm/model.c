@@ -405,6 +405,62 @@ static void ssm_cache_reset(struct slm_ssm_cache * s,
 }
 
 // ---------------------------------------------------------------------------
+// Sampling primitives. sample_argmax for greedy; struct rng + rng_*
+// for the temperature/top-k/top-p chain in sampler.c. Defined above
+// struct slm_ctx because the ctx embeds a `struct rng` by value (one
+// rng per conversation, seeded in slm_ctx_create, advanced across
+// calls).
+// ---------------------------------------------------------------------------
+
+static int32_t sample_argmax(const struct tensor * logits) {
+    int64_t n = tensor_nelements(logits);
+    int32_t best = 0;
+    float v = logits->data[0];
+    for (int64_t i = 1; i < n; i++) {
+        if (logits->data[i] > v) {
+            v    = logits->data[i];
+            best = (int32_t)i;
+        }
+    }
+    return best;
+}
+
+struct rng { uint64_t s0, s1; };
+
+static inline uint64_t rng_rotl(uint64_t x, int k) {
+    return (x << k) | (x >> (64 - k));
+}
+
+static uint64_t rng_next(struct rng * r) {
+    uint64_t s0    = r->s0;
+    uint64_t s1    = r->s1;
+    uint64_t res   = rng_rotl(s0 * 5, 7) * 9;
+    s1            ^= s0;
+    r->s0          = rng_rotl(s0, 24) ^ s1 ^ (s1 << 16);
+    r->s1          = rng_rotl(s1, 37);
+    return res;
+}
+
+// SplitMix64 to expand a single 64-bit seed into the two-word state.
+static void rng_seed(struct rng * r, uint64_t seed) {
+    uint64_t z = seed + 0x9e3779b97f4a7c15ULL;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    r->s0 = z ^ (z >> 31);
+    z     = (r->s0 + 0x9e3779b97f4a7c15ULL);
+    z     = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z     = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    r->s1 = z ^ (z >> 31);
+    // Avoid the all-zero state, which would lock xoroshiro at zero.
+    if (r->s0 == 0 && r->s1 == 0) { r->s0 = 1; }
+}
+
+static inline float rng_uniform(struct rng * r) {
+    // 24-bit mantissa, divided to [0, 1).
+    return (float)(rng_next(r) >> 40) / (float)(1u << 24);
+}
+
+// ---------------------------------------------------------------------------
 // Forward pass - single token, with KV cache update.
 //
 // Returns logits as a (vocab_size,) tensor. Uses the per-call arena
@@ -436,7 +492,7 @@ struct slm_model {
     struct slm_weights     W;
     struct tokenizer       tok;
     int32_t                loaded;
-    char                   err[256];
+    struct chars           err;
     char *                 chat_template;   // see footnote (1)
 };
 
@@ -447,7 +503,7 @@ struct slm_ctx {
     struct slm_kv          kv;
     struct slm_ssm_cache   ssm;
     struct arena *         arena;
-    int32_t                dump_layer;      // see footnote (2)
+    struct rng             rng;             // see footnote (2)
     double                 t_prefill_s;     // see footnote (3)
     double                 t_gen_s;
     int32_t                n_prefill;
@@ -466,11 +522,12 @@ struct slm_ctx {
 //     string (GGUF stores it length-prefixed). NULL if the GGUF lacks
 //     the KV. Freed in slm_model_unload.
 //
-// (2) dump_layer: --dump-layer L diagnostic. When >= 0, the forward
-//     path prints the first 8 values of selected intermediate
-//     tensors for layer L (and only that layer) before/after each
-//     major op. Used for layer-by-layer parity diffing against
-//     llama-eval-callback.
+// (2) rng: per-conversation PRNG state. Seeded in slm_ctx_create
+//     from time(NULL) so unseeded chat is non-deterministic across
+//     runs. slm_generate's `seed` parameter re-seeds this rng before
+//     decode when caller passes a non-zero value (parity-gate /
+//     reproducibility path). Advances across slm_generate calls
+//     within one ctx when caller passes seed=0.
 //
 // (3) t_prefill_s / t_gen_s / n_prefill / n_generated: filled by
 //     slm_generate's prefill and decode loops, read back via the
@@ -504,22 +561,24 @@ struct slm_ctx {
 //     slm_ctx_messages_count / slm_ctx_message. The callback's
 //     content/reasoning/call/response pointers point INTO this
 //     array's owned strings.
-static int g_dump_layer = -1;
+// g_no_q8k_rt is the matmul Q8_K runtime gate — build/perf knob, not
+// per-conversation state, so kept file-static here (see tensor.c
+// for the consumer). Set via NO_Q8K_RT env from slm.c's main().
 int g_no_q8k_rt = 0;
 
-__attribute__((unused)) static int g_min_new = 0;
-
-// DUMP(label, data, n) - one-line dump-when-this-layer-is-selected.
-// Captures `c` (the slm_ctx) and `L` (the current layer index) from
-// the calling scope; both are in scope at every dump site in
-// slm_forward_ssm / slm_forward_attn / slm_forward_step's layer loop.
-// Off (no fprintf, no read of `data`) when c->dump_layer != L.
-#define DUMP(label, data, n) \
-    do { \
-        if (c->dump_layer == L) { \
-            slm_dump_row((label), (data), (n)); \
-        } \
-    } while (0)
+// slm_dump(c, L, label, data, n) - layer-gated one-line tensor dump.
+// Used inside slm_forward_ssm / slm_forward_attn / slm_forward_step's
+// per-layer loop for parity diffing against llama-eval-callback. The
+// raw printer is slm_dump_row (defined below) — call it directly when
+// you've already gated a block with `if (c->ctrl.dump_layer == L)`.
+static void slm_dump_row(const char * label, const float * data, int32_t n);
+static inline void slm_dump(const struct slm_ctx * c, int32_t L,
+                            const char * label,
+                            const float * data, int32_t n) {
+    if (c->ctrl.dump_layer == L) {
+        slm_dump_row(label, data, n);
+    }
+}
 // ---------------------------------------------------------------------------
 // qwen_trace: machine-comparable per-tensor JSONL dump, enabled when the
 // QH_TRACE_OUT env var is set to a writable path. The schema matches
@@ -643,21 +702,42 @@ static void slm_trace_f32(const char * name, const char * op,
     }
 }
 
-// Convenience: trace a 1D row of n fp32 values.
-static inline void slm_trace_row(const char * name, const char * op,
-                                const float * data, int64_t n) {
-    slm_trace_f32(name, op, data, n, 1, 1, 1);
-}
+// Tag the JSONL trace with a printf-formatted name. The whole emit
+// path is gated on g_qh_trace_fp at the call site so snprintf isn't
+// executed when tracing is off (the common case). clang's -Wformat
+// type-checks the snprintf inside the macro just like a real call.
+//
+// Call sites read as one line:
+//   slm_trace_row("RMS_NORM", h_norm->data, hidden_dim,
+//                 "attn_norm-%d", L);
+//
+// Literal names: pass a no-conversion format string:
+//   slm_trace_row("GET_ROWS", h->data, hidden_dim, "inp_embd");
 
-// Convenience: trace a 2D batch tensor of shape (dim, n_tokens).
-// Emits one JSONL line covering all n_tokens; the receiving side
-// (llama.cpp/qwen-haiku reference dumper) uses the same shape when
-// it runs chunked prefill, so byte-comparing the two files works.
-static inline void slm_trace_batch(const char * name, const char * op,
-                                  const float * data,
-                                  int64_t dim, int64_t n_tokens) {
-    slm_trace_f32(name, op, data, dim, n_tokens, 1, 1);
-}
+#define slm_trace_row(op, data, n, fmt, ...) \
+    do { \
+        if (g_qh_trace_fp != NULL) { \
+            char _trace_nm_[64]; \
+            snprintf(_trace_nm_, sizeof(_trace_nm_), (fmt), \
+                     ##__VA_ARGS__); \
+            slm_trace_f32(_trace_nm_, (op), (data), (n), 1, 1, 1); \
+        } \
+    } while (0)
+
+// Same shape for 2D batch tensors (dim, n_tokens) — used by the
+// chunked prefill path so byte-comparing JSONL against llama.cpp's
+// qwen-haiku reference dumper works.
+#define slm_trace_batch(op, data, dim, n_tokens, fmt, ...) \
+    do { \
+        if (g_qh_trace_fp != NULL) { \
+            char _trace_nm_[64]; \
+            snprintf(_trace_nm_, sizeof(_trace_nm_), (fmt), \
+                     ##__VA_ARGS__); \
+            slm_trace_f32(_trace_nm_, (op), (data), \
+                          (dim), (n_tokens), 1, 1); \
+        } \
+    } while (0)
+
 static void slm_dump_row(const char * label, const float * data, int32_t n) {
     // Mirror llama-eval-callback's format: head + tail + sum. The
     // sum across the whole tensor is the cheapest single number that
@@ -713,12 +793,9 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
         weights_as_f32_view(&Lw->attn_norm, a);
     struct tensor * h_norm =
         tensor_rms_norm(h, &attn_norm_w, c->model->cfg.norm_eps);
-    DUMP("[A]attn_nm", h_norm->data, c->model->cfg.hidden_dim);
-    {
-        char nm[48];
-        snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
-        slm_trace_row(nm, "RMS_NORM", h_norm->data, c->model->cfg.hidden_dim);
-    }
+    slm_dump(c, L, "[A]attn_nm", h_norm->data, c->model->cfg.hidden_dim);
+    slm_trace_row("RMS_NORM", h_norm->data, c->model->cfg.hidden_dim,
+                  "attn_norm-%d", (int)L);
     // Q / K / V projections. Qwen3.5 has attn_output_gate=true: the
     // Q projection emits n_heads*head_dim*2, split into (Q, gate).
     // The gate is sigmoid'd and multiplied with the attention output
@@ -727,16 +804,13 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
     struct tensor * q_raw = matmul_dispatch(&Lw->attn_q, h_norm);
     struct tensor * k     = matmul_dispatch(&Lw->attn_k, h_norm);
     struct tensor * v     = matmul_dispatch(&Lw->attn_v, h_norm);
-    {
-        char nm[48];
-        snprintf(nm, sizeof(nm), "Qfull-%d", (int)L);
-        slm_trace_row(nm, "MUL_MAT", q_raw->data, attn_inner * 2);
-        snprintf(nm, sizeof(nm), "Kcur-%d", (int)L);
-        slm_trace_row(nm, "MUL_MAT", k->data, kv_hidden);
-        snprintf(nm, sizeof(nm), "Vcur-%d", (int)L);
-        slm_trace_row(nm, "MUL_MAT", v->data, kv_hidden);
-    }
-    if (c->dump_layer == L) {
+    slm_trace_row("MUL_MAT", q_raw->data, attn_inner * 2,
+                  "Qfull-%d", (int)L);
+    slm_trace_row("MUL_MAT", k->data,     kv_hidden,
+                  "Kcur-%d",  (int)L);
+    slm_trace_row("MUL_MAT", v->data,     kv_hidden,
+                  "Vcur-%d",  (int)L);
+    if (c->ctrl.dump_layer == L) {
         slm_dump_row("[A]Qfull  ", q_raw->data, attn_inner * 2);
         slm_dump_row("[A]Kcur   ", k->data, n_kvh * hd);
         slm_dump_row("[A]Vcur   ", v->data, n_kvh * hd);
@@ -870,9 +944,9 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
     ctx_t->ne[0] = attn_inner; ctx_t->ne[1] = 1;
     for (int32_t i = 2; i < TENSOR_MAX_DIMS; i++) ctx_t->ne[i] = 1;
     tensor_set_packed_strides(ctx_t);
-    DUMP("[A]Qrope  ", q_rope->data, attn_inner);
-    DUMP("[A]Krope  ", k_rope->data, n_kvh * hd);
-    DUMP("[A]attn   ", ctx_t->data, attn_inner);
+    slm_dump(c, L, "[A]Qrope  ", q_rope->data, attn_inner);
+    slm_dump(c, L, "[A]Krope  ", k_rope->data, n_kvh * hd);
+    slm_dump(c, L, "[A]attn   ", ctx_t->data, attn_inner);
     // Output gate: attn_output *= sigmoid(gate). qwen35 only.
     if (c->model->cfg.attn_output_gate && attn_gate_v != NULL) {
         for (int32_t i = 0; i < attn_inner; i++) {
@@ -880,18 +954,15 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
             float sig = 1.0f / (1.0f + expf(-g_v));
             ctx_t->data[i] *= sig;
         }
-        DUMP("[A]gated  ", ctx_t->data, attn_inner);
+        slm_dump(c, L, "[A]gated  ", ctx_t->data, attn_inner);
     }
     // Output projection.
     struct tensor * attn_out_t = matmul_dispatch(&Lw->attn_out, ctx_t);
-    {
-        char nm[48];
-        snprintf(nm, sizeof(nm), "attn_out-%d", (int)L);
-        slm_trace_row(nm, "MUL_MAT",
-                     attn_out_t->data, c->model->cfg.hidden_dim);
-    }
+    slm_trace_row("MUL_MAT", attn_out_t->data, c->model->cfg.hidden_dim,
+                  "attn_out-%d", (int)L);
     return attn_out_t;
 }
+
 static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
                                               int32_t L,
                                               int32_t pos_start,
@@ -909,25 +980,18 @@ static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
         weights_as_f32_view(&Lw->attn_norm, a);
     struct tensor * h_norm =
         tensor_rms_norm(h, &attn_norm_w, c->model->cfg.norm_eps);
-    {
-        char nm[48];
-        snprintf(nm, sizeof(nm), "attn_norm-%d", (int)L);
-        slm_trace_batch(nm, "RMS_NORM",
-                       h_norm->data, c->model->cfg.hidden_dim, n);
-    }
+    slm_trace_batch("RMS_NORM", h_norm->data, c->model->cfg.hidden_dim, n,
+                    "attn_norm-%d", (int)L);
     // Q/K/V projections — matmul_dispatch handles ne[1]=n natively.
     struct tensor * q_raw = matmul_dispatch(&Lw->attn_q, h_norm);
     struct tensor * k     = matmul_dispatch(&Lw->attn_k, h_norm);
     struct tensor * v     = matmul_dispatch(&Lw->attn_v, h_norm);
-    {
-        char nm[48];
-        snprintf(nm, sizeof(nm), "Qfull-%d", (int)L);
-        slm_trace_batch(nm, "MUL_MAT", q_raw->data, attn_inner * 2, n);
-        snprintf(nm, sizeof(nm), "Kcur-%d", (int)L);
-        slm_trace_batch(nm, "MUL_MAT", k->data, kv_hidden, n);
-        snprintf(nm, sizeof(nm), "Vcur-%d", (int)L);
-        slm_trace_batch(nm, "MUL_MAT", v->data, kv_hidden, n);
-    }
+    slm_trace_batch("MUL_MAT", q_raw->data, attn_inner * 2, n,
+                    "Qfull-%d", (int)L);
+    slm_trace_batch("MUL_MAT", k->data,     kv_hidden,      n,
+                    "Kcur-%d",  (int)L);
+    slm_trace_batch("MUL_MAT", v->data,     kv_hidden,      n,
+                    "Vcur-%d",  (int)L);
     // Split q_raw into (q, gate) per token when attn_output_gate=true.
     // q_raw has shape [2*attn_inner, n] in head-interleaved layout.
     struct tensor * q = tensor_new_3d(a, hd, n_h, n);
@@ -1057,67 +1121,10 @@ static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
     }
     // Output projection [hidden_dim, n].
     struct tensor * attn_out_t = matmul_dispatch(&Lw->attn_out, ctx_t);
-    {
-        char nm[48];
-        snprintf(nm, sizeof(nm), "attn_out-%d", (int)L);
-        slm_trace_batch(nm, "MUL_MAT",
-                       attn_out_t->data, c->model->cfg.hidden_dim, n);
-    }
+    slm_trace_batch("MUL_MAT", attn_out_t->data,
+                    c->model->cfg.hidden_dim, n,
+                    "attn_out-%d", (int)L);
     return attn_out_t;
-}
-
-// ---------------------------------------------------------------------------
-// Sampling primitives. sample_argmax for greedy; struct rng + rng_*
-// for the temperature/top-k/top-p chain in sampler.c. Pure scalar,
-// model-agnostic.
-// ---------------------------------------------------------------------------
-
-static int32_t sample_argmax(const struct tensor * logits) {
-    int64_t n = tensor_nelements(logits);
-    int32_t best = 0;
-    float v = logits->data[0];
-    for (int64_t i = 1; i < n; i++) {
-        if (logits->data[i] > v) {
-            v    = logits->data[i];
-            best = (int32_t)i;
-        }
-    }
-    return best;
-}
-struct rng { uint64_t s0, s1; };
-
-static inline uint64_t rng_rotl(uint64_t x, int k) {
-    return (x << k) | (x >> (64 - k));
-}
-
-static uint64_t rng_next(struct rng * r) {
-    uint64_t s0    = r->s0;
-    uint64_t s1    = r->s1;
-    uint64_t res   = rng_rotl(s0 * 5, 7) * 9;
-    s1            ^= s0;
-    r->s0          = rng_rotl(s0, 24) ^ s1 ^ (s1 << 16);
-    r->s1          = rng_rotl(s1, 37);
-    return res;
-}
-
-// SplitMix64 to expand a single 64-bit seed into the two-word state.
-
-static void rng_seed(struct rng * r, uint64_t seed) {
-    uint64_t z = seed + 0x9e3779b97f4a7c15ULL;
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    r->s0 = z ^ (z >> 31);
-    z     = (r->s0 + 0x9e3779b97f4a7c15ULL);
-    z     = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z     = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    r->s1 = z ^ (z >> 31);
-    // Avoid the all-zero state, which would lock xoroshiro at zero.
-    if (r->s0 == 0 && r->s1 == 0) { r->s0 = 1; }
-}
-
-static inline float rng_uniform(struct rng * r) {
-    // 24-bit mantissa, divided to [0, 1).
-    return (float)(rng_next(r) >> 40) / (float)(1u << 24);
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,19 +1143,19 @@ struct slm_model * slm_model_load(const char * path) {
     struct slm_model * m =
         (struct slm_model *)oom(calloc(1, sizeof(struct slm_model)));
     if (gguf_open(&m->gguf, path) != 0) {
-        snprintf(m->err, sizeof(m->err), "gguf open failed");
+        chars_printf(&m->err, "gguf open failed");
         return m;
     }
     if (slm_load_config(&m->gguf, &m->cfg) != 0) {
-        snprintf(m->err, sizeof(m->err), "config load failed");
+        chars_printf(&m->err, "config load failed");
         return m;
     }
     if (slm_load_weights(&m->gguf, &m->cfg, &m->W) != 0) {
-        snprintf(m->err, sizeof(m->err), "weights resolve failed");
+        chars_printf(&m->err, "weights resolve failed");
         return m;
     }
     if (tokenizer_load(&m->tok, &m->gguf, &m->cfg) != 0) {
-        snprintf(m->err, sizeof(m->err), "tokenizer load failed");
+        chars_printf(&m->err, "tokenizer load failed");
         return m;
     }
     // Chat-turn stop token: look up `<|im_end|>` in the vocab now
@@ -1201,6 +1208,7 @@ void slm_model_unload(struct slm_model * m) {
         slm_free_weights(&m->W);
         if (m->chat_template) { free(m->chat_template); }
         gguf_close(&m->gguf);
+        chars_free(&m->err);
         free(m);
     }
 }
@@ -1210,7 +1218,11 @@ bool slm_model_loaded(const struct slm_model * m) {
 }
 
 const char * slm_model_error(const struct slm_model * m) {
-    return m == NULL ? "no model" : m->err;
+    const char * r = "no model";
+    if (m != NULL) {
+        r = m->err.data != NULL ? m->err.data : "";
+    }
+    return r;
 }
 
 struct slm_ctx * slm_ctx_create(struct slm_model * m) {
@@ -1223,9 +1235,13 @@ struct slm_ctx * slm_ctx_create(struct slm_model * m) {
                 m->cfg.head_dim, m->cfg.max_position);
         ssm_cache_init(&c->ssm, &m->cfg);
         c->arena      = arena_new(64 * 1024 * 1024);
-        c->dump_layer = g_dump_layer;
         c->pos        = 0;
         c->system_committed = false;
+        // Per-conversation rng. Seeded from wall-clock so unseeded
+        // chat is non-deterministic across runs. slm_generate's
+        // `seed` parameter re-seeds this rng before decode when the
+        // caller passes a non-zero value (the parity-gate path).
+        rng_seed(&c->rng, (uint64_t)time(NULL));
         // c->ids and c->messages are zero-initialized via calloc;
         // first append in slm_ctx_system_prompt / slm_generate
         // grows the vectors on demand.

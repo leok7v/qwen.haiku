@@ -547,11 +547,10 @@ static void tools_websearch(const char * query, int max_results,
             out->error = strdup(
                 "websearch: libcurl request failed (network down?)");
         } else if (status < 200 || status >= 400) {
-            char tmp[128];
-            snprintf(tmp, sizeof(tmp),
-                "websearch: HTTP %ld (DDG may be rate-limiting)",
-                status);
-            out->error  = strdup(tmp);
+            struct chars tmp = {0};
+            chars_printf(&tmp, "websearch: HTTP %ld (may be rate-limiting)",
+                          status); // zero terminated
+            out->error  = tmp.data; // transfer ownership
             out->status = status;
         } else if (body.data == NULL || body.count == 0) {
             out->error = strdup("websearch: empty response from DDG");
@@ -621,9 +620,9 @@ static void tools_fetch(const char * url, int timeout_s,
             out->status = status;
             out->ok     = (status >= 200 && status < 400);
             if (!out->ok) {
-                char tmp[64];
-                snprintf(tmp, sizeof(tmp), "fetch: HTTP %ld", status);
-                out->error = strdup(tmp);
+                struct chars tmp = {0};
+                chars_printf(&tmp, "fetch: HTTP %ld", status);
+                out->error = tmp.data; // transfer ownership
             }
         }
         free(body.data);
