@@ -768,12 +768,10 @@ int32_t slm_n_generated(const struct slm_ctx * c) {
 
 int  slm_tokenize(struct slm_ctx * c, const char * text,
                   int32_t ** out_ids) {
-    size_t bytes = (text != NULL) ? strlen(text) : 0;
-    size_t cap   = bytes + 1;
-    int32_t * ids = (int32_t *)oom(calloc(cap, sizeof(int32_t)));
-    int n = tokenizer_encode(&c->model->tok, text, ids, (int)cap);
-    *out_ids = ids;
-    return n;
+    struct slm_tokens tmp = {0};
+    tokenizer_encode(&c->model->tok, text, &tmp);
+    *out_ids = tmp.data;     // transfer ownership; caller frees
+    return (int)tmp.count;
 }
 
 int  slm_vocab_size(const struct slm_ctx * c) { return c->model->cfg.vocab_size; }
@@ -902,16 +900,15 @@ int slm_generate(struct slm_ctx * c,
         trace("snapshot: pos=%d ids=%zu (pre-turn rollback point)\n",
               c->pos, c->ids.count);
     }
-    // Format the user turn delta and tokenize it.
-    char *    delta   = jinja_format_turn_delta(user_text, c->ctrl.think);
-    int32_t * cur_ids = NULL;
-    int       cur_n   = 0;
+    // Format the user turn delta and tokenize it into a growing token
+    // buffer that we reuse across iters (each iter resets count=0
+    // before refilling).
+    char *            delta = jinja_format_turn_delta(user_text,
+                                                      c->ctrl.think);
+    struct slm_tokens cur   = {0};
     if (delta != NULL) {
-        size_t delta_cap = strlen(delta) + 1;
-        cur_ids = (int32_t *)oom(calloc(delta_cap, sizeof(int32_t)));
-        cur_n   = tokenizer_encode(&c->model->tok, delta,
-                                   cur_ids, (int32_t)delta_cap);
-        slm_ctx_ids_append(c, cur_ids, (size_t)cur_n);
+        tokenizer_encode(&c->model->tok, delta, &cur);
+        slm_ctx_ids_append(c, cur.data, cur.count);
         free(delta);
     }
     bool done = false;
@@ -926,19 +923,17 @@ int slm_generate(struct slm_ctx * c,
         int budget = max_new - total_gen;
         if (getenv("LLM_AGENT_TRACE") != NULL) {
             fprintf(stderr,
-                    "[agent] iter=%d pos=%d prefill_n=%d budget=%d\n",
-                    iter, c->pos, cur_n, budget);
+                    "[agent] iter=%d pos=%d prefill_n=%zu budget=%d\n",
+                    iter, c->pos, cur.count, budget);
         }
-        int n = slm_generate_raw(c, cur_ids, cur_n,
+        int n = slm_generate_raw(c, cur.data, (int32_t)cur.count,
                                  budget, min_new,
                                  sampler_in, seed,
                                  slm_split_trampoline, &box,
                                  cb);
         total_gen += n;
         slm_think_filter_finish(&box.filter, cb);
-        free(cur_ids);
-        cur_ids = NULL;
-        cur_n   = 0;
+        cur.count = 0;       // reuse buffer; freed at function exit
         if (snap != NULL && box.filter.tool_call_ready &&
             total_gen < max_new) {
             // Parse + dispatch the tool synchronously.
@@ -1037,14 +1032,8 @@ int slm_generate(struct slm_ctx * c,
                       pcut, (int)pcut, inject.data,
                       pcut < inject.count ? "..." : "");
             }
-            size_t    cap2  = inject.count + 16;
-            int32_t * ids   = (int32_t *)oom(
-                calloc(cap2, sizeof(int32_t)));
-            int n_ids = tokenizer_encode(&c->model->tok, inject.data,
-                                         ids, (int32_t)cap2);
-            slm_ctx_ids_append(c, ids, (size_t)n_ids);
-            cur_ids = ids;
-            cur_n   = n_ids;
+            tokenizer_encode(&c->model->tok, inject.data, &cur);
+            slm_ctx_ids_append(c, cur.data, cur.count);
             chars_free(&inject);
             chars_free(&result);
             // Reset the visible-tokens counter: the aborted tool_call
@@ -1057,7 +1046,7 @@ int slm_generate(struct slm_ctx * c,
         chars_free(&box.filter.tool_call);
         iter++;
     }
-    free(cur_ids);
+    slm_tokens_free(&cur);
     slm_snapshot_free(snap);
     return total_gen;
 }

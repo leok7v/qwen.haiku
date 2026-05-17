@@ -609,8 +609,7 @@ static char * agent_run(struct slm_model * model,
     memset(owned, 0, sizeof(owned));
     char * final_text = NULL;
     int    iter       = 0;
-    int32_t * ids =
-        (int32_t *)oom(calloc(16384, sizeof(int32_t)));
+    struct slm_tokens ids = {0};
     // Loop post-condition: `final_text != NULL` is "we converged",
     // `iter == max_iters` is "we ran out of attempts". A failed
     // jinja_apply forces iter = max_iters (no progress possible).
@@ -626,13 +625,13 @@ static char * agent_run(struct slm_model * model,
         } else {
             // Fresh ctx per iteration: full conversation re-prefilled.
             struct slm_ctx * ctx = slm_ctx_create(model);
-            int32_t n_ids =
-                tokenizer_encode(&ctx->model->tok, prompt, ids, 16384);
+            ids.count = 0;
+            tokenizer_encode(&ctx->model->tok, prompt, &ids);
             struct chars reply = {0};
             if (print_trace) {
                 fprintf(stderr,
-                        "agent: iter %d/%d prompt_tokens=%d\n",
-                        iter, max_iters, (int)n_ids);
+                        "agent: iter %d/%d prompt_tokens=%zu\n",
+                        iter, max_iters, ids.count);
             }
             // Use slm_generate_raw directly (internal to TU) with
             // the slm_split_trampoline so tool-call markers are
@@ -645,7 +644,8 @@ static char * agent_run(struct slm_model * model,
             acbox.base.callback = agent_capture_cb_fn;
             acbox.out           = &reply;
             sbox.cb = &acbox.base;
-            slm_generate_raw(ctx, ids, n_ids, max_new, 0, sp, seed,
+            slm_generate_raw(ctx, ids.data, (int32_t)ids.count,
+                             max_new, 0, sp, seed,
                              slm_split_trampoline, &sbox,
                              NULL);
             slm_think_filter_finish(&sbox.filter, &acbox.base);
@@ -743,7 +743,7 @@ static char * agent_run(struct slm_model * model,
         }
     }
     for (int i = 0; i < n_owned; i++) { free(owned[i]); }
-    free(ids);
+    slm_tokens_free(&ids);
     return final_text;
 }
 

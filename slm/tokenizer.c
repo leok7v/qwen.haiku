@@ -285,18 +285,21 @@ static void tokenizer_free(struct tokenizer * t) {
     s2i_free(&t->merge_rank);
 }
 
-// Try to match any registered special token at `text[0..tlen)`.
-// Returns the special's index in `t->specials` (>=0) and writes its
-// byte length to `*sp_len`, or -1 if no special matches at position
-// 0. Greedy longest-first match: specials are registered in
-// longest-first order so this just returns the first hit.
+// Try to match any registered special token at the head of `text`
+// (data[0..count)). Returns the special's index in `t->specials`
+// (>=0) and writes its byte length to `*sp_len`, or -1 if no special
+// matches at position 0. Greedy longest-first match: specials are
+// registered in longest-first order so this just returns the first
+// hit. `text` is a non-owning view (capacity 0); the tokenizer does
+// not mutate it.
 static int32_t tokenizer_match_special(const struct tokenizer * t,
-                                 const char * text, size_t tlen,
-                                 int32_t * sp_len) {
+                                       const struct chars * text,
+                                       int32_t * sp_len) {
     int32_t hit = -1;
     for (int32_t i = 0; i < t->n_specials && hit < 0; i++) {
         size_t slen = (size_t)t->specials[i].len;
-        if (slen <= tlen && memcmp(text, t->specials[i].str, slen) == 0) {
+        if (slen <= text->count &&
+            memcmp(text->data, t->specials[i].str, slen) == 0) {
             *sp_len = (int32_t)slen;
             hit     = i;
         }
@@ -307,14 +310,14 @@ static int32_t tokenizer_match_special(const struct tokenizer * t,
 // BPE-encode a slice of raw text (no special-token recognition).
 // `text[0..tlen)` is split on spaces with the GPT-2 convention that
 // a leading space belongs to the next word, then each word is
-// byte-level-remapped and greedy-BPE-merged. Returns the number of
-// ids written to `out_ids` (bounded by `max_ids`).
-static int32_t tokenizer_encode_bpe(const struct tokenizer * t,
-                              const char * text, size_t tlen,
-                              int32_t * out_ids, int32_t max_ids) {
-    int32_t n_out = 0;
-    size_t  pos   = 0;
-    while (pos < tlen && n_out < max_ids) {
+// byte-level-remapped and greedy-BPE-merged. Token ids are appended
+// to `out`, which the caller initialises as `(struct slm_tokens){0}`
+// (or reuses across calls; this function never resets count).
+static void tokenizer_encode_bpe(const struct tokenizer * t,
+                                 const char * text, size_t tlen,
+                                 struct slm_tokens * out) {
+    size_t pos = 0;
+    while (pos < tlen) {
         // Find next "word" boundary: include leading space (if any).
         size_t word_start = pos;
         if (text[pos] == ' ') { pos++; }
@@ -367,7 +370,7 @@ static int32_t tokenizer_encode_bpe(const struct tokenizer * t,
         }
 
         // Emit ids.
-        for (int32_t i = 0; i < n_toks && n_out < max_ids; i++) {
+        for (int32_t i = 0; i < n_toks; i++) {
             int32_t id = s2i_get(&t->vocab_to_id,
                                  toks[i].data, toks[i].count, -1);
             if (id < 0) {
@@ -375,16 +378,18 @@ static int32_t tokenizer_encode_bpe(const struct tokenizer * t,
                 // byte-level BPE: every single byte is a known token.
                 trace("unknown sub-token (len=%zu)\n", toks[i].count);
             } else {
-                out_ids[n_out++] = id;
+                slm_tokens_put(out, id);
             }
         }
         for (int32_t i = 0; i < n_toks; i++) { chars_free(&toks[i]); }
         free(toks);
     }
-    return n_out;
 }
 
-// Encode: input UTF-8 text -> token ids. Returns count.
+// Encode: input UTF-8 text -> token ids appended to `out`. The caller
+// initialises `out` as `(struct slm_tokens){0}` (or reuses across
+// calls — count is appended-to, not reset). Caller frees `out->data`
+// with slm_tokens_free.
 //
 // Two-level scan. The outer loop walks the text looking for
 // registered special-token strings (`<|im_start|>` etc.) and emits
@@ -395,20 +400,22 @@ static int32_t tokenizer_encode_bpe(const struct tokenizer * t,
 // trained chat envelope, and quality collapses.
 
 __attribute__((unused))
-static int32_t tokenizer_encode(const struct tokenizer * t,
-                          const char * text,
-                          int32_t * out_ids, int32_t max_ids) {
-    int32_t n_out = 0;
-    size_t  tlen  = strlen(text);
-    size_t  pos   = 0;
-    while (pos < tlen && n_out < max_ids) {
+static void tokenizer_encode(const struct tokenizer * t,
+                             const char * text,
+                             struct slm_tokens * out) {
+    size_t tlen = (text != NULL) ? strlen(text) : 0;
+    size_t pos  = 0;
+    while (pos < tlen) {
         // Scan ahead for the next special-token occurrence.
         size_t  sp_at  = tlen;
         int32_t sp_idx = -1;
         int32_t sp_len = 0;
         for (size_t i = pos; i < tlen && sp_idx < 0; i++) {
-            int32_t mlen = 0;
-            int32_t hit  = tokenizer_match_special(t, text + i, tlen - i, &mlen);
+            int32_t mlen  = 0;
+            struct chars slice = { .data     = (char *)text + i,
+                                   .count    = tlen - i,
+                                   .capacity = 0 };
+            int32_t hit = tokenizer_match_special(t, &slice, &mlen);
             if (hit >= 0) {
                 sp_at  = i;
                 sp_idx = hit;
@@ -417,17 +424,15 @@ static int32_t tokenizer_encode(const struct tokenizer * t,
         }
         // BPE-encode the text in front of the special (or all of it).
         if (sp_at > pos) {
-            n_out += tokenizer_encode_bpe(t, text + pos, sp_at - pos,
-                                    out_ids + n_out, max_ids - n_out);
+            tokenizer_encode_bpe(t, text + pos, sp_at - pos, out);
         }
-        if (sp_idx >= 0 && n_out < max_ids) {
-            out_ids[n_out++] = t->specials[sp_idx].id;
+        if (sp_idx >= 0) {
+            slm_tokens_put(out, t->specials[sp_idx].id);
             pos = sp_at + (size_t)sp_len;
         } else {
             pos = tlen;
         }
     }
-    return n_out;
 }
 
 // Decode: token id -> raw UTF-8 bytes appended to `out`. Reverses the

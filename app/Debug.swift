@@ -14,6 +14,11 @@ import SwiftUI
 import Observation
 import Foundation
 import Darwin    // for posix_strerror etc. if ever needed
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 
 @Observable
 @MainActor
@@ -137,6 +142,10 @@ struct DebugView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(runningTests)
 
+                Button("Copy") { copyLogToPasteboard() }
+                    .buttonStyle(.bordered)
+                    .disabled(log.lines.isEmpty)
+
                 Button("Clear log") { log.clear() }
                     .buttonStyle(.bordered)
 
@@ -193,6 +202,17 @@ struct DebugView: View {
         runningTests = false
         lastResult = (failures == 0)
             ? "all PASS" : "\(failures) FAIL"
+    }
+
+    private func copyLogToPasteboard() {
+        let payload = log.lines.joined(separator: "\n")
+        #if os(macOS)
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(payload, forType: .string)
+        #else
+        UIPasteboard.general.string = payload
+        #endif
     }
 
 }

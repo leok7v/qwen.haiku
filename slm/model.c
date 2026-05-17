@@ -125,6 +125,13 @@ struct slm_config {
 //     uses it as the document terminator and emits it readily under
 //     non-chat prompts).
 
+// Typed dynamic array of token ids. Defined HERE (before the
+// tokenizer.c include) so tokenizer_encode / tokenizer_encode_bpe can
+// fill a `struct slm_tokens *` directly — caller no longer has to
+// guess a max bound for a stack/heap int32_t buffer. Also reused as
+// ctx->ids (see struct slm_ctx below).
+define_array(int32_t, slm_tokens);
+
 // ---------------------------------------------------------------------------
 // Tokenizer (byte-level BPE, simplified). Lives in tokenizer.c so the
 // `tokenizer_*` namespace stays out of model.c. Pulled in here, after
@@ -503,7 +510,8 @@ struct slm_model {
     char *                 chat_template;   // see footnote (1)
 };
 
-define_array(int32_t, slm_tokens);
+// struct slm_tokens definition lives above the tokenizer.c include so
+// tokenizer_encode can fill it directly. See definition further up.
 
 struct slm_ctx {
     struct slm_model *     model;           // borrowed; NOT owned
