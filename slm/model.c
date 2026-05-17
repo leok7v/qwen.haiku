@@ -1267,6 +1267,124 @@ void slm_ctx_destroy(struct slm_ctx * c) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Snapshot / restore. Heap-owned deep copy of every mutable cache the
+// forward pass writes to. Sized to the snapshot's `pos` for KV (so
+// short-conversation snapshots stay small), full for the fixed SSM
+// state.
+// ---------------------------------------------------------------------------
+
+struct slm_snapshot {
+    int32_t    pos;
+    size_t     ids_count;
+    struct rng rng;
+    _Float16 * k;            // [n_layers][pos][n_kv_heads][head_dim]
+    _Float16 * v;            // same layout as k
+    float    * conv_state;   // mirrors slm_ssm_cache.conv_state (or NULL)
+    float    * ssm_state;    // mirrors slm_ssm_cache.ssm_state  (or NULL)
+    int32_t  * conv_head;    // [n_layers] (or NULL)
+};
+
+struct slm_snapshot * slm_ctx_snapshot(const struct slm_ctx * c) {
+    struct slm_snapshot * s = NULL;
+    if (c != NULL) {
+        s = (struct slm_snapshot *)oom(calloc(1, sizeof(*s)));
+        s->pos       = c->pos;
+        s->ids_count = c->ids.count;
+        s->rng       = c->rng;
+        int32_t L   = c->kv.n_layers;
+        int32_t pos = c->pos;
+        size_t  per = (size_t)c->kv.n_kv_heads * c->kv.head_dim;
+        if (L > 0 && pos > 0 && per > 0) {
+            size_t n_per_layer = (size_t)pos * per;
+            size_t bytes       = (size_t)L * n_per_layer * sizeof(_Float16);
+            s->k = (_Float16 *)oom(malloc(bytes));
+            s->v = (_Float16 *)oom(malloc(bytes));
+            for (int32_t l = 0; l < L; l++) {
+                size_t src = (size_t)l * (size_t)c->kv.max_position * per;
+                size_t dst = (size_t)l * n_per_layer;
+                memcpy(s->k + dst, c->kv.k + src,
+                       n_per_layer * sizeof(_Float16));
+                memcpy(s->v + dst, c->kv.v + src,
+                       n_per_layer * sizeof(_Float16));
+            }
+        }
+        if (c->ssm.conv_state != NULL) {
+            size_t cb = (size_t)c->ssm.n_layers * c->ssm.conv_kernel *
+                        c->ssm.n_channels * sizeof(float);
+            s->conv_state = (float *)oom(malloc(cb));
+            memcpy(s->conv_state, c->ssm.conv_state, cb);
+        }
+        if (c->ssm.ssm_state != NULL) {
+            size_t sb = (size_t)c->ssm.n_layers *
+                        c->model->cfg.linear_n_heads *
+                        c->model->cfg.linear_k_head_dim *
+                        c->model->cfg.linear_v_head_dim *
+                        sizeof(float);
+            s->ssm_state = (float *)oom(malloc(sb));
+            memcpy(s->ssm_state, c->ssm.ssm_state, sb);
+        }
+        if (c->ssm.conv_head != NULL) {
+            size_t hb = (size_t)c->ssm.n_layers * sizeof(int32_t);
+            s->conv_head = (int32_t *)oom(malloc(hb));
+            memcpy(s->conv_head, c->ssm.conv_head, hb);
+        }
+    }
+    return s;
+}
+
+void slm_ctx_restore(struct slm_ctx * c, const struct slm_snapshot * s) {
+    if (c != NULL && s != NULL) {
+        c->pos = s->pos;
+        c->rng = s->rng;
+        if (s->ids_count <= c->ids.count) {
+            c->ids.count = s->ids_count;
+        }
+        int32_t L   = c->kv.n_layers;
+        int32_t pos = s->pos;
+        size_t  per = (size_t)c->kv.n_kv_heads * c->kv.head_dim;
+        if (L > 0 && pos > 0 && per > 0 && s->k != NULL && s->v != NULL) {
+            size_t n_per_layer = (size_t)pos * per;
+            for (int32_t l = 0; l < L; l++) {
+                size_t dst = (size_t)l * (size_t)c->kv.max_position * per;
+                size_t src = (size_t)l * n_per_layer;
+                memcpy(c->kv.k + dst, s->k + src,
+                       n_per_layer * sizeof(_Float16));
+                memcpy(c->kv.v + dst, s->v + src,
+                       n_per_layer * sizeof(_Float16));
+            }
+        }
+        if (s->conv_state != NULL && c->ssm.conv_state != NULL) {
+            size_t cb = (size_t)c->ssm.n_layers * c->ssm.conv_kernel *
+                        c->ssm.n_channels * sizeof(float);
+            memcpy(c->ssm.conv_state, s->conv_state, cb);
+        }
+        if (s->ssm_state != NULL && c->ssm.ssm_state != NULL) {
+            size_t sb = (size_t)c->ssm.n_layers *
+                        c->model->cfg.linear_n_heads *
+                        c->model->cfg.linear_k_head_dim *
+                        c->model->cfg.linear_v_head_dim *
+                        sizeof(float);
+            memcpy(c->ssm.ssm_state, s->ssm_state, sb);
+        }
+        if (s->conv_head != NULL && c->ssm.conv_head != NULL) {
+            memcpy(c->ssm.conv_head, s->conv_head,
+                   (size_t)c->ssm.n_layers * sizeof(int32_t));
+        }
+    }
+}
+
+void slm_snapshot_free(struct slm_snapshot * s) {
+    if (s != NULL) {
+        free(s->k);
+        free(s->v);
+        free(s->conv_state);
+        free(s->ssm_state);
+        free(s->conv_head);
+        free(s);
+    }
+}
+
 struct slm_ctrl * slm_ctx_ctrl(struct slm_ctx * c) {
     return &c->ctrl;
 }

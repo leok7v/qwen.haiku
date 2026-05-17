@@ -70,6 +70,45 @@ struct slm_ctx * slm_ctx_create(struct slm_model * model);
 void             slm_ctx_destroy(struct slm_ctx * ctx);
 
 // ---------------------------------------------------------------------------
+// Snapshot / restore — capture & roll back per-conversation mutable state.
+//
+// Used by the atomic-tool flow: take a snapshot before the model starts
+// emitting a turn, dispatch the tool internally, restore the ctx so the
+// model never sees the round-trip, then inject the curated tool result
+// as preamble before decoding the final answer.
+//
+// Cheap because the Mamba-2/DeltaNet half is fixed-size memcpy-able
+// state; the KV half copies only [0..pos) rows (not the full
+// max_position-sized arena).
+// ---------------------------------------------------------------------------
+
+struct slm_snapshot;  // opaque
+
+// Capture the ctx's mutable state at the current moment:
+//   - KV cache rows [0..pos)
+//   - SSM conv_state ring + ssm_state + conv_head (when hybrid)
+//   - pos, rng state, ids count
+//
+// Caller owns the result; free with slm_snapshot_free. Returns NULL
+// when ctx is NULL.
+//
+// NOT captured: ctx->ids contents past the saved count, ctx->messages
+// (caller-managed history); on restore, c->ids.count is truncated back
+// but the underlying token buffer is not reallocated.
+struct slm_snapshot * slm_ctx_snapshot(const struct slm_ctx * ctx);
+
+// Restore the ctx from `snap`. Caller must guarantee the snapshot
+// came from the same model (same n_layers / n_kv_heads / head_dim /
+// linear_* layout) — otherwise behavior is undefined. The KV rows
+// beyond [0..snap->pos) are left as-is and will be overwritten by
+// the next forward step.
+void slm_ctx_restore(struct slm_ctx *            ctx,
+                     const struct slm_snapshot * snap);
+
+// Release a snapshot's heap allocations.
+void slm_snapshot_free(struct slm_snapshot * snap);
+
+// ---------------------------------------------------------------------------
 // Sampler + conversation control
 // ---------------------------------------------------------------------------
 

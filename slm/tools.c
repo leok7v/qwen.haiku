@@ -420,170 +420,145 @@ static int tools_http_get(const char * url, long timeout_ms,
     return rc;
 }
 
-// Parse DDG-lite HTML and emit a "- title\n  snippet\n\n" list into
-// `out`. Returns the number of (title, snippet) pairs emitted.
-// The selectors mirror doit.devs/src/tools.c::tools_ddg_emit_titles
-// + tools_ddg_emit_snippets — DDG-lite's markup hasn't moved in
-// years, but if it does, this is the one function to update.
+// Parse DDG-lite HTML into a list of {title, url, snippet} hits.
+// `hits` is an out-array of capacity >= max_results, zero-initialised
+// by the caller. Returns the number of hits filled in [0..N). Strings
+// in each hit are heap-owned; caller frees with tools_free_hits.
+//
+// DDG-lite link shape (Leo's captured markup):
+//   <a class="result-link" rel="nofollow" href="https://...">Title</a>
+// Snippets are sibling <td class="result-snippet"> nodes in document
+// order. The two passes assume DDG keeps them paired by index; if
+// snippet count < title count the trailing hits have snippet=NULL.
+struct tools_search_hit {
+    char * title;
+    char * url;
+    char * snippet;
+};
+
+#ifndef TOOLS_HITS_MAX
+#define TOOLS_HITS_MAX 8
+#endif
+
+static void tools_free_hits(struct tools_search_hit * hits, int n) {
+    if (hits != NULL) {
+        for (int i = 0; i < n; i++) {
+            free(hits[i].title);   hits[i].title   = NULL;
+            free(hits[i].url);     hits[i].url     = NULL;
+            free(hits[i].snippet); hits[i].snippet = NULL;
+        }
+    }
+}
+
 static int tools_ddg_parse(const char * h, size_t n, int max_results,
-                           struct chars * out) {
-    int  seen = 0;
-    size_t i  = 0;
-    bool more = true;
-    // First pass: titles. Each result link carries rel="nofollow".
+                           struct tools_search_hit * hits) {
+    int    seen = 0;
+    size_t i    = 0;
+    bool   more = true;
+    // First pass: title + URL. Walk for each rel="nofollow"; extract
+    // href= from the <a> opener and title text from the <a> body.
     while (more && seen < max_results && i < n) {
         const char * p = (const char *)memmem(h + i, n - i,
                                               "rel=\"nofollow\"", 14);
         if (p == NULL) {
             more = false;
         } else {
-            size_t pos = (size_t)(p - h);
+            size_t pos  = (size_t)(p - h);
+            size_t back = pos > 512 ? pos - 512 : 0;
+            size_t lt   = pos;
+            while (lt > back && h[lt] != '<') { lt--; }
             size_t gt = pos;
             while (gt < n && h[gt] != '>') { gt++; }
+            char * url = NULL;
+            if (gt < n && lt < pos) {
+                const char * hp = (const char *)memmem(
+                    h + lt, gt - lt, "href=\"", 6);
+                if (hp != NULL) {
+                    const char * v   = hp + 6;
+                    const char * end = (const char *)memchr(
+                        v, '"', (size_t)(h + gt - v));
+                    if (end != NULL && end > v) {
+                        size_t len = (size_t)(end - v);
+                        url = (char *)oom(malloc(len + 1));
+                        memcpy(url, v, len);
+                        url[len] = '\0';
+                    }
+                }
+            }
             const char * pe = (gt < n)
-                ? (const char *)memmem(h + gt + 1, n - gt - 1,
-                                       "</a>", 4)
+                ? (const char *)memmem(h + gt + 1, n - gt - 1, "</a>", 4)
                 : NULL;
             if (gt >= n || pe == NULL) {
+                free(url);
                 more = false;
             } else {
-                size_t end = (size_t)(pe - h);
-                struct chars title = {0};
-                tools_html_strip(h + gt + 1, end - gt - 1, &title);
-                if (title.count > 5) {
-                    struct chars clean = {0};
-                    tools_collapse_ws(&title, &clean);
-                    chars_printf(out, "- %s\n",
-                              clean.data ? clean.data : "");
-                    free(clean.data);
+                size_t end_a = (size_t)(pe - h);
+                struct chars title_raw = {0};
+                struct chars title     = {0};
+                tools_html_strip(h + gt + 1, end_a - gt - 1, &title_raw);
+                tools_collapse_ws(&title_raw, &title);
+                bool good = title.count > 5 && url != NULL;
+                if (good) {
+                    hits[seen].title   = title.data;
+                    title.data         = NULL;
+                    hits[seen].url     = url;
+                    hits[seen].snippet = NULL;
                     seen++;
+                } else {
+                    free(url);
+                    free(title.data);
                 }
-                free(title.data);
-                i = end + 4;
+                free(title_raw.data);
+                i = end_a + 4;
             }
         }
     }
-    // Second pass: snippets. DDG marks them with class
-    // "result-snippet". Snippets appear in the same document order
-    // as the links above, so we emit them interleaved-by-position
-    // (each snippet block immediately after its title).
-    i = 0;
+    // Second pass: snippets. Match by document order into hits[0..seen).
+    i    = 0;
     more = true;
-    int snip_emitted = 0;
-    while (more && snip_emitted < max_results && i < n) {
+    int k = 0;
+    while (more && k < seen && i < n) {
         const char * p = (const char *)memmem(h + i, n - i,
                                               "result-snippet", 14);
         if (p == NULL) {
             more = false;
         } else {
             size_t pos = (size_t)(p - h);
-            size_t gt = pos;
+            size_t gt  = pos;
             while (gt < n && h[gt] != '>') { gt++; }
             if (gt >= n) {
                 more = false;
             } else {
                 size_t end = gt + 1;
-                bool found_close = false;
-                while (!found_close && end + 1 < n) {
+                bool   close_found = false;
+                while (!close_found && end + 1 < n) {
                     if (h[end] == '<' && h[end + 1] == '/') {
-                        found_close = true;
+                        close_found = true;
                     } else {
                         end++;
                     }
                 }
-                if (!found_close) {
+                if (!close_found) {
                     more = false;
                 } else {
-                    struct chars snip = {0};
-                    tools_html_strip(h + gt + 1, end - gt - 1, &snip);
-                    if (snip.count > 10) {
-                        struct chars clean = {0};
-                        tools_collapse_ws(&snip, &clean);
-                        chars_printf(out, "  %s\n\n",
-                                  clean.data ? clean.data : "");
+                    struct chars raw   = {0};
+                    struct chars clean = {0};
+                    tools_html_strip(h + gt + 1, end - gt - 1, &raw);
+                    tools_collapse_ws(&raw, &clean);
+                    if (clean.count > 10) {
+                        hits[k].snippet = clean.data;
+                        clean.data      = NULL;
+                        k++;
+                    } else {
                         free(clean.data);
-                        snip_emitted++;
                     }
-                    free(snip.data);
+                    free(raw.data);
                     i = end;
                 }
             }
         }
     }
     return seen;
-}
-
-// websearch: scrape DuckDuckGo lite-HTML. No API key.
-static void tools_websearch(const char * query, int max_results,
-                            struct tool_result * out) {
-    tools_global_init();
-    out->ok = 0;
-    out->body = NULL;
-    out->error = NULL;
-    out->status = 0;
-    if (query == NULL || query[0] == '\0') {
-        out->error = strdup("websearch: query parameter required");
-    } else {
-        int cap = (max_results > 0 && max_results <= 16)
-                ? max_results : 8;
-        struct chars eq = {0};
-        tools_url_encode(query, &eq);
-        struct chars url = {0};
-        // Match the URL shape Leo's Safari Incognito captured for a
-        // real DDG search: ia=web (instant-answer category), origin=
-        // funnel_home_website (came from DDG home page), t=h_ (DDG's
-        // browser-type hint), then q=..., chip-select=search.
-        // The lite endpoint is forgiving and accepts a bare ?q=,
-        // but adding the funnel params makes the request match an
-        // organic-navigation profile.
-        chars_puts(&url,
-            "https://lite.duckduckgo.com/lite/"
-            "?ia=web&origin=funnel_home_website&t=h_&q=");
-        if (eq.data != NULL) { chars_puts(&url, eq.data); }
-        chars_puts(&url, "&chip-select=search");
-        struct chars body = {0};
-        long status = 0;
-        int rc = tools_http_get(url.data, 15000, &body, &status);
-        if (rc != 0) {
-            out->error = strdup(
-                "websearch: libcurl request failed (network down?)");
-        } else if (status < 200 || status >= 400) {
-            struct chars tmp = {0};
-            chars_printf(&tmp, "websearch: HTTP %ld (may be rate-limiting)",
-                          status); // zero terminated
-            out->error  = tmp.data; // transfer ownership
-            out->status = status;
-        } else if (body.data == NULL || body.count == 0) {
-            out->error = strdup("websearch: empty response from DDG");
-        } else if (memmem(body.data, body.count,
-                          "anomaly-modal", 13) != NULL) {
-            // DDG's bot-detection challenge page — looks like a 200
-            // OK to libcurl, but the body is a CAPTCHA, no search
-            // results. Hits us when we make rapid back-to-back
-            // queries from the same IP. Surface as a distinct error
-            // so the caller can retry (with a delay) or fall back to
-            // a different engine.
-            out->error = strdup(
-                "websearch: DDG bot-detection CAPTCHA challenge"
-                " (rate-limited — try again in a few minutes)");
-            out->status = status;
-        } else {
-            struct chars result = {0};
-            chars_printf(&result, "Web results for: %s\n\n", query);
-            int titles = tools_ddg_parse(body.data, body.count,
-                                         cap, &result);
-            if (titles == 0) {
-                chars_printf(&result,
-                    "No results found for: %s\n", query);
-            }
-            out->body   = result.data;
-            out->status = status;
-            out->ok     = 1;
-        }
-        free(eq.data);
-        free(url.data);
-        free(body.data);
-    }
 }
 
 // fetch: HTTP GET via libcurl with cap. Body returned as
@@ -650,6 +625,122 @@ static void tools_distill(const char * html, size_t n,
         out->body = clean.data;
         out->ok   = 1;
         free(stripped.data);
+    }
+}
+
+// websearch: atomic DDG -> pick top -> fetch -> distill chain. The
+// 0.8B model gets confused juggling multiple tool calls, so we do
+// the full agentic walk in C and hand back curated content the model
+// can summarise in one decode pass. Returns a body of the shape:
+//
+//   Web search result for "<query>":
+//   Source: <top_url>
+//
+//   <distilled body, capped at TOOLS_DISTILL_CAP chars>
+//
+// On hits with empty body or distill failure we fall back to the
+// DDG snippet so the caller still has something to summarise.
+#ifndef TOOLS_DISTILL_CAP
+#define TOOLS_DISTILL_CAP 4000
+#endif
+
+static void tools_websearch(const char * query, int max_results,
+                            struct tool_result * out) {
+    tools_global_init();
+    out->ok     = 0;
+    out->body   = NULL;
+    out->error  = NULL;
+    out->status = 0;
+    if (query == NULL || query[0] == '\0') {
+        out->error = strdup("websearch: query parameter required");
+    } else {
+        int cap = (max_results > 0 && max_results <= TOOLS_HITS_MAX)
+                ? max_results : TOOLS_HITS_MAX;
+        struct chars eq = {0};
+        tools_url_encode(query, &eq);
+        struct chars url = {0};
+        // URL shape captured from Safari Incognito navigating DDG home
+        // (organic-funnel profile: ia=web, origin=funnel_home_website,
+        // t=h_, chip-select=search). Lite endpoint accepts bare ?q=,
+        // but the funnel params match an organic-navigation
+        // fingerprint and pass DDG's bot-detection more often.
+        chars_puts(&url,
+            "https://lite.duckduckgo.com/lite/"
+            "?ia=web&origin=funnel_home_website&t=h_&q=");
+        if (eq.data != NULL) { chars_puts(&url, eq.data); }
+        chars_puts(&url, "&chip-select=search");
+        struct chars body  = {0};
+        long status        = 0;
+        int  rc            = tools_http_get(url.data, 15000, &body, &status);
+        if (rc != 0) {
+            out->error = strdup(
+                "websearch: libcurl request failed (network down?)");
+        } else if (status < 200 || status >= 400) {
+            struct chars tmp = {0};
+            chars_printf(&tmp,
+                "websearch: HTTP %ld (may be rate-limiting)", status);
+            out->error  = tmp.data;
+            out->status = status;
+        } else if (body.data == NULL || body.count == 0) {
+            out->error = strdup("websearch: empty response from DDG");
+        } else if (memmem(body.data, body.count,
+                          "anomaly-modal", 13) != NULL) {
+            // DDG bot-detection CAPTCHA page returns 200 with no
+            // results. Surface as a distinct error so the caller can
+            // retry after a delay.
+            out->error = strdup(
+                "websearch: DDG bot-detection CAPTCHA challenge"
+                " (rate-limited - try again in a few minutes)");
+            out->status = status;
+        } else {
+            struct tools_search_hit hits[TOOLS_HITS_MAX] = {0};
+            int nh = tools_ddg_parse(body.data, body.count, cap, hits);
+            struct chars result = {0};
+            chars_printf(&result, "Web search result for \"%s\":\n", query);
+            if (nh == 0) {
+                chars_puts(&result, "No results found.\n");
+            } else {
+                const char * top_url     = hits[0].url;
+                const char * top_snippet = hits[0].snippet;
+                chars_printf(&result, "Source: %s\n\n", top_url);
+                struct tool_result fetched = {0};
+                tools_fetch(top_url, 15, &fetched);
+                if (fetched.ok && fetched.body != NULL) {
+                    struct tool_result distilled = {0};
+                    tools_distill(fetched.body, strlen(fetched.body),
+                                  &distilled);
+                    if (distilled.ok && distilled.body != NULL) {
+                        size_t blen = strlen(distilled.body);
+                        size_t cut  = blen > TOOLS_DISTILL_CAP
+                                    ? TOOLS_DISTILL_CAP : blen;
+                        chars_put(&result, distilled.body, cut);
+                        if (cut < blen) {
+                            chars_printf(&result,
+                                "\n\n[... truncated at %zu chars]", cut);
+                        }
+                    } else if (top_snippet != NULL) {
+                        chars_printf(&result, "Snippet: %s\n", top_snippet);
+                    }
+                    tools_result_free(&distilled);
+                } else if (top_snippet != NULL) {
+                    chars_printf(&result,
+                        "[fetch failed: %s]\nSnippet: %s\n",
+                        fetched.error ? fetched.error : "(no error)",
+                        top_snippet);
+                } else {
+                    chars_printf(&result, "[fetch failed: %s]\n",
+                        fetched.error ? fetched.error : "(no error)");
+                }
+                tools_result_free(&fetched);
+            }
+            tools_free_hits(hits, nh);
+            out->body   = result.data;
+            out->status = status;
+            out->ok     = 1;
+        }
+        free(eq.data);
+        free(url.data);
+        free(body.data);
     }
 }
 
