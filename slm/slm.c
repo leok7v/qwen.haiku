@@ -1206,6 +1206,20 @@ int slm_generate(struct slm_ctx * c,
                     pick_box.filter.recognize_tool_calls = false;
                     pick_box.filter.emit_visibility      = false;
                     pick_box.cb = effective_cb;
+                    // Suppress forward-to-user during URL-pick: we
+                    // need capture.content to receive the digit
+                    // reply (parser depends on it), but the user-
+                    // visible stream MUST NOT see the digit — it
+                    // otherwise leaks as "\n\n1\n\n" before the
+                    // final answer in the e2e probe output. The
+                    // filter-level emit_visibility flag is too
+                    // blunt (it would gate the capture too, since
+                    // effective_cb wraps both capture and forward
+                    // in one object). Park forward across the
+                    // URL-pick scope and restore it after.
+                    struct slm_stream_callback * saved_forward =
+                        capture.forward;
+                    capture.forward = NULL;
                     int pick_budget = 64;
                     if (pick_budget > max_new - total_gen) {
                         pick_budget = max_new - total_gen;
@@ -1218,6 +1232,7 @@ int slm_generate(struct slm_ctx * c,
                     slm_think_filter_finish(&pick_box.filter,
                                             effective_cb);
                     chars_free(&pick_box.filter.tool_call);
+                    capture.forward = saved_forward;
                     cur.count = 0;
                     picked = slm_parse_pick_number(
                         capture.content.data, capture.content.count,
@@ -1264,25 +1279,39 @@ int slm_generate(struct slm_ctx * c,
                                 fd.body, false, 0, 0);
                 }
                 if (fd.ok && fd.body != NULL) {
+                    // Framing intentionally avoids the "[N]" bracket
+                    // pattern. The URL-pick prompt above used "reply
+                    // with ONLY the number 1-N" and "[1] URL\n[2] URL"
+                    // as the list format; the model anchors to that
+                    // and emits "1" as the first token of the final
+                    // answer when it sees a near-identical "[N] URL"
+                    // header. Use plain "Page contents (URL: ...):"
+                    // so the pattern is structurally different from
+                    // the URL-pick prompt.
                     chars_printf(&inject,
-                        "Content of [%d] %s:\n\n%s\n\n"
-                        "Summarize the above to answer the user's"
-                        " question:\n\n",
-                        picked, picked_url, fd.body);
+                        "Page contents from %s:\n\n%s\n\n"
+                        "Answer the user's question using the page"
+                        " contents above. Respond in plain prose"
+                        " (no list markers, no leading numbers, no"
+                        " section headers). Do NOT call any tools.\n\n",
+                        picked_url, fd.body);
                 } else {
                     // Fetch failed — surface the error to the model
                     // and let it answer from the snippets only. Avoid
                     // "Based on this, here is the answer" wording
                     // because the model would rightly object that
-                    // there's nothing to base anything on.
+                    // there's nothing to base anything on. Same "no
+                    // [N]" rule as the success branch.
                     chars_printf(&inject,
-                        "I tried to fetch [%d] %s but it failed: %s."
+                        "I tried to fetch %s but it failed: %s."
                         "\n\nHere are the search snippets I have:"
                         "\n\n%s"
                         "Based ONLY on these snippets, give the best"
                         " concise answer you can to the user's"
-                        " question (do not call any tools):\n\n",
-                        picked, picked_url,
+                        " question. Respond in plain prose (no list"
+                        " markers, no leading numbers, no section"
+                        " headers). Do NOT call any tools.\n\n",
+                        picked_url,
                         fd.error ? fd.error : "(unknown error)",
                         hits_res.body ? hits_res.body : "");
                 }
@@ -1438,7 +1467,7 @@ static int32_t tools_e2e_test(const char * gguf_path) {
         sp.temperature        = 0.0f;
         sp.top_p              = 1.0f;
         sp.repetition_penalty = 1.0f;
-        for (int i = 0; i < np && failures == 0; i++) {
+        for (int i = 0; i < np; i++) {
             const char * prompt = probes[i];
             // Fresh ctx per probe so we test single-turn behavior
             // (multi-turn anchoring is a separate issue).

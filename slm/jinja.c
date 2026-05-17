@@ -338,14 +338,32 @@ static void jinja_emit_tools_prelude(struct chars * b,
     // language tips the next-token distribution toward the tool
     // marker. Kept outside K_TOOL_INSTRUCTIONS so the official
     // jinja text stays bit-stable.
+    //
+    // Wording aligned with the community "qwen3.5-enhanced.jinja"
+    // (allanchan339/vLLM-Qwen3-3.5-3.6-chat-template-fix) which
+    // reports 50% -> 90% reliability for 3.5 tool-calling on the
+    // back of two anchors: (1) "use the tool instead of answering
+    // from memory", (2) "put any reasoning BEFORE the first
+    // <tool_call>, never after". We keep the official Qwen
+    // K_TOOL_INSTRUCTIONS verbatim above (training-distribution
+    // alignment) and override the relaxed "may provide optional
+    // reasoning BEFORE ... but NOT after" with a HARD RULE here so
+    // the 0.8B emits the <tool_call> directly without a chatty
+    // preamble. See reference-qwen35-tool-calling.md.
     chars_puts(b,
         "\n\n"
-        "Use the websearch function for any question that depends"
+        "HARD RULES for tool use:\n"
+        "- If a suitable tool exists for the user's request, use it"
+        " instead of answering from memory or training data.\n"
+        "- Use the websearch function for any question that depends"
         " on current or real-time information: time, dates, prices,"
         " news, weather, schedules, traffic, scores, exchange rates,"
-        " or anything that may have changed since your training. Do"
-        " NOT tell the user you lack access to real-time data — call"
-        " websearch instead.");
+        " or anything that may have changed since your training.\n"
+        "- Do NOT tell the user you lack access to real-time data —"
+        " call websearch instead.\n"
+        "- Do NOT output any reasoning, natural-language commentary,"
+        " or filler text before or after the <tool_call> block."
+        " Emit the <tool_call> directly.");
     if (n_msgs > 0 && msgs[0].role == JINJA_ROLE_SYSTEM) {
         // Inline the (trimmed) system content after the instructions.
         // The Jinja's `if content` check on line 56 only emits the
