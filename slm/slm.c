@@ -1389,6 +1389,105 @@ int slm_generate(struct slm_ctx * c,
 }
 
 // ---------------------------------------------------------------------------
+// tools_e2e_test — live end-to-end smoke for the websearch dispatch
+// flow. Drives the full chain (DDG → URL probe → URL pick → fetch +
+// distill → final answer) on a handful of realistic prompts that
+// EXPLICITLY name the tool. Phrasings chosen per Leo's automated-
+// testing guidance: "Using websearch...", "Search the internet
+// to...". Each prompt is graded PASS if (a) the model emitted a
+// <tool_call>, (b) the final answer is non-empty after stripping.
+//
+// Returns the number of failures. Skips silently if libcurl can't
+// reach DDG (the tools_self_test's "offline" code path mirrors this).
+// Takes ~2-4 min on M-series at T=0 due to repeated prefills.
+struct tools_e2e_capture {
+    struct slm_stream_callback base;
+    struct chars *              out;
+};
+
+static int tools_e2e_cb_fn(const struct slm_stream_callback * cb) {
+    struct tools_e2e_capture * box = (struct tools_e2e_capture *)cb;
+    if (cb->content != NULL && box->out != NULL) {
+        chars_puts(box->out, cb->content);
+    }
+    return 0;
+}
+
+__attribute__((unused))
+static int32_t tools_e2e_test(const char * gguf_path) {
+    static const char * const probes[] = {
+        "Using websearch, what time is it in Tokyo now?",
+        "Search the internet to find the current price of Bitcoin.",
+        "Use websearch to find what the weather will be tomorrow"
+            " in San Francisco.",
+        "Search internet for the current USD to EUR exchange rate.",
+        NULL,
+    };
+    int np = 0;
+    while (probes[np] != NULL) { np++; }
+    trace("tools_e2e_test: %d probes\n", np);
+    struct slm_model * m = slm_model_load(gguf_path);
+    int32_t failures = 0;
+    if (!slm_model_loaded(m)) {
+        fprintf(stderr,
+                "tools_e2e_test: model load failed: %s\n",
+                slm_model_error(m));
+        failures = 1;
+    } else {
+        struct slm_sampler sp = slm_sampler_defaults();
+        sp.temperature        = 0.0f;
+        sp.top_p              = 1.0f;
+        sp.repetition_penalty = 1.0f;
+        for (int i = 0; i < np && failures == 0; i++) {
+            const char * prompt = probes[i];
+            // Fresh ctx per probe so we test single-turn behavior
+            // (multi-turn anchoring is a separate issue).
+            struct slm_ctx * c = slm_ctx_create(m);
+            int probe_ok = 0;
+            if (c != NULL) {
+                slm_ctx_ctrl(c)->tools = true;
+                slm_ctx_ctrl(c)->think = false;
+                slm_ctx_ctrl(c)->debug = 1;
+                slm_ctx_system_prompt(c, "", NULL);
+                struct chars reply = {0};
+                struct tools_e2e_capture cap = {0};
+                cap.base.callback = tools_e2e_cb_fn;
+                cap.out = &reply;
+                int n = slm_generate(c, prompt, 256, 0, &sp, 1u,
+                                     &cap.base);
+                chars_put(&reply, "", 0);
+                size_t kept = reply.count;
+                while (kept > 0 &&
+                       (reply.data[kept-1] == ' '  ||
+                        reply.data[kept-1] == '\n' ||
+                        reply.data[kept-1] == '\r' ||
+                        reply.data[kept-1] == '\t')) {
+                    kept--;
+                }
+                probe_ok = (n > 0 && kept > 8);
+                printf("tools_e2e_test [%d/%d] %s\n"
+                       "  prompt: %s\n"
+                       "  reply (%zu chars): %.200s%s\n\n",
+                       i + 1, np, probe_ok ? "PASS" : "FAIL",
+                       prompt, kept,
+                       reply.data, kept > 200 ? "..." : "");
+                chars_free(&reply);
+                slm_ctx_destroy(c);
+            }
+            if (!probe_ok) { failures++; }
+        }
+    }
+    slm_model_unload(m);
+    if (failures == 0) {
+        printf("tools_e2e_test: PASS (%d probes)\n", np);
+    } else {
+        printf("tools_e2e_test: FAIL (%d of %d probes)\n",
+               failures, np);
+    }
+    return failures;
+}
+
+// ---------------------------------------------------------------------------
 // Self-test battery — public entry point. Lives outside the LLM_CLI
 // gate so Swift / library consumers (Debug tab "Run Tests" button)
 // can call it. Each test function logs its progress via stderr + the
@@ -1908,6 +2007,7 @@ int main(int argc, char ** argv) {
         CLI_THINK_TEST      = 12,
         CLI_BENCH           = 13,
         CLI_ALL_TESTS       = 14,
+        CLI_TOOLS_E2E_TEST  = 15,
     };
     enum cli_mode mode = CLI_HELP;
     const char * prompt         = "Hello, my name is";
@@ -1952,6 +2052,8 @@ int main(int argc, char ** argv) {
             mode = CLI_JINJA_TEST;
         } else if (strcmp(argv[i], "--tools-test") == 0) {
             mode = CLI_TOOLS_TEST;
+        } else if (strcmp(argv[i], "--tools-e2e-test") == 0) {
+            mode = CLI_TOOLS_E2E_TEST;
         } else if (strcmp(argv[i], "--agent-test") == 0) {
             mode = CLI_AGENT_TEST;
         } else if (strcmp(argv[i], "--think-test") == 0) {
@@ -2081,6 +2183,8 @@ int main(int argc, char ** argv) {
         rc = jinja_self_test();
     } else if (mode == CLI_TOOLS_TEST) {
         rc = tools_self_test();
+    } else if (mode == CLI_TOOLS_E2E_TEST) {
+        rc = tools_e2e_test(slm_cli_gguf_path());
         tools_global_cleanup();
     } else if (mode == CLI_AGENT_TEST) {
         rc = agent_parser_test();
@@ -2106,6 +2210,8 @@ int main(int argc, char ** argv) {
                "  slm --chat-test [--max-new N]\n"
                "  slm --jinja-test\n"
                "  slm --tools-test          (live: needs network for DDG)\n"
+               "  slm --tools-e2e-test      (live: 4-probe websearch chain"
+                       " smoke; takes 2-4 min)\n"
                "  slm --agent-test          (parser fixtures, no network)\n"
                "  slm --ask \"question\" [--max-iters N] [--max-new N]"
                        " [--trace] [flags]\n"

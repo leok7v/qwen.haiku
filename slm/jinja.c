@@ -330,6 +330,22 @@ static void jinja_emit_tools_prelude(struct chars * b,
     }
     chars_puts(b, "\n</tools>");
     chars_puts(b, K_TOOL_INSTRUCTIONS);
+    // Behavioral nudge appended AFTER the structural rules. The
+    // 0.8B often commits to "I don't have access to real-time
+    // information" instead of calling websearch, and once that
+    // pattern is in KV the model anchors to it across the rest of
+    // a --repl session. Explicit "do not refuse, call websearch"
+    // language tips the next-token distribution toward the tool
+    // marker. Kept outside K_TOOL_INSTRUCTIONS so the official
+    // jinja text stays bit-stable.
+    chars_puts(b,
+        "\n\n"
+        "Use the websearch function for any question that depends"
+        " on current or real-time information: time, dates, prices,"
+        " news, weather, schedules, traffic, scores, exchange rates,"
+        " or anything that may have changed since your training. Do"
+        " NOT tell the user you lack access to real-time data — call"
+        " websearch instead.");
     if (n_msgs > 0 && msgs[0].role == JINJA_ROLE_SYSTEM) {
         // Inline the (trimmed) system content after the instructions.
         // The Jinja's `if content` check on line 56 only emits the
