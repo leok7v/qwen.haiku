@@ -176,6 +176,26 @@ static double seconds(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+// Emit a long text payload through the trace ring as a sequence of
+// ~180-byte chunks (TRACE_MESSAGE_MAX is 232; leave room for the
+// "<label> [start..end of total]: " prefix). Used by the debug>=9
+// "full text I/O" dumps so the user sees system framing / user
+// prompts / model output verbatim instead of truncated at 232 chars.
+static void slm_trace_long(const char * label,
+                           const char * text, size_t n) {
+    if (text != NULL && n > 0) {
+        const size_t CHUNK = 180;
+        size_t       pos   = 0;
+        while (pos < n) {
+            size_t take = (n - pos < CHUNK) ? (n - pos) : CHUNK;
+            trace("%s [%zu..%zu of %zu]: %.*s\n",
+                  label, pos, pos + take, n,
+                  (int)take, text + pos);
+            pos += take;
+        }
+    }
+}
+
 // File-internal token-stream callback. slm_generate_raw emits one
 // utf8 piece per generated token to this; slm_generate trampolines
 // into the <think>-filter on top of this (see further down in this
@@ -605,6 +625,37 @@ static int slm_split_trampoline(const char * utf8, void * user) {
     return slm_think_filter_push(&b->filter, utf8, b->cb);
 }
 
+// Pass-through cb that ALSO accumulates content / reasoning bytes
+// into local buffers. slm_generate installs this around the user's
+// cb when ctrl.debug >= 9 so that, at end of turn, the full text the
+// model produced can be re-emitted through the trace ring (chunked
+// via slm_trace_long). Call/response/prefilled/pp chunks pass through
+// untouched.
+struct slm_capture_box {
+    struct slm_stream_callback   base;
+    struct slm_stream_callback * forward;   // user's real cb (may be NULL)
+    struct chars                 content;
+    struct chars                 reasoning;
+};
+
+static int slm_capture_cb_fn(const struct slm_stream_callback * cb) {
+    struct slm_capture_box * me = (struct slm_capture_box *)cb;
+    if (cb->content != NULL) {
+        chars_puts(&me->content, cb->content);
+    }
+    if (cb->reasoning != NULL) {
+        chars_puts(&me->reasoning, cb->reasoning);
+    }
+    int rc = 0;
+    if (me->forward != NULL && me->forward->callback != NULL) {
+        rc = slm_cb_emit(me->forward,
+                         cb->content, cb->reasoning,
+                         cb->call, cb->response,
+                         cb->prefilled, cb->pp_pos, cb->pp_total);
+    }
+    return rc;
+}
+
 // ---------------------------------------------------------------------------
 // Think-filter self-test
 // ---------------------------------------------------------------------------
@@ -811,6 +862,10 @@ bool slm_ctx_system_prompt(struct slm_ctx * ctx,
         char * block = jinja_format_system_block(sys_text, &ctx->ctrl,
                                                  tools, n_tools);
         if (block != NULL) {
+            if (ctx->ctrl.debug >= 9) {
+                slm_trace_long("system block",
+                               block, strlen(block));
+            }
             int32_t * ids  = NULL;
             int       n    = slm_tokenize(ctx, block, &ids);
             free(block);
@@ -885,12 +940,23 @@ int slm_generate(struct slm_ctx * c,
         trace("turn: prompt %zu chars, tools=%d, think=%d\n",
               qn, with_tools ? 1 : 0, c->ctrl.think ? 1 : 0);
     }
-    if (debug_lv >= 7) {
+    if (debug_lv >= 7 && debug_lv < 9) {
         size_t qn = strlen(user_text);
         size_t cut = qn > 240 ? 240 : qn;
         trace("turn: prompt[0..%zu]: %.*s%s\n",
               cut, (int)cut, user_text, cut < qn ? "..." : "");
     }
+    if (debug_lv >= 9) {
+        slm_trace_long("turn: user prompt",
+                       user_text, strlen(user_text));
+    }
+    // At debug >= 9 wrap the user's cb so we can re-emit the full
+    // content + reasoning streams via slm_trace_long at end of turn.
+    struct slm_capture_box capture = {0};
+    capture.base.callback          = slm_capture_cb_fn;
+    capture.forward                = cb;
+    struct slm_stream_callback * effective_cb =
+        (debug_lv >= 9) ? &capture.base : cb;
     // Snapshot pre-turn state. Restored if the model emits a tool_call
     // so the second pass replays from the same conversation point but
     // with curated tool output baked into the prompt.
@@ -919,7 +985,7 @@ int slm_generate(struct slm_ctx * c,
         slm_think_filter_init(&box.filter);
         box.filter.recognize_tool_calls = (snap != NULL);
         box.filter.emit_visibility      = with_debug;
-        box.cb = cb;
+        box.cb = effective_cb;
         int budget = max_new - total_gen;
         if (debug_lv >= 3) {
             trace("agent: iter=%d pos=%d prefill_n=%zu budget=%d\n",
@@ -929,9 +995,9 @@ int slm_generate(struct slm_ctx * c,
                                  budget, min_new,
                                  sampler_in, seed,
                                  slm_split_trampoline, &box,
-                                 cb);
+                                 effective_cb);
         total_gen += n;
-        slm_think_filter_finish(&box.filter, cb);
+        slm_think_filter_finish(&box.filter, effective_cb);
         cur.count = 0;       // reuse buffer; freed at function exit
         if (snap != NULL && box.filter.tool_call_ready &&
             total_gen < max_new) {
@@ -992,7 +1058,7 @@ int slm_generate(struct slm_ctx * c,
             agent_free_calls(calls, nc);
             if (result.data != NULL && with_debug) {
                 text_puts(&c->messages, result.data);
-                slm_cb_emit(cb, NULL, NULL, NULL, result.data,
+                slm_cb_emit(effective_cb, NULL, NULL, NULL, result.data,
                             false, 0, 0);
             }
             // Atomic rollback: tool_call emission is wiped from KV/
@@ -1025,11 +1091,15 @@ int slm_generate(struct slm_ctx * c,
                 trace("preamble: %zu chars, replaying turn with"
                       " curated content\n", inject.count);
             }
-            if (debug_lv >= 7) {
+            if (debug_lv >= 7 && debug_lv < 9) {
                 size_t pcut = inject.count > 240 ? 240 : inject.count;
                 trace("preamble[0..%zu]: %.*s%s\n",
                       pcut, (int)pcut, inject.data,
                       pcut < inject.count ? "..." : "");
+            }
+            if (debug_lv >= 9) {
+                slm_trace_long("preamble (full)",
+                               inject.data, inject.count);
             }
             tokenizer_encode(&c->model->tok, inject.data, &cur);
             slm_ctx_ids_append(c, cur.data, cur.count);
@@ -1047,6 +1117,14 @@ int slm_generate(struct slm_ctx * c,
     }
     slm_tokens_free(&cur);
     slm_snapshot_free(snap);
+    if (debug_lv >= 9) {
+        slm_trace_long("turn: model reasoning",
+                       capture.reasoning.data, capture.reasoning.count);
+        slm_trace_long("turn: model content",
+                       capture.content.data,   capture.content.count);
+        chars_free(&capture.reasoning);
+        chars_free(&capture.content);
+    }
     return total_gen;
 }
 

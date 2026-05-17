@@ -79,6 +79,7 @@ final class SLMViewModel {
         case needsDownload(size: Int)                // cache empty, awaiting user OK
         case downloading(done: Int, total: Int)      // user pressed Download
         case loading                                 // model on disk, mmap+parse
+        case preparing                               // recreating ctx + re-prefill of system block
         case ready                                   // ctx alive, can generate
         case generating
         case error(String)
@@ -344,15 +345,25 @@ final class SLMViewModel {
             let toolsOn = self.tools
             let thinkOn = self.think
             let debugLv = self.debug
-            do {
-                try slm.newConversation()
-                slm.ctrl.pointee.tools  = toolsOn
-                slm.ctrl.pointee.think  = thinkOn
-                slm.ctrl.pointee.effort = nil
-                slm.ctrl.pointee.debug  = debugLv
-                try slm.prefillSystem(text: sysText)
-            } catch {
-                self.state = .error(String(describing: error))
+            // Prefill of the system block can take ~0.5-2s when tools
+            // are advertised (the tool-spec text is ~600 tokens). Run
+            // off the MainActor so the UI stays responsive while the
+            // chip flip / "New chat" click processes.
+            self.state = .preparing
+            Task { [weak self] in
+                do {
+                    try await Task.detached(priority: .userInitiated) {
+                        try slm.newConversation()
+                        slm.ctrl.pointee.tools  = toolsOn
+                        slm.ctrl.pointee.think  = thinkOn
+                        slm.ctrl.pointee.effort = nil
+                        slm.ctrl.pointee.debug  = debugLv
+                        try slm.prefillSystem(text: sysText)
+                    }.value
+                    self?.state = .ready
+                } catch {
+                    self?.state = .error(String(describing: error))
+                }
             }
         }
     }
@@ -536,13 +547,20 @@ struct ChatView: View {
     // gradually open up the trace fire-hose: 1 = events only, 9 =
     // raw HTML bodies + full distill output. step:1 snaps to integer
     // notches without needing custom tick-mark drawing.
+    //
+    // Tools/Think flips auto-trigger clearChat: those flags are
+    // baked into the system framing on slm_ctx_system_prompt and
+    // frozen for the life of the ctx, so the only way to apply a
+    // toggle is to recreate the ctx with the new value. Disabled
+    // outside .ready so the user can't flip during prefill /
+    // generation (which would race with the in-flight call).
     @ViewBuilder
     private var toggleRow: some View {
         HStack(spacing: 8) {
             ChipToggle("Tools", isOn: $vm.tools)
-                .disabled(vm.state == .generating)
+                .disabled(vm.state != .ready)
             ChipToggle("Think", isOn: $vm.think)
-                .disabled(vm.state == .generating)
+                .disabled(vm.state != .ready)
             Text("Debug")
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
@@ -558,6 +576,8 @@ struct ChatView: View {
                 .frame(width: 14, alignment: .leading)
             Spacer()
         }
+        .onChange(of: vm.tools) { _, _ in vm.clearChat() }
+        .onChange(of: vm.think) { _, _ in vm.clearChat() }
     }
 
     @ViewBuilder
@@ -715,6 +735,8 @@ struct ChatView: View {
             Text(String(format: "downloading: %.1f / %.1f MB", mb, totalMb))
         case .loading:
             Text("loading weights...  |  \(rss)")
+        case .preparing:
+            Text("preparing chat (system framing)...  |  \(rss)")
         case .ready:
             if vm.lastNGen > 0 {
                 let stats = String(format: "pp %.1f  tg %.1f tok/s  (%d+%d tok)",
