@@ -297,8 +297,21 @@ static int jinja_find_last_query_index(const struct jinja_message * msgs,
 
 // Literal block from Jinja line 53: the fixed instruction text that
 // follows the <tools>...</tools> JSON list in the tools system frame.
-// Kept verbatim — any drift here changes what the model sees and
-// invalidates tool-using fine-tunes.
+// Mostly verbatim from the official Qwen3.5 template — one bullet was
+// dropped (see HISTORY below) and the HARD RULES nudge appended in
+// jinja_emit_tools_prelude tightens what the official text leaves
+// permissive. Drift here changes what the model sees and may affect
+// tool-using fine-tunes, but the 0.8B's anchoring behavior on the
+// dropped line was strong enough to justify the edit.
+//
+// HISTORY (2026-05-17): removed the bullet
+//   "- You may provide optional reasoning for your function call in
+//    natural language BEFORE the function call, but NOT after"
+// because it directly conflicted with the HARD RULES nudge "Do NOT
+// output any reasoning, natural-language commentary, or filler text
+// before or after the <tool_call> block" and left the model picking
+// the more permissive interpretation. Observed in --repl with the IP-
+// location prompt: model emitted a chatty preamble before the call.
 static const char K_TOOL_INSTRUCTIONS[] =
     "\n\nIf you choose to call a function ONLY reply in the following format"
     " with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n"
@@ -310,8 +323,6 @@ static const char K_TOOL_INSTRUCTIONS[] =
     " <function=...></function> block must be nested within"
     " <tool_call></tool_call> XML tags\n"
     "- Required parameters MUST be specified\n"
-    "- You may provide optional reasoning for your function call in natural"
-    " language BEFORE the function call, but NOT after\n"
     "- If there is no function call available, answer the question like normal"
     " with your current knowledge and do not tell the user about function"
     " calls\n</IMPORTANT>";

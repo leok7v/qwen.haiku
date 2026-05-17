@@ -1046,6 +1046,37 @@ static int tools_websearch_hits(const char * query, int max_results,
                 trace("websearch_hits: %d hit(s) parsed (cap=%d)\n",
                       nh, cap);
             }
+            // Drop any duckduckgo.com URL — those are always
+            // {ad-redirect | help/about | "more info" disclaimer}
+            // and never useful answer pages. Free + compact.
+            // Observed in --repl with the IP-location query: DDG
+            // returned a y.js ad-redirect URL as hit[0] and the ads-
+            // disclaimer page as hit[1] (both 200 OK so they would
+            // have survived the probe step). The model picked hit[0]
+            // and we fetched 45 KB of JavaScript loader.
+            {
+                int w = 0;
+                for (int i = 0; i < nh; i++) {
+                    const char * u = hits[i].url;
+                    bool is_ddg = (u != NULL) &&
+                        (strstr(u, "://duckduckgo.com/")  != NULL ||
+                         strstr(u, "://www.duckduckgo.com/") != NULL ||
+                         strstr(u, "://lite.duckduckgo.com/") != NULL);
+                    if (is_ddg) {
+                        free(hits[i].title);   hits[i].title   = NULL;
+                        free(hits[i].url);     hits[i].url     = NULL;
+                        free(hits[i].snippet); hits[i].snippet = NULL;
+                    } else {
+                        if (w != i) { hits[w] = hits[i]; hits[i] = (struct tools_search_hit){0}; }
+                        w++;
+                    }
+                }
+                if (g_tools_debug >= 1 && w != nh) {
+                    trace("websearch_hits: dropped %d duckduckgo.com"
+                          " URL(s) (ads/help)\n", nh - w);
+                }
+                nh = w;
+            }
             if (g_tools_debug >= 5) {
                 int show = nh < 3 ? nh : 3;
                 for (int i = 0; i < show; i++) {
@@ -1062,7 +1093,13 @@ static int tools_websearch_hits(const char * query, int max_results,
             // Probe each URL for liveness + content-length, then sort
             // surviving hits by content-length ascending. Insertion
             // sort over <= TOOLS_HITS_MAX elements (typically 5-8).
+            // Also remember probe bytes_received per hit so the URL-
+            // pick preamble can show the model "[~N KB]" as a "what
+            // to expect" signal (the user's request — gives the
+            // model a basis for picking direct-answer URLs over
+            // huge hub/index pages even when titles look similar).
             int64_t cl[TOOLS_HITS_MAX];
+            size_t  bytes_per_hit[TOOLS_HITS_MAX];
             int     order[TOOLS_HITS_MAX];
             int     n_alive = 0;
             for (int i = 0; i < nh; i++) {
@@ -1073,6 +1110,7 @@ static int tools_websearch_hits(const char * query, int max_results,
                 if (pr.alive) {
                     cl[n_alive] = (pr.content_length > 0)
                                 ? pr.content_length : INT64_MAX;
+                    bytes_per_hit[n_alive] = pr.bytes_received;
                     order[n_alive] = i;
                     n_alive++;
                 }
@@ -1082,6 +1120,9 @@ static int tools_websearch_hits(const char * query, int max_results,
                 while (j > 0 && cl[j] < cl[j - 1]) {
                     int64_t tcl = cl[j];      cl[j]    = cl[j - 1];
                     cl[j - 1]   = tcl;
+                    size_t  tb  = bytes_per_hit[j];
+                    bytes_per_hit[j]     = bytes_per_hit[j - 1];
+                    bytes_per_hit[j - 1] = tb;
                     int     to  = order[j];   order[j] = order[j - 1];
                     order[j - 1] = to;
                     j--;
@@ -1109,10 +1150,27 @@ static int tools_websearch_hits(const char * query, int max_results,
             }
             struct chars result = {0};
             for (int i = 0; i < nh; i++) {
-                chars_printf(&result, "%d. %s\n   %s\n   %s\n\n",
+                // Show advertised content-length when present, else
+                // probe bytes_received as a lower bound. Format the
+                // size compactly: "<1KB" / "~3KB" / "~150KB".
+                int64_t shown = (cl[i] != INT64_MAX) ? cl[i]
+                                                     : (int64_t)bytes_per_hit[i];
+                char szbuf[24];
+                if (shown <= 0) {
+                    snprintf(szbuf, sizeof(szbuf), "(size unknown)");
+                } else if (shown < 1024) {
+                    snprintf(szbuf, sizeof(szbuf), "~%lldB",
+                             (long long)shown);
+                } else {
+                    int kb = (int)((shown + 512) / 1024);
+                    snprintf(szbuf, sizeof(szbuf), "~%dKB", kb);
+                }
+                chars_printf(&result,
+                    "%d. %s\n   %s\n   [size: %s] %s\n\n",
                     i + 1,
                     hits[i].title   ? hits[i].title   : "(no title)",
                     hits[i].url     ? hits[i].url     : "(no url)",
+                    szbuf,
                     hits[i].snippet ? hits[i].snippet : "(no snippet)");
             }
             chars_put(&result, "", 0);
