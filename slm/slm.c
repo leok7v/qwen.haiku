@@ -1265,6 +1265,35 @@ int slm_generate(struct slm_ctx * c,
                 if (picked_url != NULL) {
                     tools_fetch_distill(picked_url, &fd);
                 }
+                // Distill-too-short detector: if the HTML stripper
+                // returned almost nothing (say <200 chars after
+                // stripping) from a substantial fetch (>5 KB), the
+                // page is almost certainly heavy-JS / SPA and the
+                // body we'd inject is just the <title> + http header
+                // line — useless for answering. Observed with
+                // merriam-webster.com/dictionary/proton: 200 KB raw
+                // → 55 chars distilled = "HTTP 200 PROTON Definition
+                // & Meaning - Merriam-Webster". Treat as fetch
+                // failure so the fallback "answer from snippets"
+                // path fires instead.
+                if (fd.ok && fd.body != NULL) {
+                    size_t distilled = strlen(fd.body);
+                    if (distilled < 200 &&
+                        fd.status >= 200 && fd.status < 400) {
+                        fd.ok = false;
+                        free(fd.error);
+                        fd.error = strdup(
+                            "page distilled to <200 chars"
+                            " (likely heavy-JS / SPA — HTML stripper"
+                            " gave up)");
+                        if (debug_lv >= 1) {
+                            trace("fetch_distill: distilled body"
+                                  " too short (%zu chars)"
+                                  " — falling back to snippets\n",
+                                  distilled);
+                        }
+                    }
+                }
                 // Restore again, build final preamble. Two branches:
                 //   - fetch_distill succeeded -> distilled content +
                 //     "summarize" framing.

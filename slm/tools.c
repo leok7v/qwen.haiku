@@ -1098,7 +1098,19 @@ static int tools_websearch_hits(const char * query, int max_results,
             // to expect" signal (the user's request — gives the
             // model a basis for picking direct-answer URLs over
             // huge hub/index pages even when titles look similar).
-            int64_t cl[TOOLS_HITS_MAX];
+            // sort_key = best estimate of full body size: prefer
+            // advertised Content-Length, fall back to probe
+            // bytes_received when CL header is absent / chunked
+            // encoding. The PREVIOUS impl used INT64_MAX for cl<0,
+            // which sank every chunked-encoding site to the bottom
+            // regardless of how small the actual page was. Observed:
+            // Britannica probe returned cl=-1 got=10655 (10KB) but
+            // sorted AFTER Wikipedia at cl=73774 (72KB) because cl<0
+            // → INT64_MAX. The displayed [size: ~NKB] annotation
+            // already used bytes_received as the fallback so the
+            // model saw an inconsistency between order and labels.
+            int64_t cl[TOOLS_HITS_MAX];          // for display only
+            int64_t sort_key[TOOLS_HITS_MAX];    // for ordering
             size_t  bytes_per_hit[TOOLS_HITS_MAX];
             int     order[TOOLS_HITS_MAX];
             int     n_alive = 0;
@@ -1110,6 +1122,11 @@ static int tools_websearch_hits(const char * query, int max_results,
                 if (pr.alive) {
                     cl[n_alive] = (pr.content_length > 0)
                                 ? pr.content_length : INT64_MAX;
+                    int64_t sk = (pr.content_length > 0)
+                               ? pr.content_length
+                               : (int64_t)pr.bytes_received;
+                    if (sk <= 0) { sk = INT64_MAX; }
+                    sort_key[n_alive] = sk;
                     bytes_per_hit[n_alive] = pr.bytes_received;
                     order[n_alive] = i;
                     n_alive++;
@@ -1117,7 +1134,10 @@ static int tools_websearch_hits(const char * query, int max_results,
             }
             for (int i = 1; i < n_alive; i++) {
                 int j = i;
-                while (j > 0 && cl[j] < cl[j - 1]) {
+                while (j > 0 && sort_key[j] < sort_key[j - 1]) {
+                    int64_t tsk = sort_key[j];
+                    sort_key[j]     = sort_key[j - 1];
+                    sort_key[j - 1] = tsk;
                     int64_t tcl = cl[j];      cl[j]    = cl[j - 1];
                     cl[j - 1]   = tcl;
                     size_t  tb  = bytes_per_hit[j];
