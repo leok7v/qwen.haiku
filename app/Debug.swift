@@ -27,6 +27,13 @@ final class TraceLog {
     /// Most-recent log lines (newest at the end). Capped to maxLines.
     var lines: [String] = []
 
+    /// Joined-text view of `lines` (one big newline-separated String).
+    /// The DebugView renders this as a single Text so the user can
+    /// drag-select across multiple lines (the prior per-line LazyVStack
+    /// limited selection to one line at a time). Lazily recomputed on
+    /// access — SwiftUI's diffing notices when it changes.
+    var joinedText: String { lines.joined(separator: "\n") }
+
     /// Cap; trimming happens in a single removeFirst(N) so SwiftUI
     /// observes one change per arrival burst, not N changes.
     private static let maxLines = 2000
@@ -94,11 +101,18 @@ private func traceCallbackCFn(obsPtr: UnsafePointer<trace_observer>?,
     let file = entry.file.map { String(cString: $0) } ?? ""
     let function = entry.function.map { String(cString: $0) } ?? ""
     let line = Int(entry.line)
-    let message = withUnsafePointer(to: entry.message) { ptr in
-        ptr.withMemoryRebound(to: CChar.self,
-                              capacity: Int(TRACE_MESSAGE_MAX)) { p in
-            String(cString: p)
-        }
+    // The message is a heap pointer + length on the C side now (no
+    // fixed cap). trace_message() returns the raw bytes; we decode
+    // to a Swift String via UTF-8.
+    var msgLen: size_t = 0
+    let message: String
+    if let p = trace_message(entryPtr, &msgLen), msgLen > 0 {
+        let buf = UnsafeBufferPointer(
+            start: UnsafeRawPointer(p).assumingMemoryBound(to: UInt8.self),
+            count: Int(msgLen))
+        message = String(decoding: buf, as: UTF8.self)
+    } else {
+        message = ""
     }
     // Strip trailing newline so SwiftUI Text doesn't render an empty
     // gap line beneath each entry.
@@ -167,18 +181,22 @@ struct DebugView: View {
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(log.lines.enumerated()),
-                                id: \.offset) { _, line in
-                            Text(line)
-                                .font(.system(size: 11,
-                                              weight: .regular,
-                                              design: .monospaced))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity,
-                                       alignment: .leading)
-                        }
-                        // Sentinel to scroll to bottom on append.
+                    // Single Text node carrying all lines joined by \n
+                    // so the user can drag-select across multiple lines
+                    // and Cmd-C them (the prior per-line LazyVStack
+                    // restricted selection to one line at a time).
+                    // Tail sentinel sits below so scrollTo("tail")
+                    // can pin the view to the bottom on append.
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(log.joinedText)
+                            .font(.system(size: 11,
+                                          weight: .regular,
+                                          design: .monospaced))
+                            .textSelection(.enabled)
+                            .lineLimit(nil)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity,
+                                   alignment: .leading)
                         Color.clear.frame(height: 1).id("tail")
                     }
                     .padding(.horizontal, 16)

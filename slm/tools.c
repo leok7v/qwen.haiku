@@ -428,10 +428,16 @@ static int tools_http_get(const char * url, long timeout_ms,
                           struct chars * body, long * status) {
     int rc = -1;
     *status = 0;
+    if (g_tools_debug >= 9) {
+        trace("http_get: GET %s (timeout=%ldms)\n", url, timeout_ms);
+    }
     CURL * h = curl_easy_init();
     if (h != NULL) {
         struct curl_slist * hdrs = NULL;
         const struct tools_ua_slot * slot = tools_pick_ua();
+        if (g_tools_debug >= 9) {
+            trace("http_get: UA=%s\n", slot->ua);
+        }
         char ua_header[512];
         snprintf(ua_header, sizeof(ua_header),
                  "User-Agent: %s", slot->ua);
@@ -502,6 +508,10 @@ static int tools_http_get(const char * url, long timeout_ms,
         if (cc == CURLE_OK) {
             rc = 0;
             curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, status);
+            if (g_tools_debug >= 9) {
+                trace("http_get: status=%ld body=%zu bytes\n",
+                      *status, body->count);
+            }
         } else {
             trace("http_get: curl_easy_perform: %s\n",
                   errbuf[0] != '\0' ? errbuf : curl_easy_strerror(cc));

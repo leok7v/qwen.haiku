@@ -160,7 +160,12 @@ final class SLMViewModel {
     // this the UI's default T=0.7 sampler causes the model to mis-
     // emit tool_call markers (or hit <|im_end|> after a couple of
     // garbage tokens) and the dispatch flow never fires.
-    private func samplerFor(toolsOn: Bool) -> SLM.Sampler {
+    //
+    // nonisolated: this is a pure value-builder; the returned
+    // SLM.Sampler is captured into a Task.detached closure (which
+    // Swift 6 strict concurrency flags as a data-race risk when the
+    // call site is MainActor-isolated).
+    nonisolated private func samplerFor(toolsOn: Bool) -> SLM.Sampler {
         SLM.Sampler(temperature:       toolsOn ? 0.0  : 0.7,
                     topK:              40,
                     topP:              toolsOn ? 1.0  : 0.9,

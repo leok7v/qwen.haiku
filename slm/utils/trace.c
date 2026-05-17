@@ -49,19 +49,31 @@ extern "C" {
 // Public surface — always visible.
 // =============================================================
 
+#include <stddef.h>
+
 #define TRACE_RING_CAPACITY 1024     // power of two; head % CAPACITY
-#define TRACE_MESSAGE_MAX   232      // sizeof(struct trace_entry) ~ 256
 
 // One ring slot. `file` / `function` point to literal __FILE__ and
 // __func__ strings owned by the program's read-only segment, so
-// they're stable without copying. `message` is a vsnprintf'd payload.
+// they're stable without copying. `message` is a heap-allocated,
+// NUL-terminated UTF-8 payload sized exactly to what trace() formatted
+// — no fixed cap. The ring takes ownership: when a slot is reused on
+// wrap-around, the prior message's heap allocation is freed first.
+// Readers should call trace_message(e, &n) rather than poking the
+// struct directly so we can change the layout later without breaking
+// callers.
 struct trace_entry {
     double       timestamp;          // seconds since first trace() call
     const char * file;               // basename (after last '/')
     const char * function;           // __func__ at the call site
     int32_t      line;
-    char         message[TRACE_MESSAGE_MAX];
+    char *       message;            // owned (NUL-terminated); may be NULL
+    size_t       message_n;          // byte length excluding NUL
 };
+
+// Accessor for the message payload + its length in bytes. Returns
+// NULL when the entry has no payload (fresh slot or freed).
+const char * trace_message(const struct trace_entry * e, size_t * out_n);
 
 // Observer functor. on_trace fires once per trace() invocation, from
 // the thread that called trace(). Keep the body short; bounce to a
@@ -181,21 +193,37 @@ void _trace_(const char * filename, int32_t line, const char * func,
     uint64_t idx = atomic_load_explicit(&g_trace_head,
                                         memory_order_relaxed);
     struct trace_entry * e = &g_trace_ring[idx % TRACE_RING_CAPACITY];
+    free(e->message);
+    e->message   = NULL;
+    e->message_n = 0;
     e->timestamp = trace_since_start();
     e->file      = file;
     e->function  = func;
     e->line      = line;
 
+    // Probe required length, allocate exact, format. malloc failure
+    // here is silent (trace must not abort the program) — the entry
+    // gets an empty message and downstream readers see NULL.
     va_list ap;
     va_start(ap, format);
-    int n = vsnprintf(e->message, sizeof(e->message), format, ap);
+    va_list cp;
+    va_copy(cp, ap);
+    int n = vsnprintf(NULL, 0, format, cp);
+    va_end(cp);
+    if (n > 0) {
+        e->message = (char *)malloc((size_t)n + 1);
+        if (e->message != NULL) {
+            vsnprintf(e->message, (size_t)n + 1, format, ap);
+            e->message_n = (size_t)n;
+        }
+    }
     va_end(ap);
-    if (n < 0) { e->message[0] = '\0'; n = 0; }
 
     // Mirror to stderr so the CLI experience stays unchanged.
+    const char * msg = (e->message != NULL) ? e->message : "";
     fprintf(stderr, "%10.6f %s:%d @%s %s",
-            e->timestamp, file, line, func, e->message);
-    if (n == 0 || e->message[n - 1] != '\n') {
+            e->timestamp, file, line, func, msg);
+    if (e->message_n == 0 || e->message[e->message_n - 1] != '\n') {
         fputc('\n', stderr);
     }
 
@@ -210,6 +238,17 @@ void _trace_(const char * filename, int32_t line, const char * func,
     if (obs != NULL && obs->on_trace != NULL) {
         obs->on_trace(obs, e);
     }
+}
+
+const char * trace_message(const struct trace_entry * e, size_t * out_n) {
+    const char * r = NULL;
+    if (e != NULL && e->message != NULL) {
+        r = e->message;
+        if (out_n != NULL) { *out_n = e->message_n; }
+    } else if (out_n != NULL) {
+        *out_n = 0;
+    }
+    return r;
 }
 
 void trace_subscribe(const struct trace_observer * observer) {
