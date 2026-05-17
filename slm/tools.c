@@ -887,12 +887,22 @@ static void tools_fetch_distill(const char * url,
                 out->error = strdup(distilled.error
                     ? distilled.error : "distill failed");
                 out->status = fetched.status;
+                if (g_tools_debug >= 1) {
+                    trace("fetch_distill: FAILED on %s — %s"
+                          " (status=%ld)\n",
+                          url, out->error, fetched.status);
+                }
             }
             tools_result_free(&distilled);
         } else {
             out->error = strdup(fetched.error
                 ? fetched.error : "fetch failed");
             out->status = fetched.status;
+            if (g_tools_debug >= 1) {
+                trace("fetch_distill: FAILED on %s — %s"
+                      " (status=%ld)\n",
+                      url, out->error, fetched.status);
+            }
         }
         tools_result_free(&fetched);
     }

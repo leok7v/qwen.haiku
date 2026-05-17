@@ -916,10 +916,13 @@ bool slm_ctx_system_prompt(struct slm_ctx * ctx,
         struct jinja_tool tools[3];
         int n_tools = 0;
         if (ctx->ctrl.tools) {
+            // Single tool, zero-shot: only websearch is advertised
+            // to the model. fetch + distill are internal transitions
+            // inside the websearch dispatch flow (slm_generate uses
+            // tools_websearch_hits + tools_fetch_distill directly).
+            // The 0.8B is much steadier with a single tool surface.
             tools[0].json = AGENT_TOOL_WEBSEARCH;
-            tools[1].json = AGENT_TOOL_FETCH;
-            tools[2].json = AGENT_TOOL_DISTILL;
-            n_tools = 3;
+            n_tools = 1;
         }
         // Format the canonical system block via jinja helper.
         char * block = jinja_format_system_block(sys_text, &ctx->ctrl,
@@ -1148,10 +1151,10 @@ int slm_generate(struct slm_ctx * c,
                     capture.content = (struct chars){0};
                     struct chars pick_p = {0};
                     chars_printf(&pick_p,
-                        "Search results:\n\n%s"
-                        "Pick the URL most likely to answer the"
-                        " user's question. Reply with ONLY the"
-                        " number (1-%d).\n\n",
+                        "We have a list of URLs and titles for"
+                        " them:\n\n%s"
+                        "Chose one to use (reply with ONLY the"
+                        " number 1-%d): ",
                         hits_res.body ? hits_res.body : "",
                         nh);
                     chars_put(&pick_p, "", 0);
@@ -1218,21 +1221,42 @@ int slm_generate(struct slm_ctx * c,
                 if (picked_url != NULL) {
                     tools_fetch_distill(picked_url, &fd);
                 }
-                // Restore again, build final preamble.
+                // Restore again, build final preamble. Two branches:
+                //   - fetch_distill succeeded -> distilled content +
+                //     "summarize" framing.
+                //   - fetch failed -> "(no content)" would just nudge
+                //     the model to retry with another tool_call, so
+                //     we fall back to the snippet list and ask the
+                //     model to answer from whatever signal we have.
                 slm_ctx_restore(c, snap);
                 if (with_debug && fd.body != NULL) {
                     text_puts(&c->messages, fd.body);
                     slm_cb_emit(effective_cb, NULL, NULL, NULL,
                                 fd.body, false, 0, 0);
                 }
-                chars_printf(&inject,
-                    "I searched the web and fetched %s.\n\n%s\n\n"
-                    "Based on this, here is a concise answer to the"
-                    " user's question:\n\n",
-                    picked_url ? picked_url : "(no URL)",
-                    fd.ok && fd.body != NULL ? fd.body
-                  : fd.error    != NULL      ? fd.error
-                                             : "(no content)");
+                if (fd.ok && fd.body != NULL) {
+                    chars_printf(&inject,
+                        "Content of [%d] %s:\n\n%s\n\n"
+                        "Summarize the above to answer the user's"
+                        " question:\n\n",
+                        picked, picked_url, fd.body);
+                } else {
+                    // Fetch failed — surface the error to the model
+                    // and let it answer from the snippets only. Avoid
+                    // "Based on this, here is the answer" wording
+                    // because the model would rightly object that
+                    // there's nothing to base anything on.
+                    chars_printf(&inject,
+                        "I tried to fetch [%d] %s but it failed: %s."
+                        "\n\nHere are the search snippets I have:"
+                        "\n\n%s"
+                        "Based ONLY on these snippets, give the best"
+                        " concise answer you can to the user's"
+                        " question (do not call any tools):\n\n",
+                        picked, picked_url,
+                        fd.error ? fd.error : "(unknown error)",
+                        hits_res.body ? hits_res.body : "");
+                }
                 chars_put(&inject, "", 0);
                 tools_result_free(&fd);
                 tools_result_free(&hits_res);
