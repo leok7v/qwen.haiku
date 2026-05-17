@@ -406,11 +406,64 @@ static size_t tools_html_block_skip(const char * s, size_t n) {
     return skip;
 }
 
+// Codepoint range tests for "zero-information" Unicode that
+// distilled web content should drop before the model sees it.
+// Emojis tokenize to 2-4 BPE tokens each, contribute nothing to a
+// textual summary, and (on emoji-heavy pages like time.now's nav
+// header) cause 60%+ of the prefill budget to be spent on
+// 🌍🗺️🏙️🏴⏰⌚ ribbons. Web is messy; expect this list to grow.
+static bool tools_cp_is_emoji(int32_t cp) {
+    return (cp >= 0x2300  && cp <= 0x23FF)   // Misc Technical
+                                              // ( ⌚ ⌛ ⏰ ⏱ ⏲ ⏳ )
+        || (cp >= 0x2500  && cp <= 0x257F)   // Box Drawing
+        || (cp >= 0x2580  && cp <= 0x259F)   // Block Elements
+        || (cp >= 0x25A0  && cp <= 0x25FF)   // Geometric Shapes
+        || (cp >= 0x2600  && cp <= 0x27BF)   // Misc Symbols, Dingbats
+        || (cp >= 0x2B00  && cp <= 0x2BFF)   // Misc Symbols and Arrows
+        || (cp == 0x200D)                    // Zero-Width Joiner
+        || (cp >= 0xFE00  && cp <= 0xFE0F)   // Variation Selectors
+        || (cp >= 0x1F000 && cp <= 0x1FFFF); // emoji planes
+}
+
+// UTF-8 decode at s[i]. Returns codepoint and bytes consumed.
+static int tools_utf8_decode(const char * s, size_t n, size_t i,
+                             int32_t * out_cp) {
+    int            adv = 1;
+    int32_t        cp  = 0;
+    unsigned char  c0  = (unsigned char)s[i];
+    if (c0 < 0x80) {
+        cp  = c0;
+        adv = 1;
+    } else if ((c0 & 0xE0) == 0xC0 && i + 1 < n) {
+        cp  = ((c0 & 0x1F) << 6)
+            | ((unsigned char)s[i + 1] & 0x3F);
+        adv = 2;
+    } else if ((c0 & 0xF0) == 0xE0 && i + 2 < n) {
+        cp  = ((c0 & 0x0F) << 12)
+            | (((unsigned char)s[i + 1] & 0x3F) << 6)
+            |  ((unsigned char)s[i + 2] & 0x3F);
+        adv = 3;
+    } else if ((c0 & 0xF8) == 0xF0 && i + 3 < n) {
+        cp  = ((c0 & 0x07) << 18)
+            | (((unsigned char)s[i + 1] & 0x3F) << 12)
+            | (((unsigned char)s[i + 2] & 0x3F) << 6)
+            |  ((unsigned char)s[i + 3] & 0x3F);
+        adv = 4;
+    } else {
+        cp  = 0xFFFD;
+        adv = 1;
+    }
+    *out_cp = cp;
+    return adv;
+}
+
 // Strip HTML tags + decode entities from `[s, s+n)` into `out`.
 // Newlines, tabs, and \r collapse to a single space; whitespace
 // run-collapsing happens in the caller if needed. Block elements
 // (script/style/etc) have their entire content dropped — see
-// tools_html_block_skip.
+// tools_html_block_skip. Emoji / dingbat / box-drawing codepoints
+// are dropped entirely (zero-information for textual summaries,
+// dominant prefill cost on nav-heavy pages).
 static void tools_html_strip(const char * s, size_t n,
                              struct chars * out) {
     size_t i = 0;
@@ -436,9 +489,16 @@ static void tools_html_strip(const char * s, size_t n,
         } else if (c == '\r' || c == '\n' || c == '\t') {
             chars_put(out, " ", 1);
             i++;
-        } else {
+        } else if ((unsigned char)c < 0x80) {
             chars_put(out, &c, 1);
             i++;
+        } else {
+            int32_t cp  = 0;
+            int     adv = tools_utf8_decode(s, n, i, &cp);
+            if (!tools_cp_is_emoji(cp)) {
+                chars_put(out, s + i, (size_t)adv);
+            }
+            i += (size_t)adv;
         }
     }
 }

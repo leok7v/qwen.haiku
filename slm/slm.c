@@ -261,14 +261,19 @@ static int slm_generate_raw(struct slm_ctx * c,
         calloc((size_t)(prompt_n + max_new + 1), sizeof(int32_t)));
     int32_t   hist_n  = 0;
     for (int32_t i = 0; i < prompt_n; i++) { history[hist_n++] = prompt_ids[i]; }
-    // Pre-fill prompt. If LLM_USE_FORWARD_BATCH is set AND the prompt
-    // is multi-token AND fits in one chunk, run the chunked-SSM
-    // batched forward in a single call. Otherwise loop the
-    // autoregressive single-token forward as before. Decode (after
-    // prefill) always uses single-token forward.
+    // Pre-fill prompt. Batch path (chunked-SSM forward) is 2-3x
+    // faster but currently gated behind LLM_USE_FORWARD_BATCH env
+    // because chat-test went cross-pass-nondeterministic when it was
+    // unconditional — symptom: pass A produces "The", pass B "The2"
+    // for the same seed, suggesting FP-ordering drift somewhere on
+    // the batch path that flips a sample under T=0.7. The llama.cpp
+    // qwen-haiku JSONL comparison tool should pin down the exact
+    // divergence point; until that's verified bit-equivalent, keep
+    // the gate. Single-token prompts always use per-step.
     static int8_t use_forward_batch = -1;
     if (use_forward_batch < 0) {
-        use_forward_batch = (getenv("LLM_USE_FORWARD_BATCH") != NULL) ? 1 : 0;
+        use_forward_batch =
+            (getenv("LLM_USE_FORWARD_BATCH") != NULL) ? 1 : 0;
     }
     if (use_forward_batch && prompt_n > 1) {
         struct tensor * logits = slm_forward_batch(c, prompt_ids,
@@ -1144,7 +1149,17 @@ int slm_generate(struct slm_ctx * c,
                           nh, query ? query : "");
                 }
                 int picked = 0;        // 1-based; 0 = fallback to top
-                if (nh > 0 && hits_res.ok) {
+                if (nh == 1 && hits_res.ok) {
+                    // Only one URL survived pre-validation — skip the
+                    // Phase B model invocation entirely. Saves the
+                    // ~150-token URL-pick preamble prefill + the
+                    // ~10s "decode a single digit" round trip. The
+                    // model would have picked 1 anyway.
+                    picked = 1;
+                    if (debug_lv >= 1) {
+                        trace("url_pick: skipped (1 hit)\n");
+                    }
+                } else if (nh > 0 && hits_res.ok) {
                     // -- Phase B: ask the model to pick a URL --
                     slm_ctx_restore(c, snap);
                     chars_free(&capture.content);
