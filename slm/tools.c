@@ -312,18 +312,119 @@ static size_t tools_decode_entity(const char * s, size_t i, size_t n,
     return adv;
 }
 
+// Case-insensitive prefix compare. True if `s[0..plen)` matches
+// `prefix` after ASCII case-folding. `prefix` is NUL-terminated.
+static bool tools_starts_with_icase(const char * s, size_t n,
+                                    const char * prefix) {
+    size_t plen  = strlen(prefix);
+    bool   match = (n >= plen);
+    if (match) {
+        size_t k = 0;
+        while (k < plen && match) {
+            char a = s[k];
+            char b = prefix[k];
+            if (a >= 'A' && a <= 'Z') { a = (char)(a - 'A' + 'a'); }
+            if (b >= 'A' && b <= 'Z') { b = (char)(b - 'A' + 'a'); }
+            if (a != b) { match = false; }
+            k++;
+        }
+    }
+    return match;
+}
+
+// Block-element skip. If `s[0..]` opens one of the "drop the whole
+// content" HTML constructs (script, style, noscript, svg, HTML
+// comment), return the number of bytes to skip past the matching
+// close (or to end-of-input if unterminated). Returns 0 if `s` is
+// not such a block — caller falls back to normal single-tag strip.
+//
+// Why these in particular: distilled HTML feeds the model as
+// "content", so any tag whose body is code / vector data / hidden
+// metadata is noise that confuses the answer phase. Real-world
+// observed failure: worldclocklive.com's distilled output came back
+// as 4KB of inline GoogleTagManager JavaScript instead of the time
+// value, because <script> bodies survived the previous tag-only
+// strip. Web is messy — expect this list to grow.
+//
+// Note: HTML5 allows '/' before '>' in the close tag (e.g.
+// `</script  >`) so we walk to the `>` after matching the name
+// rather than requiring exactly "</tag>".
+static size_t tools_html_block_skip(const char * s, size_t n) {
+    size_t skip = 0;
+    if (n >= 4 && s[0] == '<' && s[1] == '!' &&
+        s[2] == '-' && s[3] == '-') {
+        // HTML comment: skip to -->
+        size_t j     = 4;
+        bool   found = false;
+        while (j + 2 < n && !found) {
+            if (s[j] == '-' && s[j + 1] == '-' && s[j + 2] == '>') {
+                found = true;
+                skip  = j + 3;
+            } else {
+                j++;
+            }
+        }
+        if (!found) { skip = n; }
+    } else if (n >= 2 && s[0] == '<') {
+        static const char * tags[] = {
+            "script", "style", "noscript", "svg", NULL
+        };
+        for (int k = 0; tags[k] != NULL && skip == 0; k++) {
+            const char * t  = tags[k];
+            size_t       tn = strlen(t);
+            // "<tag" followed by a token-terminator (space, >, /, etc).
+            bool open = (n >= tn + 2) &&
+                tools_starts_with_icase(s + 1, n - 1, t);
+            if (open) {
+                char nx = s[1 + tn];
+                bool token_end = (nx == ' ' || nx == '\t' ||
+                                  nx == '\n' || nx == '\r' ||
+                                  nx == '>'  || nx == '/');
+                if (token_end) {
+                    char   close[16];
+                    snprintf(close, sizeof(close), "</%s", t);
+                    size_t cn    = strlen(close);
+                    size_t j     = 1 + tn;
+                    bool   found = false;
+                    while (j + cn <= n && !found) {
+                        if (tools_starts_with_icase(s + j, n - j,
+                                                    close)) {
+                            size_t gt = j + cn;
+                            while (gt < n && s[gt] != '>') { gt++; }
+                            if (gt < n) { gt++; }
+                            skip  = gt;
+                            found = true;
+                        } else {
+                            j++;
+                        }
+                    }
+                    if (!found) { skip = n; }
+                }
+            }
+        }
+    }
+    return skip;
+}
+
 // Strip HTML tags + decode entities from `[s, s+n)` into `out`.
 // Newlines, tabs, and \r collapse to a single space; whitespace
-// run-collapsing happens in the caller if needed.
+// run-collapsing happens in the caller if needed. Block elements
+// (script/style/etc) have their entire content dropped — see
+// tools_html_block_skip.
 static void tools_html_strip(const char * s, size_t n,
                              struct chars * out) {
     size_t i = 0;
     while (i < n) {
         char c = s[i];
         if (c == '<') {
-            size_t j = i + 1;
-            while (j < n && s[j] != '>') { j++; }
-            i = (j < n) ? j + 1 : n;
+            size_t blk = tools_html_block_skip(s + i, n - i);
+            if (blk > 0) {
+                i += blk;
+            } else {
+                size_t j = i + 1;
+                while (j < n && s[j] != '>') { j++; }
+                i = (j < n) ? j + 1 : n;
+            }
         } else if (c == '&') {
             size_t adv = tools_decode_entity(s, i, n, out);
             if (adv > 0) {

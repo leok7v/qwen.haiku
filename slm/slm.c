@@ -1150,7 +1150,21 @@ int slm_generate(struct slm_ctx * c,
                     chars_free(&capture.content);
                     capture.content = (struct chars){0};
                     struct chars pick_p = {0};
+                    // Pre-emit a closed <think></think> block before
+                    // the prompt body. The model — having just been
+                    // fed an assistant prefix that already closed
+                    // <think> in iter 0 — sometimes re-opens <think>
+                    // when it sees a fresh-looking question (the URL-
+                    // pick preamble). The think filter then routes
+                    // the digit reply to .reasoning, leaving
+                    // capture.content empty and the picker fall-back
+                    // firing every time. Pre-filling
+                    // "<think>\n\n</think>\n\n" inside the prompt
+                    // makes a re-opened <think> impossible — there's
+                    // no token sequence the model can emit that
+                    // re-enters reasoning mode here.
                     chars_printf(&pick_p,
+                        "<think>\n\n</think>\n\n"
                         "We have a list of URLs and titles for"
                         " them:\n\n%s"
                         "Chose one to use (reply with ONLY the"
