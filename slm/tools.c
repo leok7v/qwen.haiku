@@ -135,6 +135,86 @@ static void tools_global_cleanup(void) {
     }
 }
 
+// Percent-decode `s[0..n)` into `out`. `+` is treated as space (the
+// historic form-encoding rule; DDG's uddg= values don't use `+` for
+// space but it's harmless to decode). Invalid `%XX` sequences pass
+// through as-is.
+static void tools_url_decode(const char * s, size_t n,
+                             struct chars * out) {
+    size_t i = 0;
+    while (i < n) {
+        char c = s[i];
+        if (c == '%' && i + 2 < n) {
+            char h = s[i + 1];
+            char l = s[i + 2];
+            int  hi = -1;
+            int  lo = -1;
+            if      (h >= '0' && h <= '9') { hi = h - '0';      }
+            else if (h >= 'a' && h <= 'f') { hi = h - 'a' + 10; }
+            else if (h >= 'A' && h <= 'F') { hi = h - 'A' + 10; }
+            if      (l >= '0' && l <= '9') { lo = l - '0';      }
+            else if (l >= 'a' && l <= 'f') { lo = l - 'a' + 10; }
+            else if (l >= 'A' && l <= 'F') { lo = l - 'A' + 10; }
+            if (hi >= 0 && lo >= 0) {
+                char b = (char)(hi * 16 + lo);
+                chars_put(out, &b, 1);
+                i += 3;
+            } else {
+                chars_put(out, &c, 1);
+                i++;
+            }
+        } else if (c == '+') {
+            chars_put(out, " ", 1);
+            i++;
+        } else {
+            chars_put(out, &c, 1);
+            i++;
+        }
+    }
+}
+
+// Resolve a raw href value from DDG-lite into a real, fetch-able URL.
+// DDG wraps every result link in a redirect tracker of the form
+//     //duckduckgo.com/l/?uddg=<percent-encoded-target>&rut=<hash>
+// (protocol-relative, payload inside uddg=). Without unwrapping,
+// tools_fetch hits libcurl's "URL rejected: No host part" error
+// (the `//` prefix), or — if we patched the protocol — would just
+// re-hit DDG instead of the real source. We extract the uddg=
+// value up to the next `&` (which catches the `&amp;rut=...` tail
+// since `&amp;` starts with `&`), then percent-decode it.
+//
+// Non-wrapped href values (other engines, or DDG corner cases) are
+// passed through; if they're protocol-relative we prepend https:.
+//
+// Returns a heap-allocated, NUL-terminated URL; caller frees.
+static char * tools_url_unwrap(const char * raw, size_t n) {
+    char * result = NULL;
+    if (raw != NULL && n > 0) {
+        const char * uddg = (const char *)memmem(raw, n, "uddg=", 5);
+        if (uddg != NULL) {
+            const char * v   = uddg + 5;
+            size_t       lim = n - (size_t)(v - raw);
+            const char * end = v;
+            while ((size_t)(end - v) < lim && *end != '&') { end++; }
+            struct chars dec = {0};
+            tools_url_decode(v, (size_t)(end - v), &dec);
+            chars_put(&dec, "", 0);
+            result = dec.data;
+        } else if (n >= 2 && raw[0] == '/' && raw[1] == '/') {
+            struct chars b = {0};
+            chars_puts(&b, "https:");
+            chars_put(&b, raw, n);
+            chars_put(&b, "", 0);
+            result = b.data;
+        } else {
+            result = (char *)oom(malloc(n + 1));
+            memcpy(result, raw, n);
+            result[n] = '\0';
+        }
+    }
+    return result;
+}
+
 // URL-encode `q` into `out`. RFC 3986 unreserved set only.
 
 static void tools_url_encode(const char * q, struct chars * out) {
@@ -490,10 +570,11 @@ static int tools_ddg_parse(const char * h, size_t n, int max_results,
                     const char * end = (const char *)memchr(
                         v, '"', (size_t)(h + gt - v));
                     if (end != NULL && end > v) {
-                        size_t len = (size_t)(end - v);
-                        url = (char *)oom(malloc(len + 1));
-                        memcpy(url, v, len);
-                        url[len] = '\0';
+                        // Unwrap DDG redirect + percent-decode the
+                        // real target; without this we'd hand a
+                        // schemeless DDG-tracker URL to libcurl and
+                        // fetch would fail with "No host part".
+                        url = tools_url_unwrap(v, (size_t)(end - v));
                     }
                 }
             }

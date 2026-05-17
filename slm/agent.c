@@ -586,6 +586,7 @@ static int agent_capture_cb_fn(const struct slm_stream_callback * cb) {
 //
 // Returns a heap-allocated string (caller frees).
 
+__attribute__((unused)) 
 static char * agent_run(struct slm_model * model,
                         const char * question,
                         const struct slm_sampler * sp, uint64_t seed,
@@ -646,7 +647,7 @@ static char * agent_run(struct slm_model * model,
             slm_generate_raw(ctx, ids.data, (int32_t)ids.count,
                              max_new, 0, sp, seed,
                              slm_split_trampoline, &sbox,
-                             NULL);
+                             NULL, NULL);
             slm_think_filter_finish(&sbox.filter, &acbox.base);
             chars_free(&sbox.filter.tool_call);
             slm_ctx_destroy(ctx);

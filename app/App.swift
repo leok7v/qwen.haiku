@@ -153,17 +153,28 @@ final class SLMViewModel {
         }
     }
 
+    // Build the sampler from the current tools state. With tools on
+    // the 0.8B model needs greedy + no-nucleus + no-rep sampling to
+    // emit a structurally valid <tool_call> JSON — Tool-Calling.md §3,
+    // and the CLI's --tools path auto-clamps the same way. Without
+    // this the UI's default T=0.7 sampler causes the model to mis-
+    // emit tool_call markers (or hit <|im_end|> after a couple of
+    // garbage tokens) and the dispatch flow never fires.
+    private func samplerFor(toolsOn: Bool) -> SLM.Sampler {
+        SLM.Sampler(temperature:       toolsOn ? 0.0  : 0.7,
+                    topK:              40,
+                    topP:              toolsOn ? 1.0  : 0.9,
+                    minP:              0.05,
+                    repetitionPenalty: toolsOn ? 1.0  : 1.25,
+                    repetitionWindow:  64,
+                    maxNew:            2048,
+                    minNew:            8)
+    }
+
     private func loadModel() async {
         if let dl = self.downloader {
-            let path = dl.localURL
-            let sampler = SLM.Sampler(temperature:       0.7,
-                                      topK:              40,
-                                      topP:              0.9,
-                                      minP:              0.05,
-                                      repetitionPenalty: 1.25,
-                                      repetitionWindow:  64,
-                                      maxNew:            2048,
-                                      minNew:            8)
+            let path    = dl.localURL
+            let sampler = samplerFor(toolsOn: self.tools)
             let toolsOn = self.tools
             let thinkOn = self.think
             let debugLv = self.debug
@@ -345,6 +356,11 @@ final class SLMViewModel {
             let toolsOn = self.tools
             let thinkOn = self.think
             let debugLv = self.debug
+            // Sampler depends on tools state (greedy+no-nucleus when
+            // tools are on; chat-tuned defaults otherwise). Refresh
+            // it here so the new ctx generates with the right
+            // settings on its first turn.
+            slm.sampler = samplerFor(toolsOn: toolsOn)
             // Prefill of the system block can take ~0.5-2s when tools
             // are advertised (the tool-spec text is ~600 tokens). Run
             // off the MainActor so the UI stays responsive while the

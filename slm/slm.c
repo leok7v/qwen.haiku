@@ -204,13 +204,44 @@ static void slm_trace_long(const char * label,
 
 typedef int (*slm_token_cb)(const char * utf8, void * user);
 
+// Optional functor fired after the prefill phase finishes and BEFORE
+// the decode loop starts. Same first-field-cast idiom as
+// slm_stream_callback: embed in your own struct, store extra state
+// alongside, the on_prefilled function receives `self` and reads its
+// state via the cast — no separate `void * user` plumbing.
+//
+// slm_generate uses this to snapshot the ctx at the model's "decision
+// point" (KV holds user delta + assistant prefix; no decode tokens
+// yet). A tool_call dispatched mid-decode restores to this exact
+// point and just appends a preamble, skipping any re-prefill.
+struct slm_after_prefill {
+    void (*on_prefilled)(const struct slm_after_prefill * self,
+                         struct slm_ctx *                 c);
+};
+
+// slm_generate's snap-capture functor — first-field-cast over
+// slm_after_prefill. `slot` is where the captured snapshot pointer
+// lands; consumed and NULLed in the tool-dispatch branch.
+struct slm_snap_capture {
+    struct slm_after_prefill base;
+    struct slm_snapshot **   slot;
+};
+
+static void slm_snap_capture_fn(const struct slm_after_prefill * self,
+                                struct slm_ctx *                 c) {
+    const struct slm_snap_capture * me =
+        (const struct slm_snap_capture *)self;
+    *me->slot = slm_ctx_snapshot(c);
+}
+
 static int slm_generate_raw(struct slm_ctx * c,
                  const int32_t * prompt_ids, int prompt_n,
                  int max_new, int min_new,
                  const struct slm_sampler * sampler_in,
                  uint64_t seed,
                  slm_token_cb cb, void * user,
-                 struct slm_stream_callback * progress_cb) {
+                 struct slm_stream_callback *     progress_cb,
+                 const struct slm_after_prefill * after_prefill) {
     struct slm_sampler sp = {0};
     if (sampler_in != NULL) { sp = *sampler_in; }
     // rng lives on the ctx (seeded in slm_ctx_create from time(NULL)).
@@ -252,6 +283,12 @@ static int slm_generate_raw(struct slm_ctx * c,
             (void)logits;
             pos++;
         }
+    }
+    // Fire the after-prefill hook with c->pos already advanced to
+    // post-prefill so a snapshot taken here covers the user delta.
+    c->pos = pos;
+    if (after_prefill != NULL && after_prefill->on_prefilled != NULL) {
+        after_prefill->on_prefilled(after_prefill, c);
     }
     if (progress_cb != NULL && prompt_n > 0) {
         slm_cb_emit(progress_cb, NULL, NULL, NULL, NULL,
@@ -957,15 +994,17 @@ int slm_generate(struct slm_ctx * c,
     capture.forward                = cb;
     struct slm_stream_callback * effective_cb =
         (debug_lv >= 9) ? &capture.base : cb;
-    // Snapshot pre-turn state. Restored if the model emits a tool_call
-    // so the second pass replays from the same conversation point but
-    // with curated tool output baked into the prompt.
-    struct slm_snapshot * snap = with_tools
-                                 ? slm_ctx_snapshot(c) : NULL;
-    if (debug_lv >= 1 && snap != NULL) {
-        trace("snapshot: pos=%d ids=%zu (pre-turn rollback point)\n",
-              c->pos, c->ids.count);
-    }
+    // Snapshot taken at the model's "decision point" — after the user
+    // delta is prefilled into KV but BEFORE the decode loop starts.
+    // Set by slm_snap_capture_fn via slm_generate_raw's after_prefill
+    // hook. Only filled on the first iter; restored + freed on
+    // tool_call dispatch.
+    struct slm_snapshot *    snap       = NULL;
+    bool                     tool_round = with_tools;
+    struct slm_snap_capture  snap_hook  = {
+        .base = { .on_prefilled = slm_snap_capture_fn },
+        .slot = &snap,
+    };
     // Format the user turn delta and tokenize it into a growing token
     // buffer that we reuse across iters (each iter resets count=0
     // before refilling).
@@ -983,19 +1022,30 @@ int slm_generate(struct slm_ctx * c,
            total_gen < max_new) {
         struct slm_split_box box = {0};
         slm_think_filter_init(&box.filter);
-        box.filter.recognize_tool_calls = (snap != NULL);
+        box.filter.recognize_tool_calls = tool_round;
         box.filter.emit_visibility      = with_debug;
         box.cb = effective_cb;
         int budget = max_new - total_gen;
         if (debug_lv >= 3) {
-            trace("agent: iter=%d pos=%d prefill_n=%zu budget=%d\n",
-                  iter, c->pos, cur.count, budget);
+            trace("agent: iter=%d pos=%d prefill_n=%zu budget=%d"
+                  " tool_round=%d\n",
+                  iter, c->pos, cur.count, budget, tool_round ? 1 : 0);
         }
+        // On the tool-eligible iter, the snap_hook functor fires
+        // after prefill (KV holds user delta + assistant prefix; pos
+        // is at the decision point) and writes the captured snapshot
+        // into `snap`.
+        const struct slm_after_prefill * hook =
+            (tool_round && snap == NULL) ? &snap_hook.base : NULL;
         int n = slm_generate_raw(c, cur.data, (int32_t)cur.count,
                                  budget, min_new,
                                  sampler_in, seed,
                                  slm_split_trampoline, &box,
-                                 effective_cb);
+                                 effective_cb, hook);
+        if (debug_lv >= 1 && snap != NULL && iter == 0) {
+            trace("snapshot: post-prefill pos=%d ids=%zu\n",
+                  snap->pos, snap->ids_count);
+        }
         total_gen += n;
         slm_think_filter_finish(&box.filter, effective_cb);
         cur.count = 0;       // reuse buffer; freed at function exit
@@ -1062,29 +1112,27 @@ int slm_generate(struct slm_ctx * c,
                             false, 0, 0);
             }
             // Atomic rollback: tool_call emission is wiped from KV/
-            // SSM/pos/ids. From the model's perspective the turn
-            // hasn't started yet.
+            // SSM/pos/ids back to the post-prefill snapshot point.
+            // The user delta + assistant prefix REMAIN in KV (they
+            // were prefilled before the snapshot fired), so we only
+            // need to append the curated preamble — no re-tokenize
+            // of the original turn delta.
             if (debug_lv >= 1) {
                 trace("restore: rolling ctx back to pos=%d\n",
                       snap->pos);
             }
             slm_ctx_restore(c, snap);
             slm_snapshot_free(snap);
-            snap = NULL;
-            // Replay the user delta + a preamble that continues the
-            // assistant turn with the curated result baked in. The
-            // delta ends with the assistant prefix; appending plain
-            // content tokens keeps the assistant turn open and the
-            // model picks up from there with the final answer.
+            snap       = NULL;
+            tool_round = false;     // one tool round per turn
+            // Preamble: the curated search results followed by a
+            // direct request to summarize. Continues the assistant
+            // turn (KV ends at <think></think>\n\n after restore).
             struct chars inject = {0};
-            char * delta2 = jinja_format_turn_delta(user_text,
-                                                    c->ctrl.think);
-            if (delta2 != NULL) { chars_puts(&inject, delta2); }
-            free(delta2);
             chars_printf(&inject,
-                "Based on a web search, here is the relevant"
-                " information:\n\n%s\n\n"
-                "Now I will answer the user's question.\n\n",
+                "I searched the web. Here are the results:\n\n%s\n\n"
+                "Based on the above, here is a concise answer to the"
+                " user's question:\n\n",
                 result.data ? result.data : "");
             chars_put(&inject, "", 0);
             if (debug_lv >= 1) {
@@ -1110,6 +1158,18 @@ int slm_generate(struct slm_ctx * c,
             // gets the full budget for the actual answer.
             total_gen = 0;
         } else {
+            if (debug_lv >= 1 && snap != NULL) {
+                // Diagnose the "tools on but nothing happened" case:
+                // the model finished without emitting a tool_call.
+                // Common cause: sampler temperature > 0 on the 0.8B
+                // makes <tool_call> JSON shatter — the cli auto-
+                // clamps to T=0; UI / library callers should too.
+                trace("agent: iter=%d ended without tool_call"
+                      " (n=%d, max_new=%d, T=%.2f)\n",
+                      iter, n, max_new,
+                      sampler_in != NULL ? sampler_in->temperature
+                                         : 0.0f);
+            }
             done = true;
         }
         chars_free(&box.filter.tool_call);
