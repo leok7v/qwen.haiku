@@ -45,6 +45,14 @@
 
 #include "utils/maps.c"  // oom, struct chars, struct arr, struct map
 #include "utils/text.c"  // struct text (vector of owned UTF-8 strings)
+
+// model.c owns the trace ring storage: this is the ONE TU that
+// defines TRACE_IMPLEMENTATION. Every other consumer (Swift via
+// bridge.h, or any future C consumer) just #includes utils/trace.c
+// without the define and gets the declarations only — the linker
+// resolves the extern functions back to this TU's copy.
+#define TRACE_IMPLEMENTATION
+#include "utils/trace.c"
 #include "tensor.c"      // struct tensor + ops (incl. neon.c + chunked.c)
 #include "slm.h"         // struct slm_ctrl + public API types
 #include "gguf.c"        // GGUF v3 reader
@@ -178,7 +186,7 @@ static int32_t slm_resolve_tensor(const struct gguf * g, const char * name,
     int32_t r = 0;
     if (t == NULL) {
         if (required) {
-            fprintf(stderr, "llm: missing required tensor: %s\n", name);
+            trace("missing required tensor: %s\n", name);
             r = -1;
         }
     } else {
@@ -242,8 +250,7 @@ static struct tensor * matmul_dispatch(const struct slm_tensor * w,
                                        out_f, k, x);
             break;
         default:
-            fprintf(stderr, "llm: matmul: unsupported weight type %d\n",
-                    w->type);
+            trace("matmul: unsupported weight type %d\n", w->type);
             abort();
     }
     return r;
@@ -1287,14 +1294,6 @@ const char * slm_ctx_message(const struct slm_ctx * c, int32_t i) {
     return out;
 }
 
-// File-internal: append a single int32_t to ctx->ids.
-__attribute__((unused))
-static void slm_ctx_ids_put(struct slm_ctx * c, int32_t v) {
-    arr_grow((struct arr *)&c->ids, sizeof(int32_t), c->ids.count + 1);
-    c->ids.data[c->ids.count++] = v;
-}
-
-// File-internal: append a buffer of ids.
 __attribute__((unused))
 static void slm_ctx_ids_append(struct slm_ctx * c,
                                const int32_t * src, size_t n) {

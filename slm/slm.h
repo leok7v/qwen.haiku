@@ -318,6 +318,27 @@ char * slm_chat_format(const struct slm_chat_message * messages,
                        int                              add_generation_prompt,
                        int                              enable_thinking);
 
+// ---------------------------------------------------------------------------
+// Self-test battery
+// ---------------------------------------------------------------------------
+
+// Run the C self-tests in sequence:
+//   qwen_self_test       — synthetic forward pass (data-flow sanity)
+//   chunked_self_test    — chunked vs autoregressive SSM parity
+//   jinja_self_test      — jinja template fixtures
+//   agent_parser_test    — <tool_call> parser fixtures
+//   tools_self_test      — websearch / fetch / distill (LIVE network)
+//   slm_think_test       — <think> stream-filter fixtures
+//
+// Progress and pass/fail lines are emitted via the trace ring buffer
+// (utils/trace.h) and to stderr. Returns the total count of failing
+// suites (0 = all PASS).
+//
+// Note: tools_self_test makes real DuckDuckGo HTTP requests; offline
+// or rate-limited runs will FAIL that suite. The macOS app's Debug
+// tab calls this and surfaces the failure count.
+int slm_run_all_tests(void);
+
 #ifdef __cplusplus
 }
 #endif

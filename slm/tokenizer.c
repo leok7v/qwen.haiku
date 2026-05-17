@@ -91,19 +91,20 @@ struct tokenizer_special {
 #define TOK_MAX_SPECIALS 8
 
 struct tokenizer {
-    int32_t         vocab_size;
-    struct chars *  vocab_strs;        // [vocab_size]
-    struct map      vocab_to_id;       // chars → int32 token id
-    struct map      merge_rank;        // "tokenA tokenB" → rank
-    int32_t         bos_id;
-    int32_t         eos_id;
-    int32_t         byte_to_uni[256];  // initial codepoint per raw byte
-    int32_t         uni_to_byte[1024]; // reverse map; sparse, indexed by
-                                       // codepoint mod 1024 (the GPT-2
-                                       // set is < 1024)
-    int32_t            n_specials;
+    int32_t        vocab_size;
+    struct chars * vocab_strs;        // [vocab_size]
+    struct map     vocab_to_id;       // chars → int32 token id
+    struct map     merge_rank;        // "tokenA tokenB" → rank
+    int32_t        bos_id;
+    int32_t        eos_id;
+    int32_t        byte_to_uni[256];  // initial codepoint per raw byte
+    int32_t        uni_to_byte[1024]; // reverse map; see footnote
+    int32_t        n_specials;
     struct tokenizer_special specials[TOK_MAX_SPECIALS];
 };
+
+// footnote: .uni_to_byte reverse map; sparse, indexed by
+// codepoint mod 1024 (the GPT-2 set is < 1024)
 
 // GPT-2's bytes_to_unicode table, expressed as direct codepoints.
 // Reference: huggingface/tokenizers's gpt2 byte_level pre-tokenizer.
@@ -221,7 +222,7 @@ static int32_t tokenizer_load(struct tokenizer * t, const struct gguf * g,
     const struct gguf_kv * tk = gguf_find_kv(g, "tokenizer.ggml.tokens");
     if (!tk || tk->v.type != GGUF_VT_ARRAY
             || tk->v.arr_type != GGUF_VT_STR) {
-        fprintf(stderr, "tok: missing tokenizer.ggml.tokens (str array)\n");
+        trace("missing tokenizer.ggml.tokens (str array)\n");
         return -1;
     }
     t->vocab_strs = (struct chars *)oom(
@@ -246,8 +247,8 @@ static int32_t tokenizer_load(struct tokenizer * t, const struct gguf * g,
             cc += n;
         }
     } else {
-        fprintf(stderr, "tok: warning: no tokenizer.ggml.merges (BPE will\n"
-                        "     fall back to byte-token-only encoding)\n");
+        trace("warning: no tokenizer.ggml.merges — BPE falls back to"
+              " byte-token-only encoding\n");
     }
     // Known chat-framing specials (Qwen3 vocab). Looked up in the
     // vocab map; populated only when present, so non-chat GGUFs are
@@ -372,8 +373,7 @@ static int32_t tokenizer_encode_bpe(const struct tokenizer * t,
             if (id < 0) {
                 // Unknown sub-token. Should never happen for
                 // byte-level BPE: every single byte is a known token.
-                fprintf(stderr, "tok: unknown sub-token (len=%zu)\n",
-                        toks[i].count);
+                trace("unknown sub-token (len=%zu)\n", toks[i].count);
             } else {
                 out_ids[n_out++] = id;
             }
@@ -393,6 +393,7 @@ static int32_t tokenizer_encode_bpe(const struct tokenizer * t,
 // Without the outer scan a marker like `<|im_start|>` is split into
 // six byte pieces, the model sees garbled framing instead of its
 // trained chat envelope, and quality collapses.
+
 __attribute__((unused))
 static int32_t tokenizer_encode(const struct tokenizer * t,
                           const char * text,
@@ -431,6 +432,7 @@ static int32_t tokenizer_encode(const struct tokenizer * t,
 
 // Decode: token id -> raw UTF-8 bytes appended to `out`. Reverses the
 // byte-level remap.
+
 __attribute__((unused))
 static void tokenizer_decode_one(const struct tokenizer * t,
                            int32_t id, struct chars * out) {

@@ -59,6 +59,11 @@
 // its CHUNK_SIZE × CHUNK_SIZE scratch allocations).
 #include "utils/maps.c"
 
+// trace() declarations — model.c (further down) supplies the
+// implementation via #define TRACE_IMPLEMENTATION. We need the
+// declarations now because gguf.c (included below) uses trace().
+#include "utils/trace.c"
+
 #include "tensor.c"
 #include "slm.h"
 
@@ -680,7 +685,6 @@ static int slm_think_test_case(const char * name,
     return failed;
 }
 
-__attribute__((unused))
 static int32_t slm_think_test(void) {
     int failures = 0;
     {
@@ -963,6 +967,31 @@ int slm_generate(struct slm_ctx * c,
     }
     free(cur_ids);
     return total_gen;
+}
+
+// ---------------------------------------------------------------------------
+// Self-test battery — public entry point. Lives outside the LLM_CLI
+// gate so Swift / library consumers (Debug tab "Run Tests" button)
+// can call it. Each test function logs its progress via stderr + the
+// trace ring; we just sum up the failure counts and return.
+// ---------------------------------------------------------------------------
+int slm_run_all_tests(void) {
+    trace("running C self-test battery\n");
+    tools_global_init();
+    int failures = 0;
+    failures += (qwen_self_test()     != 0) ? 1 : 0;
+    failures += (chunked_self_test()  != 0) ? 1 : 0;
+    failures += (jinja_self_test()    != 0) ? 1 : 0;
+    failures += (agent_parser_test()  != 0) ? 1 : 0;
+    failures += (tools_self_test()    != 0) ? 1 : 0;
+    failures += (slm_think_test()     != 0) ? 1 : 0;
+    if (failures == 0) {
+        trace("self-test battery: PASS (6 suites)\n");
+    } else {
+        trace("self-test battery: %d / 6 suites FAILED\n", failures);
+    }
+    tools_global_cleanup();
+    return failures;
 }
 
 #ifdef LLM_CLI
@@ -1511,6 +1540,7 @@ int main(int argc, char ** argv) {
         CLI_ASK             = 11,
         CLI_THINK_TEST      = 12,
         CLI_BENCH           = 13,
+        CLI_ALL_TESTS       = 14,
     };
     enum cli_mode mode = CLI_HELP;
     const char * prompt         = "Hello, my name is";
@@ -1560,6 +1590,8 @@ int main(int argc, char ** argv) {
             mode = CLI_THINK_TEST;
         } else if (strcmp(argv[i], "--bench") == 0) {
             mode = CLI_BENCH;
+        } else if (strcmp(argv[i], "--all-tests") == 0) {
+            mode = CLI_ALL_TESTS;
         } else if (strcmp(argv[i], "--ask") == 0 && i + 1 < argc) {
             mode = CLI_ASK;
             if (argv[i + 1][0] != '-') { prompt = argv[++i]; }
@@ -1683,9 +1715,13 @@ int main(int argc, char ** argv) {
         rc = slm_think_test();
     } else if (mode == CLI_BENCH) {
         rc = run_bench(dump_layer, trace_tokens);
+    } else if (mode == CLI_ALL_TESTS) {
+        rc = slm_run_all_tests();
     } else {
         printf("usage (set QWEN_GGUF=/path/to/model.gguf to override default):\n"
                "  slm --self-test\n"
+               "  slm --all-tests          (qwen_self_test + chunked +\n"
+               "                            jinja + agent_parser + think)\n"
                "  slm --bench\n"
                "  slm --single \"prompt\" [--max-new N] [flags]\n"
                "  slm --repl [--max-new N] [flags]\n"

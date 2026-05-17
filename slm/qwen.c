@@ -73,8 +73,7 @@ static int32_t slm_load_config(const struct gguf * g, struct slm_config * c) {
             // architectural notes; SSM block math is reverse-
             // engineered from tensor shapes/names and is marked
             // "PROBABLY" where uncertain.
-            fprintf(stderr,
-                "llm: qwen35 hybrid (Mamba-2/DeltaNet + attention)."
+            trace("llm: qwen35 hybrid (Mamba-2/DeltaNet + attention)."
                 " SSM math is best-guess.\n");
         } else if (n == 5 && memcmp(s, "qwen2", 5) == 0) {
             prefix = "qwen2";
@@ -1011,6 +1010,7 @@ static struct tensor * slm_forward_step(struct slm_ctx * c,
 // Returns logits for the LAST token (shape [vocab_size, 1]). Earlier
 // tokens' logits are discarded (we only need them for prefill
 // state-building; the first sample-able token is pos_start + n - 1).
+
 __attribute__((unused))
 static struct tensor * slm_forward_batch(struct slm_ctx * c,
                                          const int32_t * tok_ids,
@@ -1190,7 +1190,6 @@ static void autoregressive_ref(int n, int k_hd, int v_hd,
     }
 }
 
-__attribute__((unused))
 static int32_t chunked_self_test(void) {
     enum { k_hd = CHUNKED_TEST_KHD, v_hd = CHUNKED_TEST_VHD,
            N   = CHUNKED_TEST_NTOK };
@@ -1340,7 +1339,7 @@ static int32_t chunked_self_test(void) {
 // Lives here next to the forward pass it exercises; `#include`-d into
 // slm.c as part of the single-TU build, and invoked from slm.c's CLI
 // dispatch via `--self-test`.
-__attribute__((unused))
+
 static int32_t qwen_self_test(void) {
     // Tiny config: 2 layers, hidden=64, heads=4, head_dim=16, ffn=128,
     // vocab=256. Just enough to exercise every kernel.

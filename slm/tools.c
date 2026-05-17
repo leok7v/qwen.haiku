@@ -107,24 +107,24 @@ static size_t tools_curl_write(void * ptr, size_t size, size_t nmemb,
 
 // One-shot libcurl global init / cleanup. Idempotent — callers can
 // invoke before every tool call without worrying about pairing.
-static int    g_tools_curl_initialized = 0;
+static bool g_tools_curl_initialized;
 
 static void tools_global_init(void) {
     if (!g_tools_curl_initialized) {
         curl_global_init(CURL_GLOBAL_DEFAULT);
-        g_tools_curl_initialized = 1;
+        g_tools_curl_initialized = true;
     }
 }
 
-__attribute__((unused))
 static void tools_global_cleanup(void) {
     if (g_tools_curl_initialized) {
         curl_global_cleanup();
-        g_tools_curl_initialized = 0;
+        g_tools_curl_initialized = false;
     }
 }
 
 // URL-encode `q` into `out`. RFC 3986 unreserved set only.
+
 static void tools_url_encode(const char * q, struct chars * out) {
     const char * p = q;
     while (*p != '\0') {
@@ -150,6 +150,7 @@ static void tools_url_encode(const char * q, struct chars * out) {
 // consumed from `s` (so caller advances `i += adv`), 0 if not an
 // entity. Recognises &amp; &lt; &gt; &quot; &apos; &nbsp; and
 // numeric &#NNN; / &#xHH;.
+
 static size_t tools_decode_entity(const char * s, size_t i, size_t n,
                                   struct chars * out) {
     size_t adv = 0;
@@ -410,8 +411,8 @@ static int tools_http_get(const char * url, long timeout_ms,
             rc = 0;
             curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, status);
         } else {
-            fprintf(stderr, "tools_http_get: curl_easy_perform: %s\n",
-                    errbuf[0] != '\0' ? errbuf : curl_easy_strerror(cc));
+            trace("http_get: curl_easy_perform: %s\n",
+                  errbuf[0] != '\0' ? errbuf : curl_easy_strerror(cc));
         }
         curl_slist_free_all(hdrs);
         curl_easy_cleanup(h);
@@ -658,7 +659,7 @@ static void tools_distill(const char * html, size_t n,
 // trivia query that should find substantive snippets, and
 // "bitcoin price today" exercises a fresh-data query the model
 // CAN'T answer from training alone.
-__attribute__((unused))
+
 static int32_t tools_self_test(void) {
     tools_global_init();
     int failures = 0;
@@ -779,9 +780,8 @@ static void tools_result_free(struct tool_result * r) {
     }
 }
 
-__attribute__((unused))
+
 static void tools_global_init(void)    { /* no-op */ }
-__attribute__((unused))
 static void tools_global_cleanup(void) { /* no-op */ }
 
 static void tools_websearch(const char * query, int max_results,
@@ -811,7 +811,6 @@ static void tools_distill(const char * html, size_t n,
     out->status = 0;
 }
 
-__attribute__((unused))
 static int32_t tools_self_test(void) {
     printf("tools-test: SKIP (built with -DLLM_NO_TOOLS)\n");
     return 0;

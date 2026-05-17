@@ -35,6 +35,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Disable AppKit's system-wide window tabbing — we don't
+        // support multiple chat tabs at the OS level (each window
+        // would have its own SLMViewModel, KV cache, etc., which is
+        // confusing). This removes "View > Show Tab Bar" and the
+        // auto-generated "+ tab" toolbar button.
+        NSWindow.allowsAutomaticWindowTabbing = false
+    }
+
 }
 #endif
 
@@ -49,8 +58,10 @@ struct App: SwiftUI.App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .frame(minWidth: 600, minHeight: 540)
         }
         #if os(macOS)
+        .defaultSize(width: 760, height: 640)
         .commands {
             CommandGroup(replacing: .newItem) { }
         }
@@ -100,6 +111,11 @@ final class SLMViewModel {
     nonisolated(unsafe) private var stopRequested = false
 
     func checkCache() {
+        // Idempotent — fires once on first appearance. Subsequent
+        // SwiftUI .task / .onAppear re-fires (e.g. when a tab is
+        // unmounted and remounted) hit this guard and bail without
+        // re-mmap'ing the GGUF or re-allocating the KV cache.
+        guard state == .idle else { return }
         do {
             let dl = try Downloader()
             self.downloader = dl
@@ -335,6 +351,12 @@ final class SLMViewModel {
 /// UISwitch is too wide for a three-toggle row on phone width, and
 /// `.checkbox` is macOS-only. This renders the same on both: a
 /// monospaced caption inside a capsule whose tint shifts when on.
+///
+/// Single-line label with tail truncation so a "Debug" / "Tools" /
+/// "Think" label never wraps to a second line on a tight layout —
+/// the bug-screenshot showed "De-\nbug" and "Too-\nls" stacks when
+/// the chip was squeezed by the system-prompt textfield in the same
+/// HStack.
 struct ChipToggle: View {
     let title: String
     @Binding var isOn: Bool
@@ -348,6 +370,9 @@ struct ChipToggle: View {
         } label: {
             Text(title)
                 .font(.caption.monospaced())
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .fixedSize(horizontal: true, vertical: false)
                 .padding(.horizontal, 10)
                 .padding(.vertical,    5)
                 .background(
@@ -368,9 +393,38 @@ struct ChipToggle: View {
     }
 }
 
+/// Top-level shell: TabView wrapping the chat experience and the
+/// Debug pane. Both SLMViewModel and TraceLog live here so their
+/// lifetime spans the whole app session. If the vm lived on
+/// ChatView, switching to the Debug tab and back would unmount and
+/// remount ChatView, destroy the @State vm, and trigger a fresh
+/// GGUF mmap + KV-cache realloc on every tab switch. Hoisting the
+/// vm one level up keeps the chat session alive across tab flips.
 struct ContentView: View {
 
-    @State private var vm    = SLMViewModel()
+    @State private var vm       = SLMViewModel()
+    @State private var traceLog = TraceLog()
+
+    var body: some View {
+        TabView {
+            ChatView(vm: vm)
+                .tabItem { Label("Chat", systemImage: "bubble.left") }
+            DebugView(log: traceLog)
+                .tabItem { Label("Debug", systemImage: "ant") }
+        }
+        .onAppear {
+            TraceBridge.shared.attach(traceLog)
+            TraceBridge.shared.subscribeOnce()
+        }
+    }
+
+}
+
+/// Chat experience. The vm is owned by ContentView and passed in
+/// here as a @Bindable so any tab cycling doesn't reset its state.
+struct ChatView: View {
+
+    @Bindable var vm: SLMViewModel
     @State private var input: String = ""
     @State private var showSystem    = false
 
@@ -389,9 +443,14 @@ struct ContentView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
             Divider()
-            systemBar
+            systemRow
                 .padding(.horizontal, 16)
-                .padding(.vertical, 8)
+                .padding(.top,    8)
+                .padding(.bottom, 4)
+            toggleRow
+                .padding(.horizontal, 16)
+                .padding(.top,    4)
+                .padding(.bottom, 8)
             Divider()
             if case .needsDownload(let size) = vm.state {
                 downloadPrompt(size: size)
@@ -409,10 +468,28 @@ struct ContentView: View {
                 .padding(.vertical, 8)
         }
         .task { vm.checkCache() }
+        .toolbar {
+            // Top-right of the window title bar, alongside the
+            // Chat|Debug tab toggle. Same semantic the in-bar "Clear"
+            // button used to have: drop messages, recreate the C
+            // ctx (fresh KV + SSM state), re-prefill the system
+            // block. NOT a new window.
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    vm.clearChat()
+                } label: {
+                    Label("New chat", systemImage: "plus")
+                }
+                .disabled(vm.messages.isEmpty || vm.state == .generating)
+            }
+        }
     }
 
+    // Row 1: system-prompt label + textfield/preview + edit button.
+    // Separated from the toggle row below so a long system prompt
+    // doesn't squeeze the chips into ugly two-line wraps.
     @ViewBuilder
-    private var systemBar: some View {
+    private var systemRow: some View {
         HStack(alignment: .top, spacing: 8) {
             Text("system")
                 .font(.caption.monospaced())
@@ -437,17 +514,20 @@ struct ContentView: View {
             Button(showSystem ? "done" : "edit") { showSystem.toggle() }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-            // iOS UISwitch toggles eat way too much horizontal space
-            // for a three-toggle row on phone width; on macOS the
-            // .checkbox style is the right one but it's iOS-
-            // unavailable. ChipToggle below renders a compact tap-
-            // able capsule on both platforms — same width budget on
-            // iPhone as a `Text("Tools")`.
+        }
+    }
+
+    // Row 2: tools / think / debug toggle chips. Their own row so they
+    // get a full-width budget and the labels never wrap.
+    @ViewBuilder
+    private var toggleRow: some View {
+        HStack(spacing: 8) {
             ChipToggle("Tools", isOn: $vm.tools)
                 .disabled(vm.state == .generating)
             ChipToggle("Think", isOn: $vm.think)
                 .disabled(vm.state == .generating)
             ChipToggle("Debug", isOn: $vm.debug)
+            Spacer()
         }
     }
 
@@ -553,9 +633,9 @@ struct ContentView: View {
                               input.trimmingCharacters(in: .whitespacesAndNewlines)
                                    .isEmpty)
             }
-            Button("Clear") { vm.clearChat() }
-                .buttonStyle(.bordered)
-                .disabled(vm.messages.isEmpty || vm.state == .generating)
+            // "New chat" lives in the toolbar (the system-provided
+            // "+" button at the top-right) — fires the .newDocument
+            // command we expose below. No duplicate in-bar button.
         }
     }
 

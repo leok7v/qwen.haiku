@@ -25,6 +25,7 @@
 				tensor.c,
 				tokenizer.c,
 				tools.c,
+				utils/trace.c,
 			);
 			target = B3F4AAAA2F904FAC00000006 /* QwenHaiku */;
 		};

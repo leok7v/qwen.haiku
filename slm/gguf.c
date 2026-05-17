@@ -163,7 +163,7 @@ static size_t gguf_value_skip(const uint8_t * b, size_t c, uint32_t type) {
             break;
         }
         default:
-            fprintf(stderr, "gguf: unknown value type %u\n", type);
+            trace("unknown value type %u\n", type);
             abort();
     }
     return end;
@@ -174,18 +174,18 @@ static int gguf_open(struct gguf * g, const char * path) {
     g->alignment = 32;
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "gguf: open(%s): %s\n", path, strerror(errno));
+        trace("open(%s): %s\n", path, strerror(errno));
         return -1;
     }
     struct stat st;
     if (fstat(fd, &st) != 0) {
-        fprintf(stderr, "gguf: fstat: %s\n", strerror(errno));
+        trace("fstat: %s\n", strerror(errno));
         close(fd);
         return -1;
     }
     void * m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (m == MAP_FAILED) {
-        fprintf(stderr, "gguf: mmap: %s\n", strerror(errno));
+        trace("mmap: %s\n", strerror(errno));
         close(fd);
         return -1;
     }
@@ -195,14 +195,14 @@ static int gguf_open(struct gguf * g, const char * path) {
     size_t c = 0;
     uint32_t magic = gr_u32(g->base, &c);
     if (magic != GGUF_MAGIC) {
-        fprintf(stderr, "gguf: bad magic %08x\n", magic);
+        trace("bad magic %08x\n", magic);
         gguf_close(g);
         return -1;
     }
     uint32_t ver = gr_u32(g->base, &c);
     if (ver != GGUF_VERSION) {
-        fprintf(stderr, "gguf: version %u not supported (need %u)\n",
-                ver, GGUF_VERSION);
+        trace("version %u not supported (need %u)\n",
+              ver, GGUF_VERSION);
         gguf_close(g);
         return -1;
     }

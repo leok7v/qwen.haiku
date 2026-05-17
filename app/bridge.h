@@ -13,4 +13,10 @@
 
 #include "slm.h"
 
+// trace.c is single-file (stb-style): declarations always visible,
+// implementation gated by TRACE_IMPLEMENTATION (defined exactly
+// once in model.c). Here we just pull in the declarations so Swift
+// can see trace_subscribe / trace_observer / trace_entry.
+#include "../slm/utils/trace.c"
+
 #endif // BRIDGE_H
