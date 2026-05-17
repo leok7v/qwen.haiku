@@ -629,9 +629,8 @@ static char * agent_run(struct slm_model * model,
             tokenizer_encode(&ctx->model->tok, prompt, &ids);
             struct chars reply = {0};
             if (print_trace) {
-                fprintf(stderr,
-                        "agent: iter %d/%d prompt_tokens=%zu\n",
-                        iter, max_iters, ids.count);
+                trace("agent: iter %d/%d prompt_tokens=%zu\n",
+                      iter, max_iters, ids.count);
             }
             // Use slm_generate_raw directly (internal to TU) with
             // the slm_split_trampoline so tool-call markers are
@@ -668,10 +667,9 @@ static char * agent_run(struct slm_model * model,
             int n_calls =
                 agent_parse_tool_calls(reply.data, calls, 8);
             if (print_trace) {
-                fprintf(stderr,
-                        "agent: iter %d produced %d tool_call(s),"
-                        " %zu bytes of output\n",
-                        iter, n_calls, reply.count);
+                trace("agent: iter %d produced %d tool_call(s),"
+                      " %zu bytes of output\n",
+                      iter, n_calls, reply.count);
             }
             if (n_calls == 0) {
                 // No tool calls - this is the final answer. The
@@ -697,16 +695,23 @@ static char * agent_run(struct slm_model * model,
                 for (int c = 0; c < n_calls && n_msgs < MAX_MSGS; c++) {
                     struct tool_result r = {0};
                     if (print_trace) {
-                        fprintf(stderr,
-                                "agent: dispatching %s(",
-                                calls[c].name);
+                        // Assemble the full "name(p1=v1, p2=v2)" line
+                        // into one buffer so it lands as one trace
+                        // entry (and one stderr line) rather than four
+                        // timestamp-prefixed fragments.
+                        struct chars line = {0};
+                        chars_printf(&line, "agent: dispatching %s(",
+                                     calls[c].name);
                         for (int k = 0; k < calls[c].n_params; k++) {
-                            fprintf(stderr, "%s%s=%.80s",
-                                    k > 0 ? ", " : "",
-                                    calls[c].params[k].name,
-                                    calls[c].params[k].value);
+                            chars_printf(&line, "%s%s=%.80s",
+                                         k > 0 ? ", " : "",
+                                         calls[c].params[k].name,
+                                         calls[c].params[k].value);
                         }
-                        fprintf(stderr, ")\n");
+                        chars_puts(&line, ")\n");
+                        chars_put(&line, "", 0);
+                        trace("%s", line.data != NULL ? line.data : "");
+                        chars_free(&line);
                     }
                     agent_dispatch(&calls[c], &r);
                     const char * payload = r.ok && r.body != NULL
@@ -716,11 +721,8 @@ static char * agent_run(struct slm_model * model,
                                              : "(no result)");
                     owned[n_owned] = strdup(payload);
                     if (print_trace) {
-                        fprintf(stderr,
-                                "agent: tool returned %s,"
-                                " %zu bytes\n",
-                                r.ok ? "OK" : "ERROR",
-                                strlen(payload));
+                        trace("agent: tool returned %s, %zu bytes\n",
+                              r.ok ? "OK" : "ERROR", strlen(payload));
                     }
                     msgs[n_msgs].role    = JINJA_ROLE_TOOL;
                     msgs[n_msgs].content = owned[n_owned];

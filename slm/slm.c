@@ -921,10 +921,9 @@ int slm_generate(struct slm_ctx * c,
         box.filter.emit_visibility      = with_debug;
         box.cb = cb;
         int budget = max_new - total_gen;
-        if (getenv("LLM_AGENT_TRACE") != NULL) {
-            fprintf(stderr,
-                    "[agent] iter=%d pos=%d prefill_n=%zu budget=%d\n",
-                    iter, c->pos, cur.count, budget);
+        if (debug_lv >= 3) {
+            trace("agent: iter=%d pos=%d prefill_n=%zu budget=%d\n",
+                  iter, c->pos, cur.count, budget);
         }
         int n = slm_generate_raw(c, cur.data, (int32_t)cur.count,
                                  budget, min_new,

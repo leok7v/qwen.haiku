@@ -619,7 +619,7 @@ static void slm_trace_open(void) {
         if (p != NULL && p[0] != '\0') {
             g_qh_trace_fp = fopen(p, "w");
             if (g_qh_trace_fp != NULL) {
-                fprintf(stderr, "qwen_trace: writing JSONL to %s\n", p);
+                trace("qwen_trace: writing JSONL to %s\n", p);
             }
         }
     }

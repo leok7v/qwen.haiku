@@ -88,6 +88,7 @@ struct tokenizer_special {
     int32_t      len;
     int32_t      id;
 };
+
 #define TOK_MAX_SPECIALS 8
 
 struct tokenizer {
@@ -235,7 +236,6 @@ static int32_t tokenizer_load(struct tokenizer * t, const struct gguf * g,
         s2i_put(&t->vocab_to_id,
                 t->vocab_strs[i].data, t->vocab_strs[i].count, (int32_t)i);
     }
-
     const struct gguf_kv * mg = gguf_find_kv(g, "tokenizer.ggml.merges");
     if (mg && mg->v.type == GGUF_VT_ARRAY
            && mg->v.arr_type == GGUF_VT_STR) {
@@ -313,6 +313,7 @@ static int32_t tokenizer_match_special(const struct tokenizer * t,
 // byte-level-remapped and greedy-BPE-merged. Token ids are appended
 // to `out`, which the caller initialises as `(struct slm_tokens){0}`
 // (or reuses across calls; this function never resets count).
+
 static void tokenizer_encode_bpe(const struct tokenizer * t,
                                  const char * text, size_t tlen,
                                  struct slm_tokens * out) {
@@ -368,7 +369,6 @@ static void tokenizer_encode_bpe(const struct tokenizer * t,
                 changed = 1;
             }
         }
-
         // Emit ids.
         for (int32_t i = 0; i < n_toks; i++) {
             int32_t id = s2i_get(&t->vocab_to_id,
