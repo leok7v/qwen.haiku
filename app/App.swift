@@ -530,11 +530,12 @@ struct ChatView: View {
         }
     }
 
-    // Row 2: tools / think chips + debug-level stepper. Their own
-    // row so they get a full-width budget and the labels never wrap.
-    // Debug is a 0..9 stepper (replacing the on/off chip) so the user
-    // can gradually open up the trace fire-hose: 1 = events only,
-    // 9 = raw HTML bodies + full distill output.
+    // Row 2: tools / think chips + debug-level slider. Their own row
+    // so they get a full-width budget and the labels never wrap.
+    // Debug is a 10-notch (0..9) horizontal slider so the user can
+    // gradually open up the trace fire-hose: 1 = events only, 9 =
+    // raw HTML bodies + full distill output. step:1 snaps to integer
+    // notches without needing custom tick-mark drawing.
     @ViewBuilder
     private var toggleRow: some View {
         HStack(spacing: 8) {
@@ -542,15 +543,19 @@ struct ChatView: View {
                 .disabled(vm.state == .generating)
             ChipToggle("Think", isOn: $vm.think)
                 .disabled(vm.state == .generating)
-            Stepper(value: $vm.debug, in: Int32(0) ... Int32(9)) {
-                Text("Debug \(vm.debug)")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .fixedSize()
-            }
-            .controlSize(.small)
-            .fixedSize()
+            Text("Debug")
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+            Slider(value: Binding(
+                       get: { Double(vm.debug) },
+                       set: { vm.debug = Int32($0.rounded()) }),
+                   in: 0 ... 9, step: 1)
+                .controlSize(.small)
+                .frame(width: 160)
+            Text("\(vm.debug)")
+                .font(.caption.monospaced().weight(.semibold))
+                .foregroundStyle(.primary)
+                .frame(width: 14, alignment: .leading)
             Spacer()
         }
     }
