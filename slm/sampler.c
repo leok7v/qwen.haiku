@@ -127,6 +127,8 @@ static void topk_sort_desc(int32_t * idx, float * val, int32_t filled) {
     }
 }
 
+// slm-runtime sampler entry; qwen-test standalone build only asserts
+// forward-pass shapes (no token sampling, no rep penalty).
 __attribute__((unused))
 static int32_t sample_with(struct tensor * logits,
                            const struct slm_sampler * sp,

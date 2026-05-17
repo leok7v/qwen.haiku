@@ -390,34 +390,6 @@ static void ssm_cache_free(struct slm_ssm_cache * s) {
     free(s->conv_head);  s->conv_head  = NULL;
 }
 
-// Reset recurrent state to "fresh conversation". The KV cache is
-// overwritten by the next forward pass so it does not need
-// clearing here; only the SSM/conv recurrent buffers do.
-
-// ssm_cache_reset is not in the current architecture.
-// Reason it could come back is branched conversations
-// "save SSM snapshot, run a hypothetical, restore".
-// That needs a slm_ssm_cache_clone + slm_ssm_cache_assign, not a zero-reset.
-
-__attribute__((unused))
-static void ssm_cache_reset(struct slm_ssm_cache * s,
-                            const struct slm_config * cfg) {
-    if (s->conv_state != NULL) {
-        size_t cb = (size_t)s->n_layers * s->conv_kernel *
-                    s->n_channels * sizeof(float);
-        memset(s->conv_state, 0, cb);
-    }
-    if (s->ssm_state != NULL) {
-        size_t sb = (size_t)s->n_layers * cfg->linear_n_heads *
-                    cfg->linear_k_head_dim * cfg->linear_v_head_dim *
-                    sizeof(float);
-        memset(s->ssm_state, 0, sb);
-    }
-    if (s->conv_head != NULL) {
-        memset(s->conv_head, 0, (size_t)s->n_layers * sizeof(int32_t));
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Sampling primitives. sample_argmax for greedy; struct rng + rng_*
 // for the temperature/top-k/top-p chain in sampler.c. Defined above
@@ -612,6 +584,9 @@ static inline void slm_dump(const struct slm_ctx * c, int32_t L,
 
 static FILE * g_qh_trace_fp = NULL;
 
+// slm-runtime entry; qwen-test standalone build doesn't fopen a
+// parity-dump file (the synthetic-weights self-test has no llama.cpp
+// reference to diff against).
 __attribute__((unused))
 static void slm_trace_open(void) {
     if (g_qh_trace_fp == NULL) {
@@ -729,28 +704,26 @@ static void slm_trace_f32(const char * name, const char * op,
 // Literal names: pass a no-conversion format string:
 //   slm_trace_row("GET_ROWS", h->data, hidden_dim, "inp_embd");
 
-#define slm_trace_row(op, data, n, fmt, ...) \
-    do { \
-        if (g_qh_trace_fp != NULL) { \
-            char _trace_nm_[64]; \
-            snprintf(_trace_nm_, sizeof(_trace_nm_), (fmt), \
-                     ##__VA_ARGS__); \
-            slm_trace_f32(_trace_nm_, (op), (data), (n), 1, 1, 1); \
-        } \
+#define slm_trace_row(op, data, n, fmt, ...)                                \
+    do {                                                                    \
+        if (g_qh_trace_fp != NULL) {                                        \
+            char _trace_nm_[64];                                            \
+            snprintf(_trace_nm_, sizeof(_trace_nm_), (fmt), ##__VA_ARGS__); \
+            slm_trace_f32(_trace_nm_, (op), (data), (n), 1, 1, 1);          \
+        }                                                                   \
     } while (0)
 
 // Same shape for 2D batch tensors (dim, n_tokens) — used by the
 // chunked prefill path so byte-comparing JSONL against llama.cpp's
 // qwen-haiku reference dumper works.
-#define slm_trace_batch(op, data, dim, n_tokens, fmt, ...) \
-    do { \
-        if (g_qh_trace_fp != NULL) { \
-            char _trace_nm_[64]; \
-            snprintf(_trace_nm_, sizeof(_trace_nm_), (fmt), \
-                     ##__VA_ARGS__); \
-            slm_trace_f32(_trace_nm_, (op), (data), \
-                          (dim), (n_tokens), 1, 1); \
-        } \
+#define slm_trace_batch(op, data, dim, n_tokens, fmt, ...)                  \
+    do {                                                                    \
+        if (g_qh_trace_fp != NULL) {                                        \
+            char _trace_nm_[64];                                            \
+            snprintf(_trace_nm_, sizeof(_trace_nm_), (fmt), ##__VA_ARGS__); \
+            slm_trace_f32(_trace_nm_, (op), (data),                         \
+                          (dim), (n_tokens), 1, 1);                         \
+        }                                                                   \
     } while (0)
 
 static void slm_dump_row(const char * label, const float * data, int32_t n) {
@@ -914,7 +887,8 @@ static struct tensor * slm_forward_attn(struct slm_ctx * c,
     // mrope variant ported from ggml-cpu/ops.cpp. For plain Qwen3
     // it falls back to standard NEOX-style RoPE when sections are
     // all zero.
-    int32_t rotary_dim = c->model->cfg.rope_dim > 0 ? c->model->cfg.rope_dim : hd;
+    int32_t rotary_dim = c->model->cfg.rope_dim > 0 ?
+                         c->model->cfg.rope_dim : hd;
     int32_t use_imrope = c->model->cfg.rope_sections[0] ||
                          c->model->cfg.rope_sections[1] ||
                          c->model->cfg.rope_sections[2] ||
@@ -1071,7 +1045,8 @@ static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
     // RoPE on q [hd, n_h, n] and k [hd, n_kvh, n] starting at pos_start.
     // tensor_rope* already iterate seq axis (ne[2]) and apply
     // pos_t = pos_offset + s.
-    int32_t rotary_dim = c->model->cfg.rope_dim > 0 ? c->model->cfg.rope_dim : hd;
+    int32_t rotary_dim = c->model->cfg.rope_dim > 0 ?
+                         c->model->cfg.rope_dim : hd;
     int32_t use_imrope = c->model->cfg.rope_sections[0] ||
                          c->model->cfg.rope_sections[1] ||
                          c->model->cfg.rope_sections[2] ||
@@ -1084,8 +1059,10 @@ static struct tensor * slm_forward_attn_batch(struct slm_ctx * c,
         k_rope = tensor_rope_mrope_i(k, pos_start, c->model->cfg.rope_theta,
                                      rotary_dim, c->model->cfg.rope_sections);
     } else {
-        q_rope = tensor_rope(q, pos_start, c->model->cfg.rope_theta, rotary_dim);
-        k_rope = tensor_rope(k, pos_start, c->model->cfg.rope_theta, rotary_dim);
+        q_rope = tensor_rope(q, pos_start, c->model->cfg.rope_theta,
+                             rotary_dim);
+        k_rope = tensor_rope(k, pos_start, c->model->cfg.rope_theta,
+                             rotary_dim);
     }
     // Write the n new (K, V) rows into the KV cache.
     for (int32_t t = 0; t < n; t++) {
@@ -1420,6 +1397,8 @@ const char * slm_ctx_message(const struct slm_ctx * c, int32_t i) {
     return out;
 }
 
+// slm-runtime entry; qwen-test standalone build doesn't track an
+// append-only token history (no per-conversation ctx in self-tests).
 __attribute__((unused))
 static void slm_ctx_ids_append(struct slm_ctx * c,
                                const int32_t * src, size_t n) {

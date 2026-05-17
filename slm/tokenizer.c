@@ -399,6 +399,7 @@ static void tokenizer_encode_bpe(const struct tokenizer * t,
 // six byte pieces, the model sees garbled framing instead of its
 // trained chat envelope, and quality collapses.
 
+// slm-runtime entry; qwen-test standalone build doesn't tokenize.
 __attribute__((unused))
 static void tokenizer_encode(const struct tokenizer * t,
                              const char * text,
@@ -438,9 +439,10 @@ static void tokenizer_encode(const struct tokenizer * t,
 // Decode: token id -> raw UTF-8 bytes appended to `out`. Reverses the
 // byte-level remap.
 
+// slm-runtime entry; qwen-test standalone build doesn't decode tokens.
 __attribute__((unused))
 static void tokenizer_decode_one(const struct tokenizer * t,
-                           int32_t id, struct chars * out) {
+                                 int32_t id, struct chars * out) {
     if (id >= 0 && id < t->vocab_size) {
         const struct chars * s = &t->vocab_strs[id];
         size_t pos = 0;

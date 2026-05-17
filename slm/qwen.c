@@ -1011,6 +1011,9 @@ static struct tensor * slm_forward_step(struct slm_ctx * c,
 // tokens' logits are discarded (we only need them for prefill
 // state-building; the first sample-able token is pos_start + n - 1).
 
+// Used by slm_generate_raw when LLM_USE_FORWARD_BATCH env is set;
+// qwen-test exercises chunked SSM via autoregressive_ref + per-step
+// forward, not this batched path.
 __attribute__((unused))
 static struct tensor * slm_forward_batch(struct slm_ctx * c,
                                          const int32_t * tok_ids,

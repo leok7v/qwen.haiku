@@ -585,7 +585,7 @@ static int agent_capture_cb_fn(const struct slm_stream_callback * cb) {
 // tool_response sizes to stderr.
 //
 // Returns a heap-allocated string (caller frees).
-__attribute__((unused))
+
 static char * agent_run(struct slm_model * model,
                         const char * question,
                         const struct slm_sampler * sp, uint64_t seed,
@@ -751,7 +751,7 @@ static char * agent_run(struct slm_model * model,
 
 // Self-test for the parser only (no network, no model). The dispatch
 // + live agent loop are exercised by --ask (which IS the live test).
-__attribute__((unused))
+
 static int32_t agent_parser_test(void) {
     int failures = 0;
     const char * sample =
