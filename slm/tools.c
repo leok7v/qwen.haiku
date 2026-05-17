@@ -735,11 +735,93 @@ static void tools_distill(const char * html, size_t n,
 #define TOOLS_DISTILL_CAP 4000
 #endif
 
+// Probe a URL with a partial GET (first 4KB only via Range header)
+// to filter dead/blocked URLs before offering them to the model.
+// Partial GET, not HEAD, because some servers (a) reject HEAD with
+// 405, (b) return 200 to HEAD but the GET would be a CAPTCHA / soft-
+// block page; downloading a few KB lets us verify SOMETHING came
+// back. Reads Content-Length header back via
+// CURLINFO_CONTENT_LENGTH_DOWNLOAD_T so hits can be sorted by full-
+// body size (shortest first = usually the most direct answer; large
+// pages tend to be hub/listing/aggregator junk).
+//
+// Follows redirects (CURLOPT_FOLLOWLOCATION=1L, MAXREDIRS=5). Alive
+// requires both HTTP status in 2xx/3xx AND body bytes received.
+struct tools_probe_result {
+    bool    alive;
+    long    status;
+    int64_t content_length;       // -1 = unknown / chunked
+    size_t  bytes_received;       // capped at 4KB by Range header
+};
+
+static void tools_url_probe(const char * url, long timeout_ms,
+                            struct tools_probe_result * out) {
+    out->alive          = false;
+    out->status         = 0;
+    out->content_length = -1;
+    out->bytes_received = 0;
+    if (url != NULL && url[0] != '\0') {
+        CURL * h = curl_easy_init();
+        if (h != NULL) {
+            const struct tools_ua_slot * slot = tools_pick_ua();
+            struct chars body = {0};
+            curl_easy_setopt(h, CURLOPT_URL,               url);
+            // Range: bytes=0-4095. Servers that accept return 206
+            // Partial Content; servers that don't return 200 (most
+            // commonly) and stream the full body — we cap via
+            // tools_curl_write's TOOLS_FETCH_CAP backstop anyway.
+            curl_easy_setopt(h, CURLOPT_RANGE,             "0-4095");
+            curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION,    1L);
+            curl_easy_setopt(h, CURLOPT_MAXREDIRS,         5L);
+            curl_easy_setopt(h, CURLOPT_TIMEOUT_MS,        timeout_ms);
+            curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
+            curl_easy_setopt(h, CURLOPT_NOPROGRESS,        1L);
+            curl_easy_setopt(h, CURLOPT_USERAGENT,         slot->ua);
+            curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING,   "");
+            curl_easy_setopt(h, CURLOPT_WRITEFUNCTION,
+                             tools_curl_write);
+            curl_easy_setopt(h, CURLOPT_WRITEDATA,         &body);
+            CURLcode cc = curl_easy_perform(h);
+            if (cc == CURLE_OK) {
+                curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE,
+                                  &out->status);
+                curl_off_t cl = -1;
+                curl_easy_getinfo(h,
+                    CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
+                if (cl > 0) { out->content_length = (int64_t)cl; }
+                out->bytes_received = body.count;
+                // Accept 200/206/3xx with non-empty body. Status-only
+                // checks miss CAPTCHA-200s that have no real content,
+                // so we also require something came back.
+                out->alive = (out->status >= 200 && out->status < 400)
+                          && (body.count > 0);
+            }
+            if (g_tools_debug >= 5) {
+                trace("url_probe: %s -> HTTP %ld cl=%lld got=%zu%s\n",
+                      url, out->status,
+                      (long long)out->content_length, body.count,
+                      out->alive ? "" : " [DEAD]");
+            }
+            free(body.data);
+            curl_easy_cleanup(h);
+        }
+    }
+}
+
 // DDG search → parsed hits + formatted numbered text. No fetch. The
 // 3-phase URL-pick flow in slm_generate calls this directly so the
 // model can choose which URL to fetch from the (title, URL, snippet)
 // triples. The single-phase tools_websearch (back-compat shim) calls
 // it too, then auto-picks hits[0].
+//
+// Pipeline:
+//   1. DDG-lite GET, parse hits via tools_ddg_parse (with URL unwrap)
+//   2. HEAD-probe each URL → filter out non-2xx/3xx (bot-blocked,
+//      404, etc.) and capture Content-Length
+//   3. Sort surviving hits by Content-Length ASC (shortest = often
+//      most direct; aggregator/listing hubs sink to the bottom)
+//   4. Format the surviving hits into out->body for the URL-pick
+//      preamble.
 //
 // `hits` is an out-array of capacity `hits_cap`; populated up to N
 // entries (return value). `out->body` gets a "1. <title>\n   <url>\n
@@ -815,6 +897,54 @@ static int tools_websearch_hits(const char * query, int max_results,
                 size_t bcut = body.count > 2048 ? 2048 : body.count;
                 trace("websearch_hits: raw DDG body[0..%zu]: %.*s\n",
                       bcut, (int)bcut, body.data);
+            }
+            // Probe each URL for liveness + content-length, then sort
+            // surviving hits by content-length ascending. Insertion
+            // sort over <= TOOLS_HITS_MAX elements (typically 5-8).
+            int64_t cl[TOOLS_HITS_MAX];
+            int     order[TOOLS_HITS_MAX];
+            int     n_alive = 0;
+            for (int i = 0; i < nh; i++) {
+                struct tools_probe_result pr;
+                // 5s cap per the user's "anything that doesn't
+                // respond in 5s isn't of interest" rule.
+                tools_url_probe(hits[i].url, 5000, &pr);
+                if (pr.alive) {
+                    cl[n_alive] = (pr.content_length > 0)
+                                ? pr.content_length : INT64_MAX;
+                    order[n_alive] = i;
+                    n_alive++;
+                }
+            }
+            for (int i = 1; i < n_alive; i++) {
+                int j = i;
+                while (j > 0 && cl[j] < cl[j - 1]) {
+                    int64_t tcl = cl[j];      cl[j]    = cl[j - 1];
+                    cl[j - 1]   = tcl;
+                    int     to  = order[j];   order[j] = order[j - 1];
+                    order[j - 1] = to;
+                    j--;
+                }
+            }
+            // Reorder hits: copy alive into a temp in sorted order;
+            // free the discarded (dead) slots; copy back.
+            struct tools_search_hit tmp[TOOLS_HITS_MAX] = {0};
+            for (int i = 0; i < n_alive; i++) {
+                tmp[i] = hits[order[i]];
+                hits[order[i]].title   = NULL;
+                hits[order[i]].url     = NULL;
+                hits[order[i]].snippet = NULL;
+            }
+            for (int i = 0; i < nh; i++) {
+                free(hits[i].title);   hits[i].title   = NULL;
+                free(hits[i].url);     hits[i].url     = NULL;
+                free(hits[i].snippet); hits[i].snippet = NULL;
+            }
+            for (int i = 0; i < n_alive; i++) { hits[i] = tmp[i]; }
+            nh = n_alive;
+            if (g_tools_debug >= 1) {
+                trace("websearch_hits: %d alive (sorted by"
+                      " content-length asc)\n", nh);
             }
             struct chars result = {0};
             for (int i = 0; i < nh; i++) {
