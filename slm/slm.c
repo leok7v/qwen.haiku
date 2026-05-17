@@ -851,8 +851,23 @@ bool slm_ctx_system_prompt(struct slm_ctx * ctx,
 // slm_generate - one user-turn chat round. Frames the delta as
 // canonical Qwen3 form, tokenizes, prefills, decodes. Streams via cb.
 // Returns the number of decode tokens emitted.
+//
+// With ctrl.tools the runtime takes a snapshot of the pre-turn ctx
+// before any prefill. If the model emits a <tool_call>, we dispatch
+// it internally, ROLL BACK the ctx (KV/SSM/pos/ids), and replay the
+// turn with the curated result spliced in as preamble — so the
+// model continues its assistant reply with the search content baked
+// into in-context history instead of round-tripping through a
+// synthetic <tool_response> user turn. The 0.8B is much steadier on
+// "answer using this preamble" than on "interpret a tool_response
+// then continue".
+//
+// Cap of 2 iterations is a hard ceiling: one pass that may emit a
+// tool_call, one pass that consumes the preamble and writes the
+// final answer. `snap != NULL` doubles as the "tool round still
+// available" flag — after dispatch we free and NULL it.
 // ---------------------------------------------------------------------------
-#define SLM_GENERATE_TOOL_ITER_CAP 6
+#define SLM_GENERATE_TOOL_ITER_CAP 2
 int slm_generate(struct slm_ctx * c,
                  const char * prompt,
                  int max_new, int min_new,
@@ -863,11 +878,16 @@ int slm_generate(struct slm_ctx * c,
     bool with_tools = c->ctrl.tools;
     bool with_debug = (c->ctrl.debug > 0);
     int  total_gen  = 0;
-    // Push user prompt into messages.
+    // Push user prompt into messages — not part of the rollback set.
     const char * user_text = (prompt != NULL) ? prompt : "";
     text_puts(&c->messages, user_text);
+    // Snapshot pre-turn state. Restored if the model emits a tool_call
+    // so the second pass replays from the same conversation point but
+    // with curated tool output baked into the prompt.
+    struct slm_snapshot * snap = with_tools
+                                 ? slm_ctx_snapshot(c) : NULL;
     // Format the user turn delta and tokenize it.
-    char * delta = jinja_format_turn_delta(user_text, c->ctrl.think);
+    char *    delta   = jinja_format_turn_delta(user_text, c->ctrl.think);
     int32_t * cur_ids = NULL;
     int       cur_n   = 0;
     if (delta != NULL) {
@@ -884,7 +904,7 @@ int slm_generate(struct slm_ctx * c,
            total_gen < max_new) {
         struct slm_split_box box = {0};
         slm_think_filter_init(&box.filter);
-        box.filter.recognize_tool_calls = with_tools;
+        box.filter.recognize_tool_calls = (snap != NULL);
         box.filter.emit_visibility      = with_debug;
         box.cb = cb;
         int budget = max_new - total_gen;
@@ -903,17 +923,16 @@ int slm_generate(struct slm_ctx * c,
         free(cur_ids);
         cur_ids = NULL;
         cur_n   = 0;
-        if (with_tools && box.filter.tool_call_ready &&
+        if (snap != NULL && box.filter.tool_call_ready &&
             total_gen < max_new) {
+            // Parse + dispatch the tool synchronously.
             struct chars wrapped = {0};
-            const char * pre  = "<tool_call>";
-            const char * post = "</tool_call>";
-            chars_put(&wrapped, pre, strlen(pre));
+            chars_puts(&wrapped, "<tool_call>");
             if (box.filter.tool_call.count > 0) {
                 chars_put(&wrapped, box.filter.tool_call.data,
                           box.filter.tool_call.count);
             }
-            chars_put(&wrapped, post, strlen(post));
+            chars_puts(&wrapped, "</tool_call>");
             chars_put(&wrapped, "", 0);
             struct agent_call calls[4];
             int nc = agent_parse_tool_calls(wrapped.data, calls, 4);
@@ -932,33 +951,47 @@ int slm_generate(struct slm_ctx * c,
             }
             chars_put(&result, "", 0);
             agent_free_calls(calls, nc);
-            // Visibility chunk for tool response (debug only).
             if (result.data != NULL && with_debug) {
                 text_puts(&c->messages, result.data);
                 slm_cb_emit(cb, NULL, NULL, NULL, result.data,
                             false, 0, 0);
             }
+            // Atomic rollback: tool_call emission is wiped from KV/
+            // SSM/pos/ids. From the model's perspective the turn
+            // hasn't started yet.
+            slm_ctx_restore(c, snap);
+            slm_snapshot_free(snap);
+            snap = NULL;
+            // Replay the user delta + a preamble that continues the
+            // assistant turn with the curated result baked in. The
+            // delta ends with the assistant prefix; appending plain
+            // content tokens keeps the assistant turn open and the
+            // model picks up from there with the final answer.
             struct chars inject = {0};
-            const char * head =
-                "<|im_end|>\n<|im_start|>user\n<tool_response>\n";
-            chars_put(&inject, head, strlen(head));
-            if (result.data != NULL) {
-                chars_put(&inject, result.data, result.count);
-            }
-            const char * tail =
-                "\n</tool_response><|im_end|>\n"
-                "<|im_start|>assistant\n<think>\n\n</think>\n\n";
-            chars_put(&inject, tail, strlen(tail));
+            char * delta2 = jinja_format_turn_delta(user_text,
+                                                    c->ctrl.think);
+            if (delta2 != NULL) { chars_puts(&inject, delta2); }
+            free(delta2);
+            chars_printf(&inject,
+                "Based on a web search, here is the relevant"
+                " information:\n\n%s\n\n"
+                "Now I will answer the user's question.\n\n",
+                result.data ? result.data : "");
             chars_put(&inject, "", 0);
-            int32_t * ids = (int32_t *)oom(
-                calloc(16384, sizeof(int32_t)));
+            size_t    cap2  = inject.count + 16;
+            int32_t * ids   = (int32_t *)oom(
+                calloc(cap2, sizeof(int32_t)));
             int n_ids = tokenizer_encode(&c->model->tok, inject.data,
-                                         ids, 16384);
+                                         ids, (int32_t)cap2);
             slm_ctx_ids_append(c, ids, (size_t)n_ids);
             cur_ids = ids;
             cur_n   = n_ids;
             chars_free(&inject);
             chars_free(&result);
+            // Reset the visible-tokens counter: the aborted tool_call
+            // emission doesn't count toward max_new. The second pass
+            // gets the full budget for the actual answer.
+            total_gen = 0;
         } else {
             done = true;
         }
@@ -966,6 +999,7 @@ int slm_generate(struct slm_ctx * c,
         iter++;
     }
     free(cur_ids);
+    slm_snapshot_free(snap);
     return total_gen;
 }
 
@@ -1085,15 +1119,11 @@ static void strip_reasoning_for_history(struct chars * s) {
     s->data[kept] = '\0';
 }
 
-// Scripted multi-turn chat (-p "Q1" -p "Q2" ...). Two shapes mirror
-// run_repl / run_single:
-//   with_tools=false (default): growing-KV chat via slm_generate; one
-//     ctx, all turns appended, ctrl.tools forced OFF so the model
-//     emits content (not tool_call markers) — the original bug was
-//     that ctrl_defaults() has tools=true and the capture cb only saw
-//     .content, producing empty bubbles.
-//   with_tools=true: each -p is an independent cascade question. No
-//     conversation continuity — same shape as `--tools --repl`.
+// Scripted multi-turn chat (-p "Q1" -p "Q2" ...). One ctx, all turns
+// appended (growing-KV). ctrl.tools is set from with_tools — when on,
+// slm_generate's embedded snapshot/restore/preamble flow handles any
+// <tool_call> the model emits atomically; the caller-visible answer
+// is the post-tool-dispatch final answer for that turn.
 static int32_t run_chat(const char ** prompts, int32_t n_prompts,
                         const char * system_prompt,
                         const struct slm_sampler * sp, uint64_t seed,
@@ -1101,26 +1131,12 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
                         int32_t dump_layer, int32_t verbose,
                         bool with_tools, bool with_think,
                         bool trace_tokens) {
+    (void)verbose;
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
     int32_t r = 0;
     if (!slm_model_loaded(m)) {
         fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
         r = 1;
-    } else if (with_tools) {
-        struct print_cb_box pbox = {0};
-        pbox.base.callback = repl_cb_fn;
-        pbox.verbose       = verbose;
-        for (int32_t t = 0; t < n_prompts && r == 0; t++) {
-            printf("\n--- turn %d/%d ---\n",
-                   (int)(t + 1), (int)n_prompts);
-            printf("[user] %s\n[assistant] ", prompts[t]);
-            fflush(stdout);
-            char * answer = agent_cascade_run(m, prompts[t], sp, seed,
-                                              max_new, verbose,
-                                              &pbox.base);
-            printf("\n");
-            free(answer);
-        }
     } else {
         struct slm_ctx * c = slm_ctx_create(m);
         if (c == NULL) {
@@ -1128,7 +1144,7 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
             r = 1;
         } else {
             const char * sys = (system_prompt != NULL) ? system_prompt : "";
-            slm_ctx_ctrl(c)->tools        = false;
+            slm_ctx_ctrl(c)->tools        = with_tools;
             slm_ctx_ctrl(c)->think        = with_think;
             slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
             slm_ctx_ctrl(c)->dump_layer   = dump_layer;
@@ -1324,17 +1340,6 @@ static int32_t run_single(const char * prompt, int32_t max_new,
     if (!slm_model_loaded(m)) {
         fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
         r = 1;
-    } else if (with_tools) {
-        struct print_cb_box pbox = {0};
-        pbox.base.callback = repl_cb_fn;
-        pbox.verbose       = verbose;
-        printf("[user] %s\n", prompt);
-        fflush(stdout);
-        char * answer = agent_cascade_run(m, prompt, sp, seed,
-                                          max_new, verbose,
-                                          &pbox.base);
-        printf("\n");
-        free(answer);
     } else {
         struct slm_ctx * c = slm_ctx_create(m);
         if (c == NULL) {
@@ -1357,7 +1362,7 @@ static int32_t run_single(const char * prompt, int32_t max_new,
                    (int)c->model->cfg.rope_sections[1],
                    (int)c->model->cfg.rope_sections[2],
                    (int)c->model->cfg.rope_sections[3]);
-            slm_ctx_ctrl(c)->tools        = false;
+            slm_ctx_ctrl(c)->tools        = with_tools;
             slm_ctx_ctrl(c)->think        = with_think;
             slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
             slm_ctx_ctrl(c)->dump_layer   = dump_layer;
@@ -1437,13 +1442,11 @@ static int32_t run_bench(int32_t dump_layer, bool trace_tokens) {
     return r;
 }
 
-// REPL. Two shapes:
-//   tools=false (default): growing-KV chat via slm_generate. Sys
-//     prompt = "You are a helpful assistant." Sampler as passed in.
-//   tools=true: each turn fires a fresh decomposed cascade (Router →
-//     Eval → Synth). No conversation continuity by design — the
-//     cascade is question-answering, not chat. Sampler is auto-clamped
-//     before calling here (T=0.0, top_p=1.0, rep=1.0).
+// REPL: growing-KV chat via slm_generate. Sys prompt = "You are a
+// helpful assistant." With ctrl.tools the model can emit a single
+// <tool_call> per turn that slm_generate dispatches internally
+// (snapshot/restore/preamble) before writing the visible answer —
+// from the user's perspective each turn is just "ask, get reply".
 static int32_t run_repl(const struct slm_sampler * sp,
                         uint64_t seed, int32_t max_new, int32_t min_new,
                         int32_t dump_layer, int32_t verbose,
@@ -1454,40 +1457,13 @@ static int32_t run_repl(const struct slm_sampler * sp,
     if (!slm_model_loaded(m)) {
         fprintf(stderr, "slm: load failed: %s\n", slm_model_error(m));
         r = 1;
-    } else if (with_tools) {
-        struct print_cb_box pbox = {0};
-        pbox.base.callback = repl_cb_fn;
-        pbox.verbose       = verbose;
-        char line[4096];
-        printf("repl: --tools mode (Router → Eval → Synth cascade)."
-               " Each turn is independent.\n"
-               "type a question, Enter to send, Ctrl-D to exit.\n> ");
-        fflush(stdout);
-        while (fgets(line, sizeof(line), stdin) != NULL) {
-            size_t n = strlen(line);
-            while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) {
-                line[--n] = '\0';
-            }
-            if (n > 0) {
-                char * answer = agent_cascade_run(m, line, sp, seed,
-                                                  max_new, verbose,
-                                                  &pbox.base);
-                // The synthesizer already streamed via pbox; the
-                // returned string is the fully-concatenated answer.
-                // Print a trailing newline + prompt; the answer text
-                // itself is already on stdout from the stream.
-                free(answer);
-                printf("\n\n> ");
-                fflush(stdout);
-            }
-        }
     } else {
         struct slm_ctx * c = slm_ctx_create(m);
         if (c == NULL) {
             fprintf(stderr, "slm: ctx create failed\n");
             r = 1;
         } else {
-            slm_ctx_ctrl(c)->tools        = false;
+            slm_ctx_ctrl(c)->tools        = with_tools;
             slm_ctx_ctrl(c)->think        = with_think;
             slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
             slm_ctx_ctrl(c)->dump_layer   = dump_layer;
@@ -1736,8 +1712,8 @@ int main(int argc, char ** argv) {
                "  slm --print-chat-template\n"
                "\n"
                "behavior flags (apply to --single / --repl):\n"
-               "  --tools / --no-tools              enable web-research"
-                       " cascade (auto-clamps T=0, top_p=1, rep=1)\n"
+               "  --tools / --no-tools              enable atomic"
+                       " websearch tool (auto-clamps T=0, top_p=1, rep=1)\n"
                "  --think / --no-think              enable <think> mode"
                        " (must stay off for --tools per Tool-Calling.md)\n"
                "  --verbose                         stream every signal"
