@@ -698,32 +698,6 @@ static int slm_capture_cb_fn(const struct slm_stream_callback * cb) {
     return rc;
 }
 
-// Scan a text buffer for the first ASCII integer, return it if it
-// falls in [1..max_n], else 0. Used by the URL-pick phase to extract
-// the model's chosen hit number from its short reply. Tolerant of
-// leading whitespace, punctuation, or English chatter prefix.
-static int slm_parse_pick_number(const char * s, size_t n, int max_n) {
-    int  result = 0;
-    int  value  = 0;
-    bool found  = false;
-    size_t i    = 0;
-    while (i < n && !found) {
-        if (s[i] >= '0' && s[i] <= '9') {
-            while (i < n && s[i] >= '0' && s[i] <= '9' && value < 1000000) {
-                value = value * 10 + (s[i] - '0');
-                i++;
-            }
-            found = true;
-        } else {
-            i++;
-        }
-    }
-    if (found && value >= 1 && value <= max_n) {
-        result = value;
-    }
-    return result;
-}
-
 // ---------------------------------------------------------------------------
 // Think-filter self-test
 // ---------------------------------------------------------------------------
@@ -917,17 +891,22 @@ bool slm_ctx_system_prompt(struct slm_ctx * ctx,
     bool committed = false;
     if (ctx != NULL && !ctx->system_committed) {
         const char * sys_text = (text != NULL) ? text : "";
-        // Build tools array when ctrl.tools is set.
-        struct jinja_tool tools[3];
+        // Build tools array when ctrl.tools is set. Six narrow tools
+        // (see agent.c AGENT_TOOL_*): wikipedia / time_now / weather /
+        // crypto_price / ip_geo / websearch. Each returns a small
+        // structured-data answer; no HTML pipeline. Replaced the
+        // pre-2026-05-17 single-tool websearch + URL-pick + fetch +
+        // distill cascade.
+        struct jinja_tool tools[6];
         int n_tools = 0;
         if (ctx->ctrl.tools) {
-            // Single tool, zero-shot: only websearch is advertised
-            // to the model. fetch + distill are internal transitions
-            // inside the websearch dispatch flow (slm_generate uses
-            // tools_websearch_hits + tools_fetch_distill directly).
-            // The 0.8B is much steadier with a single tool surface.
-            tools[0].json = AGENT_TOOL_WEBSEARCH;
-            n_tools = 1;
+            tools[0].json = AGENT_TOOL_WIKIPEDIA;
+            tools[1].json = AGENT_TOOL_TIME_NOW;
+            tools[2].json = AGENT_TOOL_WEATHER;
+            tools[3].json = AGENT_TOOL_CRYPTO_PRICE;
+            tools[4].json = AGENT_TOOL_IP_GEO;
+            tools[5].json = AGENT_TOOL_WEBSEARCH;
+            n_tools = 6;
         }
         // Format the canonical system block via jinja helper.
         char * block = jinja_format_system_block(sys_text, &ctx->ctrl,
@@ -1118,273 +1097,59 @@ int slm_generate(struct slm_ctx * c,
                 }
             }
             chars_free(&wrapped);
-            // Detect "single websearch call" — the URL-pick fast path.
-            // Multi-call or non-websearch falls through to the legacy
-            // single-phase dispatch below.
-            bool websearch_only = (nc == 1 && calls[0].name != NULL &&
-                                   strcmp(calls[0].name, "websearch") == 0);
             // Propagate debug level into the tools.c primitives.
             tools_set_debug(debug_lv);
             struct chars inject = {0};
-            if (websearch_only) {
-                // ===== URL-pick: 3 phases inside ONE outer iter =====
-                // Phase A: DDG search → hits[].
-                // Phase B: model picks a number (1..N) from the hit
-                //          list. We run an inline slm_generate_raw
-                //          here with a short budget, capture the
-                //          reply, parse the digit (fallback to 1 if
-                //          the model doesn't emit a clean number).
-                // Phase C: fetch+distill the picked URL.
-                // Then we hand a "Source: <url>\n\n<distilled>\n\n
-                // Concise answer:\n" preamble to the outer loop's
-                // next iter for the final-answer decode.
-                const char * query =
-                    agent_call_param(&calls[0], "query");
-                struct tools_search_hit hits[TOOLS_HITS_MAX] = {0};
-                struct tool_result      hits_res             = {0};
-                int nh = tools_websearch_hits(
-                    query, 5, hits, TOOLS_HITS_MAX, &hits_res);
+            // ===== Single-phase dispatch =====
+            // Each tool returns a small structured-data answer
+            // (typically 100-500 bytes) — no HTML pipeline, no URL-
+            // pick step. The pre-2026-05-17 URL-pick + fetch+distill
+            // cascade lived here; replaced after `rnd/WEBSEARCH.md`
+            // showed (a) URL-pick was always-fallback (the model
+            // never actually picked) and (b) the HTML stripper
+            // produced 55 chars from 200 KB SPA pages.
+            struct chars result = {0};
+            for (int i = 0; i < nc; i++) {
+                struct tool_result r = {0};
+                agent_dispatch(&calls[i], &r);
+                const char * payload =
+                    r.ok && r.body != NULL ? r.body
+                  : r.error != NULL        ? r.error
+                                           : "(no result)";
                 if (debug_lv >= 1) {
-                    trace("websearch: %d hit(s) for \"%s\"\n",
-                          nh, query ? query : "");
+                    trace("tool_call[%d]: %s -> %s (%zu bytes)\n",
+                          i,
+                          calls[i].name ? calls[i].name : "?",
+                          r.ok ? "ok" : "ERR",
+                          payload ? strlen(payload) : 0);
                 }
-                int picked = 0;        // 1-based; 0 = fallback to top
-                if (nh == 1 && hits_res.ok) {
-                    // Only one URL survived pre-validation — skip the
-                    // Phase B model invocation entirely. Saves the
-                    // ~150-token URL-pick preamble prefill + the
-                    // ~10s "decode a single digit" round trip. The
-                    // model would have picked 1 anyway.
-                    picked = 1;
-                    if (debug_lv >= 1) {
-                        trace("url_pick: skipped (1 hit)\n");
-                    }
-                } else if (nh > 0 && hits_res.ok) {
-                    // -- Phase B: ask the model to pick a URL --
-                    slm_ctx_restore(c, snap);
-                    chars_free(&capture.content);
-                    capture.content = (struct chars){0};
-                    struct chars pick_p = {0};
-                    // Pre-emit a closed <think></think> block before
-                    // the prompt body. The model — having just been
-                    // fed an assistant prefix that already closed
-                    // <think> in iter 0 — sometimes re-opens <think>
-                    // when it sees a fresh-looking question (the URL-
-                    // pick preamble). The think filter then routes
-                    // the digit reply to .reasoning, leaving
-                    // capture.content empty and the picker fall-back
-                    // firing every time. Pre-filling
-                    // "<think>\n\n</think>\n\n" inside the prompt
-                    // makes a re-opened <think> impossible — there's
-                    // no token sequence the model can emit that
-                    // re-enters reasoning mode here.
-                    chars_printf(&pick_p,
-                        "<think>\n\n</think>\n\n"
-                        "We have a list of URLs and titles for"
-                        " them:\n\n%s"
-                        "Chose one to use (reply with ONLY the"
-                        " number 1-%d): ",
-                        hits_res.body ? hits_res.body : "",
-                        nh);
-                    chars_put(&pick_p, "", 0);
-                    if (debug_lv >= 1) {
-                        trace("url_pick: asking model"
-                              " (preamble %zu chars, budget 64)\n",
-                              pick_p.count);
-                    }
-                    if (debug_lv >= 9) {
-                        slm_trace_long("url_pick preamble",
-                                       pick_p.data, pick_p.count);
-                    }
-                    cur.count = 0;
-                    tokenizer_encode(&c->model->tok,
-                                     pick_p.data, &cur);
-                    slm_ctx_ids_append(c, cur.data, cur.count);
-                    chars_free(&pick_p);
-                    struct slm_split_box pick_box = {0};
-                    slm_think_filter_init(&pick_box.filter);
-                    pick_box.filter.recognize_tool_calls = false;
-                    pick_box.filter.emit_visibility      = false;
-                    pick_box.cb = effective_cb;
-                    // Suppress forward-to-user during URL-pick: we
-                    // need capture.content to receive the digit
-                    // reply (parser depends on it), but the user-
-                    // visible stream MUST NOT see the digit — it
-                    // otherwise leaks as "\n\n1\n\n" before the
-                    // final answer in the e2e probe output. The
-                    // filter-level emit_visibility flag is too
-                    // blunt (it would gate the capture too, since
-                    // effective_cb wraps both capture and forward
-                    // in one object). Park forward across the
-                    // URL-pick scope and restore it after.
-                    struct slm_stream_callback * saved_forward =
-                        capture.forward;
-                    capture.forward = NULL;
-                    int pick_budget = 64;
-                    if (pick_budget > max_new - total_gen) {
-                        pick_budget = max_new - total_gen;
-                    }
-                    slm_generate_raw(c, cur.data, (int32_t)cur.count,
-                                     pick_budget, 0,
-                                     sampler_in, seed,
-                                     slm_split_trampoline, &pick_box,
-                                     effective_cb, NULL);
-                    slm_think_filter_finish(&pick_box.filter,
-                                            effective_cb);
-                    chars_free(&pick_box.filter.tool_call);
-                    capture.forward = saved_forward;
-                    cur.count = 0;
-                    picked = slm_parse_pick_number(
-                        capture.content.data, capture.content.count,
-                        nh);
-                    if (debug_lv >= 1) {
-                        trace("url_pick: model reply %zu chars,"
-                              " parsed=%d (1=fallback)\n",
-                              capture.content.count,
-                              picked > 0 ? picked : 1);
-                    }
-                    if (debug_lv >= 9) {
-                        slm_trace_long("url_pick reply",
-                                       capture.content.data,
-                                       capture.content.count);
-                    }
-                    chars_free(&capture.content);
-                    capture.content = (struct chars){0};
-                    chars_free(&capture.reasoning);
-                    capture.reasoning = (struct chars){0};
+                if (debug_lv >= 5 && payload != NULL) {
+                    size_t plen = strlen(payload);
+                    size_t pcut = plen > 320 ? 320 : plen;
+                    trace("tool_call[%d] payload[0..%zu]: %.*s%s\n",
+                          i, pcut, (int)pcut, payload,
+                          pcut < plen ? "..." : "");
                 }
-                if (picked < 1) { picked = 1; }
-                const char * picked_url = (nh > 0)
-                    ? hits[picked - 1].url : NULL;
-                if (debug_lv >= 1 && nh > 0) {
-                    trace("url_pick: chose [%d] %s\n",
-                          picked, picked_url ? picked_url : "?");
-                }
-                // -- Phase C: fetch+distill the chosen URL --
-                struct tool_result fd = {0};
-                if (picked_url != NULL) {
-                    tools_fetch_distill(picked_url, &fd);
-                }
-                // Distill-too-short detector: if the HTML stripper
-                // returned almost nothing (say <200 chars after
-                // stripping) from a substantial fetch (>5 KB), the
-                // page is almost certainly heavy-JS / SPA and the
-                // body we'd inject is just the <title> + http header
-                // line — useless for answering. Observed with
-                // merriam-webster.com/dictionary/proton: 200 KB raw
-                // → 55 chars distilled = "HTTP 200 PROTON Definition
-                // & Meaning - Merriam-Webster". Treat as fetch
-                // failure so the fallback "answer from snippets"
-                // path fires instead.
-                if (fd.ok && fd.body != NULL) {
-                    size_t distilled = strlen(fd.body);
-                    if (distilled < 200 &&
-                        fd.status >= 200 && fd.status < 400) {
-                        fd.ok = false;
-                        free(fd.error);
-                        fd.error = strdup(
-                            "page distilled to <200 chars"
-                            " (likely heavy-JS / SPA — HTML stripper"
-                            " gave up)");
-                        if (debug_lv >= 1) {
-                            trace("fetch_distill: distilled body"
-                                  " too short (%zu chars)"
-                                  " — falling back to snippets\n",
-                                  distilled);
-                        }
-                    }
-                }
-                // Restore again, build final preamble. Two branches:
-                //   - fetch_distill succeeded -> distilled content +
-                //     "summarize" framing.
-                //   - fetch failed -> "(no content)" would just nudge
-                //     the model to retry with another tool_call, so
-                //     we fall back to the snippet list and ask the
-                //     model to answer from whatever signal we have.
-                slm_ctx_restore(c, snap);
-                if (with_debug && fd.body != NULL) {
-                    text_puts(&c->messages, fd.body);
-                    slm_cb_emit(effective_cb, NULL, NULL, NULL,
-                                fd.body, false, 0, 0);
-                }
-                if (fd.ok && fd.body != NULL) {
-                    // Framing intentionally avoids the "[N]" bracket
-                    // pattern. The URL-pick prompt above used "reply
-                    // with ONLY the number 1-N" and "[1] URL\n[2] URL"
-                    // as the list format; the model anchors to that
-                    // and emits "1" as the first token of the final
-                    // answer when it sees a near-identical "[N] URL"
-                    // header. Use plain "Page contents (URL: ...):"
-                    // so the pattern is structurally different from
-                    // the URL-pick prompt.
-                    chars_printf(&inject,
-                        "Page contents from %s:\n\n%s\n\n"
-                        "Answer the user's question using the page"
-                        " contents above. Respond in plain prose"
-                        " (no list markers, no leading numbers, no"
-                        " section headers). Do NOT call any tools.\n\n",
-                        picked_url, fd.body);
-                } else {
-                    // Fetch failed — surface the error to the model
-                    // and let it answer from the snippets only. Avoid
-                    // "Based on this, here is the answer" wording
-                    // because the model would rightly object that
-                    // there's nothing to base anything on. Same "no
-                    // [N]" rule as the success branch.
-                    chars_printf(&inject,
-                        "I tried to fetch %s but it failed: %s."
-                        "\n\nHere are the search snippets I have:"
-                        "\n\n%s"
-                        "Based ONLY on these snippets, give the best"
-                        " concise answer you can to the user's"
-                        " question. Respond in plain prose (no list"
-                        " markers, no leading numbers, no section"
-                        " headers). Do NOT call any tools.\n\n",
-                        picked_url,
-                        fd.error ? fd.error : "(unknown error)",
-                        hits_res.body ? hits_res.body : "");
-                }
-                chars_put(&inject, "", 0);
-                tools_result_free(&fd);
-                tools_result_free(&hits_res);
-                tools_free_hits(hits, nh);
-            } else {
-                // ===== Legacy single-phase (fetch / distill / multi-
-                // call) — keep the original agent_dispatch loop. =====
-                struct chars result = {0};
-                for (int i = 0; i < nc; i++) {
-                    struct tool_result r = {0};
-                    agent_dispatch(&calls[i], &r);
-                    const char * payload =
-                        r.ok && r.body != NULL ? r.body
-                      : r.error != NULL        ? r.error
-                                               : "(no result)";
-                    if (debug_lv >= 1) {
-                        trace("tool_call[%d]: %s -> %s (%zu bytes)\n",
-                              i,
-                              calls[i].name ? calls[i].name : "?",
-                              r.ok ? "ok" : "ERR",
-                              payload ? strlen(payload) : 0);
-                    }
-                    if (i > 0) { chars_put(&result, "\n\n", 2); }
-                    chars_put(&result, payload, strlen(payload));
-                    tools_result_free(&r);
-                }
-                chars_put(&result, "", 0);
-                if (result.data != NULL && with_debug) {
-                    text_puts(&c->messages, result.data);
-                    slm_cb_emit(effective_cb, NULL, NULL, NULL,
-                                result.data, false, 0, 0);
-                }
-                slm_ctx_restore(c, snap);
-                chars_printf(&inject,
-                    "I ran a tool. Here is the result:\n\n%s\n\n"
-                    "Based on the above, here is a concise answer to"
-                    " the user's question:\n\n",
-                    result.data ? result.data : "");
-                chars_put(&inject, "", 0);
-                chars_free(&result);
+                if (i > 0) { chars_put(&result, "\n\n", 2); }
+                chars_put(&result, payload, strlen(payload));
+                tools_result_free(&r);
             }
+            chars_put(&result, "", 0);
+            if (result.data != NULL && with_debug) {
+                text_puts(&c->messages, result.data);
+                slm_cb_emit(effective_cb, NULL, NULL, NULL,
+                            result.data, false, 0, 0);
+            }
+            slm_ctx_restore(c, snap);
+            chars_printf(&inject,
+                "Tool result:\n\n%s\n\n"
+                "Answer the user's original question using the tool"
+                " result above. Be concise (1-3 sentences for simple"
+                " queries) and respond in plain prose. Do NOT call"
+                " any more tools.\n\n",
+                result.data ? result.data : "");
+            chars_put(&inject, "", 0);
+            chars_free(&result);
             tools_set_debug(0);
             agent_free_calls(calls, nc);
             if (debug_lv >= 1) {
@@ -1447,17 +1212,17 @@ int slm_generate(struct slm_ctx * c,
 }
 
 // ---------------------------------------------------------------------------
-// tools_e2e_test — live end-to-end smoke for the websearch dispatch
-// flow. Drives the full chain (DDG → URL probe → URL pick → fetch +
-// distill → final answer) on a handful of realistic prompts that
-// EXPLICITLY name the tool. Phrasings chosen per Leo's automated-
-// testing guidance: "Using websearch...", "Search the internet
-// to...". Each prompt is graded PASS if (a) the model emitted a
-// <tool_call>, (b) the final answer is non-empty after stripping.
+// tools_e2e_test — live end-to-end smoke for the multi-tool dispatch
+// flow. Drives one probe per tool against the 0.8B; each probe
+// EXPLICITLY names the kind of question so the model can route to
+// the right tool. Each prompt is graded PASS if (a) the model
+// emitted a <tool_call>, (b) the final answer is non-empty after
+// stripping.
 //
-// Returns the number of failures. Skips silently if libcurl can't
-// reach DDG (the tools_self_test's "offline" code path mirrors this).
-// Takes ~2-4 min on M-series at T=0 due to repeated prefills.
+// Returns the number of failures. Takes ~2-4 min on M-series at T=0
+// due to repeated prefills. Network failures (DNS, TLS, rate limits)
+// will surface as FAIL rather than SKIP — accept that for now; CI
+// can re-run if a third-party API is flaky.
 struct tools_e2e_capture {
     struct slm_stream_callback base;
     struct chars *              out;
@@ -1474,11 +1239,18 @@ static int tools_e2e_cb_fn(const struct slm_stream_callback * cb) {
 __attribute__((unused))
 static int32_t tools_e2e_test(const char * gguf_path) {
     static const char * const probes[] = {
-        "Using websearch, what time is it in Tokyo now?",
-        "Search the internet to find the current price of Bitcoin.",
-        "Use websearch to find what the weather will be tomorrow"
-            " in San Francisco.",
-        "Search internet for the current USD to EUR exchange rate.",
+        // wikipedia tool — encyclopedic noun-phrase query
+        "Look up the Wikipedia article for the proton subatomic"
+            " particle and tell me what it is.",
+        // time_now tool
+        "What time is it in Tokyo right now?",
+        // crypto_price tool
+        "What is the current price of bitcoin in USD?",
+        // ip_geo tool
+        "Where am I right now, based on my IP address?",
+        // websearch fallback for the long tail
+        "Search the web for reviews of the best running shoes"
+            " for women.",
         NULL,
     };
     int np = 0;

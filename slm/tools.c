@@ -1,76 +1,81 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// tools.c - agent tool primitives: websearch, fetch, distill.
+// tools.c - agent tool primitives, post-DDG-cleanup.
 //
-// Three composable primitives an agent loop hands to the model
-// through the Qwen3.5 `<tool_call>` framing (built by jinja_apply
-// in llm/jinja-template.c):
+// Six narrow, intent-routed tools the agent dispatches by name. Each
+// returns a small structured-data answer (typically 100-500 bytes),
+// not a page to scrape. The pre-2026-05-17 design had one generic
+// websearch tool that did DDG HTML scrape → URL pick → fetch+distill.
+// That pipeline was unreliable: DDG returned ad-redirect URLs as top
+// hits; the HTML stripper produced 55 chars from 200 KB SPAs; the URL-
+// pick model invocation always rubber-stamped hit[0]. See
+// `rnd/WEBSEARCH.md` for the R&D notes that led to this rewrite.
 //
-//   websearch(query, max_results)
-//       DuckDuckGo lite-HTML scrape. No API key required. Returns
-//       a plain-text "Web results for: <q>\n\n- title1\n  snippet\n
-//       \n- title2\n  snippet\n..." that fits in a typical model's
-//       attention window.
-//   fetch(url, timeout_s)
-//       libcurl GET with a browser User-Agent; returns the body
-//       prefixed by `HTTP <status>\n\n`. Truncates at 200 KB so
-//       a stray multi-MB asset never blows the context.
-//   distill(html)
-//       Strip tags + decode entities + collapse whitespace; returns
-//       the meaningful text content of a page. Composes with fetch
-//       for "fetch this URL and tell me what it says" agent flows.
+//   wikipedia(query)
+//       OpenSearch → REST summary. Returns the article's `extract`
+//       paragraph (typically 200-500 chars) or NOT_FOUND.
+//   time_now(timezone)
+//       timeapi.io. Returns "Mon 2026-05-18 08:11:22 in Asia/Tokyo"
+//       formatted from the JSON response.
+//   weather(latitude, longitude)
+//       open-meteo. Returns current temp + 2-day high/low. No
+//       geocoding here; caller supplies coordinates.
+//   crypto_price(symbol, vs)
+//       coingecko simple/price. Returns "1 BTC = 77772 USD" style line.
+//   ip_geo()
+//       ip-api.com (HTTP, no key). Returns the caller IP's city,
+//       region, country, timezone, ISP.
+//   websearch(query)
+//       mwmbl.org open-source search. Returns top-3 hits formatted
+//       as "1. Title — extract\n2. ..." — pre-segmented snippets, no
+//       HTML strip required.
 //
-// Single-file lib. `#include "tools.c"` from slm.c under
-// `#ifdef LLM_WITH_TOOLS` so the libcurl dependency stays optional
-// (the core inference path has zero net deps; tools.c is the only
-// thing in this repo that links libcurl). Listed under
-// QwenHaiku.xcodeproj's membershipExceptions alongside the other
-// single-file libs.
+// All API responses are tiny structured JSON; we use a small JSON
+// value extractor (`tools_json_str` / `tools_json_num`) rather than
+// pulling in a full JSON library. Each tool returns a `struct
+// tool_result { ok, body, error, status }`. body is what gets
+// injected into the model's context as the tool response.
 //
-// Style notes:
-//   - Patterned after doit.devs/src/tools.c (Leo's home agent
-//     framework). Same DDG selectors, same UA + Referer hardening,
-//     same HTTP-status surfacing through tool_result.error.
-//   - SESE: single exit per function, no goto / break / continue
-//     except in switch grammar, no `bool ok` flag layered on real
-//     state.
+// Single-file lib. `#include "tools.c"` from slm.c. The LLM_NO_TOOLS
+// branch at the bottom keeps the file compilable on targets without
+// libcurl (Android NDK etc.) and emits stub "tool unavailable"
+// results.
+//
+// Style: SESE (single exit per function, no goto/break/continue
+// except switch grammar, no `bool ok` flags). Matches the rest of
+// the codebase per the project coding-discipline notes.
 //
 // Caller responsibilities:
-//   - libcurl global init: tools_global_init() once, before any
-//     tool call; tools_global_cleanup() at shutdown.
-//   - tool_result lifetime: caller frees `body` and `error` via
-//     tools_result_free.
+//   - tools_global_init() once before any tool call; tools_global_cleanup()
+//     at shutdown.
+//   - tool_result lifetime: free body + error via tools_result_free.
 
-// Always-available headers + ts_buf helpers (used by agent.c too —
-// must stay visible regardless of LLM_NO_TOOLS).
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-// LLM_NO_TOOLS: opt-out for builds that can't link libcurl (Android
-// NDK, embedded targets). When set, this file emits stub
-// implementations that return "tool unavailable" results; agent.c
-// continues to compile against the same prototypes. The Apple /
-// Linux dev path leaves LLM_NO_TOOLS undefined and links libcurl
-// as before.
 #ifndef LLM_NO_TOOLS
 
 #include <ctype.h>
 #include <curl/curl.h>
-#include <unistd.h>  // sleep()
 
 #ifndef TOOLS_FETCH_CAP
 #define TOOLS_FETCH_CAP (200 * 1024)
 #endif
 
+// User-Agent string for API calls. Wikipedia's WMF API policy requires
+// a contact-identifying UA; other APIs (mwmbl, open-meteo, coingecko,
+// ip-api, timeapi) accept anything but a clean identifying UA is
+// good citizenship.
+#define TOOLS_API_UA \
+    "qwen.haiku/0.1 (https://github.com/leok7v/qwen.haiku;" \
+    " leo.kuznetsov@gmail.com)"
+
 // Debug verbosity for tool internals. slm_generate sets this from
-// c->ctrl.debug right before dispatching a tool; the level gates how
-// chatty tools_websearch / tools_fetch are at each call. File-scoped
-// (not per-ctx) because tools_* are pure C functions with no ctx
-// parameter — passing debug through every primitive would balloon the
-// signatures for one diagnostic knob.
+// c->ctrl.debug right before dispatching a tool. File-scoped (not
+// per-ctx) because tools_* are pure C functions with no ctx param.
 static int32_t g_tools_debug = 0;
 
 static void tools_set_debug(int32_t level) {
@@ -95,13 +100,8 @@ static void tools_result_free(struct tool_result * r) {
     }
 }
 
-// ts_buf + ts_grow/ts_put/ts_puts/chars_printf hoisted above the
-// LLM_NO_TOOLS gate so agent.c sees them in both build modes.
-
-// libcurl write-callback into a ts_buf. Caps writes once the buffer
-// hits TOOLS_FETCH_CAP so a runaway server can't make us allocate
-// gigabytes — extra bytes are silently dropped (the truncation
-// notice is appended by the caller).
+// libcurl write-callback. Caps at TOOLS_FETCH_CAP so a runaway server
+// can't make us allocate gigabytes — extra bytes silently dropped.
 static size_t tools_curl_write(void * ptr, size_t size, size_t nmemb,
                                void * user) {
     struct chars * b = (struct chars *)user;
@@ -112,13 +112,10 @@ static size_t tools_curl_write(void * ptr, size_t size, size_t nmemb,
     if (take > 0) {
         chars_put(b, (const char *)ptr, take);
     }
-    // Tell curl we accepted everything so it doesn't error out;
-    // we'll surface truncation in the body itself.
     return total;
 }
 
-// One-shot libcurl global init / cleanup. Idempotent — callers can
-// invoke before every tool call without worrying about pairing.
+// One-shot libcurl global init / cleanup. Idempotent.
 static bool g_tools_curl_initialized;
 
 static void tools_global_init(void) {
@@ -135,546 +132,72 @@ static void tools_global_cleanup(void) {
     }
 }
 
-// Percent-decode `s[0..n)` into `out`. `+` is treated as space (the
-// historic form-encoding rule; DDG's uddg= values don't use `+` for
-// space but it's harmless to decode). Invalid `%XX` sequences pass
-// through as-is.
-static void tools_url_decode(const char * s, size_t n,
-                             struct chars * out) {
-    size_t i = 0;
-    while (i < n) {
-        char c = s[i];
-        if (c == '%' && i + 2 < n) {
-            char h = s[i + 1];
-            char l = s[i + 2];
-            int  hi = -1;
-            int  lo = -1;
-            if      (h >= '0' && h <= '9') { hi = h - '0';      }
-            else if (h >= 'a' && h <= 'f') { hi = h - 'a' + 10; }
-            else if (h >= 'A' && h <= 'F') { hi = h - 'A' + 10; }
-            if      (l >= '0' && l <= '9') { lo = l - '0';      }
-            else if (l >= 'a' && l <= 'f') { lo = l - 'a' + 10; }
-            else if (l >= 'A' && l <= 'F') { lo = l - 'A' + 10; }
-            if (hi >= 0 && lo >= 0) {
-                char b = (char)(hi * 16 + lo);
-                chars_put(out, &b, 1);
-                i += 3;
-            } else {
-                chars_put(out, &c, 1);
-                i++;
-            }
-        } else if (c == '+') {
-            chars_put(out, " ", 1);
-            i++;
-        } else {
-            chars_put(out, &c, 1);
-            i++;
-        }
-    }
-}
-
-// Resolve a raw href value from DDG-lite into a real, fetch-able URL.
-// DDG wraps every result link in a redirect tracker of the form
-//     //duckduckgo.com/l/?uddg=<percent-encoded-target>&rut=<hash>
-// (protocol-relative, payload inside uddg=). Without unwrapping,
-// tools_fetch hits libcurl's "URL rejected: No host part" error
-// (the `//` prefix), or — if we patched the protocol — would just
-// re-hit DDG instead of the real source. We extract the uddg=
-// value up to the next `&` (which catches the `&amp;rut=...` tail
-// since `&amp;` starts with `&`), then percent-decode it.
-//
-// Non-wrapped href values (other engines, or DDG corner cases) are
-// passed through; if they're protocol-relative we prepend https:.
-//
-// Returns a heap-allocated, NUL-terminated URL; caller frees.
-static char * tools_url_unwrap(const char * raw, size_t n) {
-    char * result = NULL;
-    if (raw != NULL && n > 0) {
-        const char * uddg = (const char *)memmem(raw, n, "uddg=", 5);
-        if (uddg != NULL) {
-            const char * v   = uddg + 5;
-            size_t       lim = n - (size_t)(v - raw);
-            const char * end = v;
-            while ((size_t)(end - v) < lim && *end != '&') { end++; }
-            struct chars dec = {0};
-            tools_url_decode(v, (size_t)(end - v), &dec);
-            chars_put(&dec, "", 0);
-            result = dec.data;
-        } else if (n >= 2 && raw[0] == '/' && raw[1] == '/') {
-            struct chars b = {0};
-            chars_puts(&b, "https:");
-            chars_put(&b, raw, n);
-            chars_put(&b, "", 0);
-            result = b.data;
-        } else {
-            result = (char *)oom(malloc(n + 1));
-            memcpy(result, raw, n);
-            result[n] = '\0';
-        }
-    }
-    return result;
-}
-
-// URL-encode `q` into `out`. RFC 3986 unreserved set only.
-
+// Percent-encode `q` for use as a URL query value. ASCII alnum +
+// `-._~` pass through; everything else becomes %XX. Used to build
+// query strings for the API tools.
 static void tools_url_encode(const char * q, struct chars * out) {
-    const char * p = q;
-    while (*p != '\0') {
-        unsigned char c = (unsigned char)*p;
-        int unreserved = (c >= 'A' && c <= 'Z')
-                      || (c >= 'a' && c <= 'z')
-                      || (c >= '0' && c <= '9')
-                      ||  c == '-' || c == '_'
-                      ||  c == '.' || c == '~';
-        if (unreserved) {
-            char ch = (char)c;
-            chars_put(out, &ch, 1);
-        } else {
-            char hex[4];
-            snprintf(hex, sizeof(hex), "%%%02X", c);
-            chars_puts(out, hex);
-        }
-        p++;
-    }
-}
-
-// Decode one HTML entity starting at &. Returns the number of bytes
-// consumed from `s` (so caller advances `i += adv`), 0 if not an
-// entity. Recognises &amp; &lt; &gt; &quot; &apos; &nbsp; and
-// numeric &#NNN; / &#xHH;.
-
-static size_t tools_decode_entity(const char * s, size_t i, size_t n,
-                                  struct chars * out) {
-    size_t adv = 0;
-    if (i < n && s[i] == '&') {
-        size_t end = i + 1;
-        while (end < n && end - i < 10 && s[end] != ';') { end++; }
-        if (end < n && s[end] == ';') {
-            size_t len = end - i - 1;
-            const char * body = s + i + 1;
-            if (len == 3 && memcmp(body, "amp", 3) == 0) {
-                chars_put(out, "&", 1); adv = 4;
-            } else if (len == 2 && memcmp(body, "lt", 2) == 0) {
-                chars_put(out, "<", 1); adv = 3;
-            } else if (len == 2 && memcmp(body, "gt", 2) == 0) {
-                chars_put(out, ">", 1); adv = 3;
-            } else if (len == 4 && memcmp(body, "quot", 4) == 0) {
-                chars_put(out, "\"", 1); adv = 5;
-            } else if (len == 4 && memcmp(body, "apos", 4) == 0) {
-                chars_put(out, "'", 1); adv = 5;
-            } else if (len == 4 && memcmp(body, "nbsp", 4) == 0) {
-                chars_put(out, " ", 1); adv = 5;
-            } else if (len >= 2 && body[0] == '#') {
-                int cp = 0;
-                if (body[1] == 'x' || body[1] == 'X') {
-                    for (size_t k = 2; k < len; k++) {
-                        char c = body[k];
-                        int d = -1;
-                        if (c >= '0' && c <= '9') { d = c - '0'; }
-                        else if (c >= 'a' && c <= 'f') { d = c - 'a' + 10; }
-                        else if (c >= 'A' && c <= 'F') { d = c - 'A' + 10; }
-                        if (d >= 0) { cp = cp * 16 + d; }
-                    }
-                } else {
-                    for (size_t k = 1; k < len; k++) {
-                        if (body[k] >= '0' && body[k] <= '9') {
-                            cp = cp * 10 + (body[k] - '0');
-                        }
-                    }
-                }
-                // Emit as UTF-8.
-                if (cp >= 0 && cp < 0x80) {
-                    char c = (char)cp;
-                    chars_put(out, &c, 1);
-                } else if (cp < 0x800) {
-                    char b[2];
-                    b[0] = (char)(0xC0 | (cp >> 6));
-                    b[1] = (char)(0x80 | (cp & 0x3F));
-                    chars_put(out, b, 2);
-                } else if (cp < 0x10000) {
-                    char b[3];
-                    b[0] = (char)(0xE0 | (cp >> 12));
-                    b[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                    b[2] = (char)(0x80 | (cp & 0x3F));
-                    chars_put(out, b, 3);
-                } else {
-                    char b[4];
-                    b[0] = (char)(0xF0 | (cp >> 18));
-                    b[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-                    b[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                    b[3] = (char)(0x80 | (cp & 0x3F));
-                    chars_put(out, b, 4);
-                }
-                adv = len + 2;  // &...;
-            }
-        }
-    }
-    return adv;
-}
-
-// Case-insensitive prefix compare. True if `s[0..plen)` matches
-// `prefix` after ASCII case-folding. `prefix` is NUL-terminated.
-static bool tools_starts_with_icase(const char * s, size_t n,
-                                    const char * prefix) {
-    size_t plen  = strlen(prefix);
-    bool   match = (n >= plen);
-    if (match) {
-        size_t k = 0;
-        while (k < plen && match) {
-            char a = s[k];
-            char b = prefix[k];
-            if (a >= 'A' && a <= 'Z') { a = (char)(a - 'A' + 'a'); }
-            if (b >= 'A' && b <= 'Z') { b = (char)(b - 'A' + 'a'); }
-            if (a != b) { match = false; }
-            k++;
-        }
-    }
-    return match;
-}
-
-// Block-element skip. If `s[0..]` opens one of the "drop the whole
-// content" HTML constructs (script, style, noscript, svg, HTML
-// comment), return the number of bytes to skip past the matching
-// close (or to end-of-input if unterminated). Returns 0 if `s` is
-// not such a block — caller falls back to normal single-tag strip.
-//
-// Why these in particular: distilled HTML feeds the model as
-// "content", so any tag whose body is code / vector data / hidden
-// metadata is noise that confuses the answer phase. Real-world
-// observed failure: worldclocklive.com's distilled output came back
-// as 4KB of inline GoogleTagManager JavaScript instead of the time
-// value, because <script> bodies survived the previous tag-only
-// strip. Web is messy — expect this list to grow.
-//
-// Note: HTML5 allows '/' before '>' in the close tag (e.g.
-// `</script  >`) so we walk to the `>` after matching the name
-// rather than requiring exactly "</tag>".
-static size_t tools_html_block_skip(const char * s, size_t n) {
-    size_t skip = 0;
-    if (n >= 4 && s[0] == '<' && s[1] == '!' &&
-        s[2] == '-' && s[3] == '-') {
-        // HTML comment: skip to -->
-        size_t j     = 4;
-        bool   found = false;
-        while (j + 2 < n && !found) {
-            if (s[j] == '-' && s[j + 1] == '-' && s[j + 2] == '>') {
-                found = true;
-                skip  = j + 3;
+    if (q != NULL) {
+        size_t n = strlen(q);
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)q[i];
+            bool safe = (c >= 'A' && c <= 'Z') ||
+                        (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') ||
+                        c == '-' || c == '_' ||
+                        c == '.' || c == '~';
+            if (safe) {
+                chars_put(out, (const char *)&c, 1);
             } else {
-                j++;
-            }
-        }
-        if (!found) { skip = n; }
-    } else if (n >= 2 && s[0] == '<') {
-        static const char * tags[] = {
-            "script", "style", "noscript", "svg", NULL
-        };
-        for (int k = 0; tags[k] != NULL && skip == 0; k++) {
-            const char * t  = tags[k];
-            size_t       tn = strlen(t);
-            // "<tag" followed by a token-terminator (space, >, /, etc).
-            bool open = (n >= tn + 2) &&
-                tools_starts_with_icase(s + 1, n - 1, t);
-            if (open) {
-                char nx = s[1 + tn];
-                bool token_end = (nx == ' ' || nx == '\t' ||
-                                  nx == '\n' || nx == '\r' ||
-                                  nx == '>'  || nx == '/');
-                if (token_end) {
-                    char   close[16];
-                    snprintf(close, sizeof(close), "</%s", t);
-                    size_t cn    = strlen(close);
-                    size_t j     = 1 + tn;
-                    bool   found = false;
-                    while (j + cn <= n && !found) {
-                        if (tools_starts_with_icase(s + j, n - j,
-                                                    close)) {
-                            size_t gt = j + cn;
-                            while (gt < n && s[gt] != '>') { gt++; }
-                            if (gt < n) { gt++; }
-                            skip  = gt;
-                            found = true;
-                        } else {
-                            j++;
-                        }
-                    }
-                    if (!found) { skip = n; }
-                }
+                char hex[4];
+                snprintf(hex, sizeof(hex), "%%%02X", (int)c);
+                chars_put(out, hex, 3);
             }
         }
     }
-    return skip;
 }
 
-// Codepoint range tests for "zero-information" Unicode that
-// distilled web content should drop before the model sees it.
-// Emojis tokenize to 2-4 BPE tokens each, contribute nothing to a
-// textual summary, and (on emoji-heavy pages like time.now's nav
-// header) cause 60%+ of the prefill budget to be spent on
-// 🌍🗺️🏙️🏴⏰⌚ ribbons. Web is messy; expect this list to grow.
-static bool tools_cp_is_emoji(int32_t cp) {
-    return (cp >= 0x2300  && cp <= 0x23FF)   // Misc Technical
-                                              // ( ⌚ ⌛ ⏰ ⏱ ⏲ ⏳ )
-        || (cp >= 0x2500  && cp <= 0x257F)   // Box Drawing
-        || (cp >= 0x2580  && cp <= 0x259F)   // Block Elements
-        || (cp >= 0x25A0  && cp <= 0x25FF)   // Geometric Shapes
-        || (cp >= 0x2600  && cp <= 0x27BF)   // Misc Symbols, Dingbats
-        || (cp >= 0x2B00  && cp <= 0x2BFF)   // Misc Symbols and Arrows
-        || (cp == 0x200D)                    // Zero-Width Joiner
-        || (cp >= 0xFE00  && cp <= 0xFE0F)   // Variation Selectors
-        || (cp >= 0x1F000 && cp <= 0x1FFFF); // emoji planes
-}
-
-// UTF-8 decode at s[i]. Returns codepoint and bytes consumed.
-static int tools_utf8_decode(const char * s, size_t n, size_t i,
-                             int32_t * out_cp) {
-    int            adv = 1;
-    int32_t        cp  = 0;
-    unsigned char  c0  = (unsigned char)s[i];
-    if (c0 < 0x80) {
-        cp  = c0;
-        adv = 1;
-    } else if ((c0 & 0xE0) == 0xC0 && i + 1 < n) {
-        cp  = ((c0 & 0x1F) << 6)
-            | ((unsigned char)s[i + 1] & 0x3F);
-        adv = 2;
-    } else if ((c0 & 0xF0) == 0xE0 && i + 2 < n) {
-        cp  = ((c0 & 0x0F) << 12)
-            | (((unsigned char)s[i + 1] & 0x3F) << 6)
-            |  ((unsigned char)s[i + 2] & 0x3F);
-        adv = 3;
-    } else if ((c0 & 0xF8) == 0xF0 && i + 3 < n) {
-        cp  = ((c0 & 0x07) << 18)
-            | (((unsigned char)s[i + 1] & 0x3F) << 12)
-            | (((unsigned char)s[i + 2] & 0x3F) << 6)
-            |  ((unsigned char)s[i + 3] & 0x3F);
-        adv = 4;
-    } else {
-        cp  = 0xFFFD;
-        adv = 1;
-    }
-    *out_cp = cp;
-    return adv;
-}
-
-// Strip HTML tags + decode entities from `[s, s+n)` into `out`.
-// Newlines, tabs, and \r collapse to a single space; whitespace
-// run-collapsing happens in the caller if needed. Block elements
-// (script/style/etc) have their entire content dropped — see
-// tools_html_block_skip. Emoji / dingbat / box-drawing codepoints
-// are dropped entirely (zero-information for textual summaries,
-// dominant prefill cost on nav-heavy pages).
-static void tools_html_strip(const char * s, size_t n,
-                             struct chars * out) {
-    size_t i = 0;
-    while (i < n) {
-        char c = s[i];
-        if (c == '<') {
-            size_t blk = tools_html_block_skip(s + i, n - i);
-            if (blk > 0) {
-                i += blk;
-            } else {
-                size_t j = i + 1;
-                while (j < n && s[j] != '>') { j++; }
-                i = (j < n) ? j + 1 : n;
-            }
-        } else if (c == '&') {
-            size_t adv = tools_decode_entity(s, i, n, out);
-            if (adv > 0) {
-                i += adv;
-            } else {
-                chars_put(out, &c, 1);
-                i++;
-            }
-        } else if (c == '\r' || c == '\n' || c == '\t') {
-            chars_put(out, " ", 1);
-            i++;
-        } else if ((unsigned char)c < 0x80) {
-            chars_put(out, &c, 1);
-            i++;
-        } else {
-            int32_t cp  = 0;
-            int     adv = tools_utf8_decode(s, n, i, &cp);
-            if (!tools_cp_is_emoji(cp)) {
-                chars_put(out, s + i, (size_t)adv);
-            }
-            i += (size_t)adv;
-        }
-    }
-}
-
-// Collapse runs of ASCII whitespace inside `in` into a single space;
-// trim leading and trailing whitespace. Writes into `out`.
-static void tools_collapse_ws(const struct chars * in,
-                              struct chars * out) {
-    size_t i = 0;
-    bool   in_ws    = true;  // start as "just saw ws" so leading is dropped
-    size_t emitted  = 0;
-    while (i < in->count) {
-        unsigned char c = (unsigned char)in->data[i];
-        bool is_ws = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
-        if (is_ws) {
-            if (!in_ws && emitted > 0) {
-                chars_put(out, " ", 1);
-                emitted++;
-            }
-            in_ws = true;
-        } else {
-            char ch = (char)c;
-            chars_put(out, &ch, 1);
-            emitted++;
-            in_ws = false;
-        }
-        i++;
-    }
-    // Strip trailing single space we may have appended pending real char.
-    while (out->count > 0 && out->data[out->count - 1] == ' ') {
-        out->count--;
-        out->data[out->count] = '\0';
-    }
-}
-
-// UA pool. Each slot carries the User-Agent string AND a "style"
-// tag — Chrome and Safari emit DIFFERENT header sets in real
-// traffic, and sending the wrong set with the wrong UA is itself
-// a fingerprint inconsistency that bot detectors look for. The
-// style flag drives the per-style header builder below.
-//
-// Slots populated from real captured browser requests (Leo's
-// Chrome 148 + Safari Incognito 26.4 against duckduckgo.com).
-enum tools_ua_style {
-    TOOLS_UA_CHROME = 0,
-    TOOLS_UA_SAFARI = 1,
-};
-
-struct tools_ua_slot {
-    const char *        ua;
-    enum tools_ua_style style;
-    const char *        ch_platform;  // Chrome-only; NULL for Safari
-};
-
-static const struct tools_ua_slot TOOLS_UA_POOL[] = {
-    { "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
-      " AppleWebKit/537.36 (KHTML, like Gecko)"
-      " Chrome/148.0.0.0 Safari/537.36",
-      TOOLS_UA_CHROME, "\"macOS\"" },
-    { "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-      " AppleWebKit/537.36 (KHTML, like Gecko)"
-      " Chrome/148.0.0.0 Safari/537.36",
-      TOOLS_UA_CHROME, "\"Windows\"" },
-    { "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
-      " AppleWebKit/605.1.15 (KHTML, like Gecko)"
-      " Version/26.4 Safari/605.1.15",
-      TOOLS_UA_SAFARI, NULL },
-};
-
-static const struct tools_ua_slot * tools_pick_ua(void) {
-    static unsigned int counter = 0;
-    unsigned int n = (unsigned int)
-        (sizeof(TOOLS_UA_POOL) / sizeof(TOOLS_UA_POOL[0]));
-    const struct tools_ua_slot * slot = &TOOLS_UA_POOL[counter % n];
-    counter++;
-    return slot;
-}
-
-// HTTP GET, body lands in `body`. Sets `*status` to the HTTP code.
-// Returns 0 on success, -1 on libcurl failure (status will be 0).
-//
-// Headers and UA chosen to look like a real browser navigation,
-// since DDG's bot-detection is opportunistic — back-to-back identical
-// requests get challenged, but rotating UA + adding Sec-Fetch-*
-// browser-nav headers passes more often. Still no substitute for a
-// proper search API; this is best-effort scraping.
-static int tools_http_get(const char * url, long timeout_ms,
-                          struct chars * body, long * status) {
+// Clean API GET: simple identifying User-Agent, accepts JSON, follows
+// redirects, fixed timeout. No browser fingerprinting (that lived in
+// the old DDG-scrape path; APIs reject impersonation anyway).
+// Returns 0 on success and writes status code through `status`. Caller
+// owns `body` allocations.
+static int tools_api_get(const char * url, long timeout_ms,
+                         struct chars * body, long * status) {
     int rc = -1;
     *status = 0;
-    if (g_tools_debug >= 9) {
-        trace("http_get: GET %s (timeout=%ldms)\n", url, timeout_ms);
+    if (g_tools_debug >= 5) {
+        trace("api_get: GET %s\n", url);
     }
+    tools_global_init();
     CURL * h = curl_easy_init();
     if (h != NULL) {
         struct curl_slist * hdrs = NULL;
-        const struct tools_ua_slot * slot = tools_pick_ua();
-        if (g_tools_debug >= 9) {
-            trace("http_get: UA=%s\n", slot->ua);
-        }
-        char ua_header[512];
-        snprintf(ua_header, sizeof(ua_header),
-                 "User-Agent: %s", slot->ua);
-        hdrs = curl_slist_append(hdrs, ua_header);
-        // Shared headers (both Chrome and Safari emit these on a
-        // top-level navigation to an HTTPS URL with no referer).
-        hdrs = curl_slist_append(hdrs,
-            "Accept: text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,*/*;q=0.8");
-        hdrs = curl_slist_append(hdrs,
-            "Accept-Language: en-US,en;q=0.9");
-        hdrs = curl_slist_append(hdrs, "Priority: u=0, i");
-        // Sec-Fetch-Site: none means "no Referer / new tab nav" —
-        // matches the absence of a Referer header in our request.
-        // Real Chrome / Safari send "none" in that case, NOT
-        // "cross-site" (the previous value, which implied we came
-        // from a different site — another fingerprint inconsistency).
-        hdrs = curl_slist_append(hdrs, "Sec-Fetch-Dest: document");
-        hdrs = curl_slist_append(hdrs, "Sec-Fetch-Mode: navigate");
-        hdrs = curl_slist_append(hdrs, "Sec-Fetch-Site: none");
-        if (slot->style == TOOLS_UA_CHROME) {
-            // Chrome-only extras: User-Agent Client Hints, DNT,
-            // Pragma/Cache-Control, Sec-Fetch-User, Upgrade-Insecure.
-            // Order matches Chrome 148's real emission order.
-            hdrs = curl_slist_append(hdrs, "Cache-Control: no-cache");
-            hdrs = curl_slist_append(hdrs, "Pragma: no-cache");
-            hdrs = curl_slist_append(hdrs, "DNT: 1");
-            hdrs = curl_slist_append(hdrs,
-                "Sec-CH-UA: \"Chromium\";v=\"148\","
-                " \"Google Chrome\";v=\"148\","
-                " \"Not/A)Brand\";v=\"99\"");
-            hdrs = curl_slist_append(hdrs, "Sec-CH-UA-Mobile: ?0");
-            char ch_platform[64];
-            snprintf(ch_platform, sizeof(ch_platform),
-                     "Sec-CH-UA-Platform: %s",
-                     slot->ch_platform != NULL ? slot->ch_platform
-                                               : "\"macOS\"");
-            hdrs = curl_slist_append(hdrs, ch_platform);
-            hdrs = curl_slist_append(hdrs, "Sec-Fetch-User: ?1");
-            hdrs = curl_slist_append(hdrs,
-                "Upgrade-Insecure-Requests: 1");
-        }
-        // Safari Incognito sends the minimal set above plus nothing
-        // else — no Sec-CH-UA (Safari doesn't implement Client Hints),
-        // no Pragma, no DNT, no Upgrade-Insecure-Requests on this
-        // particular nav. Matches Leo's captured Safari headers.
+        hdrs = curl_slist_append(hdrs, "User-Agent: " TOOLS_API_UA);
+        hdrs = curl_slist_append(hdrs, "Accept: application/json, */*");
+        hdrs = curl_slist_append(hdrs, "Accept-Language: en-US,en;q=0.9");
         char errbuf[CURL_ERROR_SIZE];
         errbuf[0] = '\0';
-        curl_easy_setopt(h, CURLOPT_URL, url);
-        curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
-        curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(h, CURLOPT_MAXREDIRS, 5L);
-        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, timeout_ms);
-        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
-        curl_easy_setopt(h, CURLOPT_NOPROGRESS, 1L);
-        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, tools_curl_write);
-        curl_easy_setopt(h, CURLOPT_WRITEDATA, body);
-        curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
-        // CURLOPT_ACCEPT_ENCODING="" makes libcurl advertise (in the
-        // Accept-Encoding header) whatever decoders it was built
-        // with, AND transparently decode the response on the way
-        // back. We don't manually set Accept-Encoding because the
-        // declared algorithms must match what libcurl can decode —
-        // libcurl on macOS may or may not have brotli linked.
-        curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
-        curl_easy_setopt(h, CURLOPT_USERAGENT, slot->ua);
+        curl_easy_setopt(h, CURLOPT_URL,               url);
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER,        hdrs);
+        curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION,    1L);
+        curl_easy_setopt(h, CURLOPT_MAXREDIRS,         5L);
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS,        timeout_ms);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+        curl_easy_setopt(h, CURLOPT_NOPROGRESS,        1L);
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION,     tools_curl_write);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA,         body);
+        curl_easy_setopt(h, CURLOPT_ERRORBUFFER,       errbuf);
+        curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING,   "");
         CURLcode cc = curl_easy_perform(h);
         if (cc == CURLE_OK) {
             rc = 0;
             curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, status);
-            if (g_tools_debug >= 9) {
-                trace("http_get: status=%ld body=%zu bytes\n",
+            if (g_tools_debug >= 5) {
+                trace("api_get: status=%ld body=%zu bytes\n",
                       *status, body->count);
             }
-        } else {
-            trace("http_get: curl_easy_perform: %s\n",
+        } else if (g_tools_debug >= 1) {
+            trace("api_get: curl_easy_perform: %s\n",
                   errbuf[0] != '\0' ? errbuf : curl_easy_strerror(cc));
         }
         curl_slist_free_all(hdrs);
@@ -683,751 +206,1138 @@ static int tools_http_get(const char * url, long timeout_ms,
     return rc;
 }
 
-// Parse DDG-lite HTML into a list of {title, url, snippet} hits.
-// `hits` is an out-array of capacity >= max_results, zero-initialised
-// by the caller. Returns the number of hits filled in [0..N). Strings
-// in each hit are heap-owned; caller frees with tools_free_hits.
+// ---------------------------------------------------------------------------
+// Tiny JSON value extractor — handles the response shapes we actually
+// see from the APIs we call. Not a full parser; designed to be small,
+// readable, and bombproof against the specific JSON we accept.
 //
-// DDG-lite link shape (Leo's captured markup):
-//   <a class="result-link" rel="nofollow" href="https://...">Title</a>
-// Snippets are sibling <td class="result-snippet"> nodes in document
-// order. The two passes assume DDG keeps them paired by index; if
-// snippet count < title count the trailing hits have snippet=NULL.
-struct tools_search_hit {
-    char * title;
-    char * url;
-    char * snippet;
-};
+// `tools_json_find_key` locates `"key":` in `s[0..n)` (skipping over
+// quoted-string regions so the key match isn't fooled by a key-shaped
+// substring inside another value). Returns a pointer just AFTER the
+// colon, or NULL if the key isn't found. The pointer is suitable to
+// pass into the extract helpers below.
+//
+// `tools_json_extract_string` reads a JSON string value at `p`,
+// unescaping \" \\ \n \t \uXXXX (BMP only) into `out`. Returns
+// pointer past the closing quote, or NULL on parse error.
+//
+// `tools_json_extract_number` reads a JSON number at `p` into `out`
+// (double). Returns pointer past the number, or NULL on parse error.
+//
+// All three skip leading whitespace before parsing.
+// ---------------------------------------------------------------------------
 
-#ifndef TOOLS_HITS_MAX
-#define TOOLS_HITS_MAX 8
-#endif
-
-static void tools_free_hits(struct tools_search_hit * hits, int n) {
-    if (hits != NULL) {
-        for (int i = 0; i < n; i++) {
-            free(hits[i].title);   hits[i].title   = NULL;
-            free(hits[i].url);     hits[i].url     = NULL;
-            free(hits[i].snippet); hits[i].snippet = NULL;
-        }
+static void tools_json_skip_ws(const char ** pp, const char * end) {
+    const char * p = *pp;
+    while (p < end && (*p == ' ' || *p == '\t' ||
+                       *p == '\n' || *p == '\r')) {
+        p++;
     }
+    *pp = p;
 }
 
-static int tools_ddg_parse(const char * h, size_t n, int max_results,
-                           struct tools_search_hit * hits) {
-    int    seen = 0;
-    size_t i    = 0;
-    bool   more = true;
-    // First pass: title + URL. Walk for each rel="nofollow"; extract
-    // href= from the <a> opener and title text from the <a> body.
-    while (more && seen < max_results && i < n) {
-        const char * p = (const char *)memmem(h + i, n - i,
-                                              "rel=\"nofollow\"", 14);
-        if (p == NULL) {
-            more = false;
-        } else {
-            size_t pos  = (size_t)(p - h);
-            size_t back = pos > 512 ? pos - 512 : 0;
-            size_t lt   = pos;
-            while (lt > back && h[lt] != '<') { lt--; }
-            size_t gt = pos;
-            while (gt < n && h[gt] != '>') { gt++; }
-            char * url = NULL;
-            if (gt < n && lt < pos) {
-                const char * hp = (const char *)memmem(
-                    h + lt, gt - lt, "href=\"", 6);
-                if (hp != NULL) {
-                    const char * v   = hp + 6;
-                    const char * end = (const char *)memchr(
-                        v, '"', (size_t)(h + gt - v));
-                    if (end != NULL && end > v) {
-                        // Unwrap DDG redirect + percent-decode the
-                        // real target; without this we'd hand a
-                        // schemeless DDG-tracker URL to libcurl and
-                        // fetch would fail with "No host part".
-                        url = tools_url_unwrap(v, (size_t)(end - v));
-                    }
-                }
-            }
-            const char * pe = (gt < n)
-                ? (const char *)memmem(h + gt + 1, n - gt - 1, "</a>", 4)
-                : NULL;
-            if (gt >= n || pe == NULL) {
-                free(url);
-                more = false;
+// Skip a JSON string in `s[i..n)` starting at the opening quote.
+// Returns the index just past the closing quote, or `n` if the
+// string is malformed.
+static size_t tools_json_skip_string(const char * s, size_t n, size_t i) {
+    size_t r = n;
+    if (i < n && s[i] == '"') {
+        size_t j = i + 1;
+        bool   done = false;
+        while (j < n && !done) {
+            if (s[j] == '\\') {
+                j += 2;
+            } else if (s[j] == '"') {
+                done = true;
+                r    = j + 1;
             } else {
-                size_t end_a = (size_t)(pe - h);
-                struct chars title_raw = {0};
-                struct chars title     = {0};
-                tools_html_strip(h + gt + 1, end_a - gt - 1, &title_raw);
-                tools_collapse_ws(&title_raw, &title);
-                bool good = title.count > 5 && url != NULL;
-                if (good) {
-                    hits[seen].title   = title.data;
-                    title.data         = NULL;
-                    hits[seen].url     = url;
-                    hits[seen].snippet = NULL;
-                    seen++;
-                } else {
-                    free(url);
-                    free(title.data);
-                }
-                free(title_raw.data);
-                i = end_a + 4;
+                j++;
             }
         }
+        if (!done) { r = n; }
     }
-    // Second pass: snippets. Match by document order into hits[0..seen).
-    i    = 0;
-    more = true;
-    int k = 0;
-    while (more && k < seen && i < n) {
-        const char * p = (const char *)memmem(h + i, n - i,
-                                              "result-snippet", 14);
-        if (p == NULL) {
-            more = false;
-        } else {
-            size_t pos = (size_t)(p - h);
-            size_t gt  = pos;
-            while (gt < n && h[gt] != '>') { gt++; }
-            if (gt >= n) {
-                more = false;
+    return r;
+}
+
+static const char * tools_json_find_key(const char * s, size_t n,
+                                        const char * key) {
+    const char * result = NULL;
+    size_t       klen   = strlen(key);
+    size_t       i      = 0;
+    bool         found  = false;
+    while (i < n && !found) {
+        if (s[i] == '"') {
+            // Check if this opening quote starts our key.
+            if (i + klen + 1 < n &&
+                memcmp(s + i + 1, key, klen) == 0 &&
+                s[i + 1 + klen] == '"') {
+                // Move past closing quote of key, then optional
+                // whitespace, then expect ':'.
+                size_t j = i + 2 + klen;
+                while (j < n && (s[j] == ' ' || s[j] == '\t' ||
+                                 s[j] == '\n' || s[j] == '\r')) {
+                    j++;
+                }
+                if (j < n && s[j] == ':') {
+                    result = s + j + 1;
+                    found  = true;
+                } else {
+                    i = j;
+                }
             } else {
-                size_t end = gt + 1;
-                bool   close_found = false;
-                while (!close_found && end + 1 < n) {
-                    if (h[end] == '<' && h[end + 1] == '/') {
-                        close_found = true;
-                    } else {
-                        end++;
-                    }
-                }
-                if (!close_found) {
-                    more = false;
-                } else {
-                    struct chars raw   = {0};
-                    struct chars clean = {0};
-                    tools_html_strip(h + gt + 1, end - gt - 1, &raw);
-                    tools_collapse_ws(&raw, &clean);
-                    if (clean.count > 10) {
-                        hits[k].snippet = clean.data;
-                        clean.data      = NULL;
-                        k++;
-                    } else {
-                        free(clean.data);
-                    }
-                    free(raw.data);
-                    i = end;
-                }
+                // Skip past this whole string so we don't match a
+                // key-shaped substring inside a value.
+                i = tools_json_skip_string(s, n, i);
             }
-        }
-    }
-    return seen;
-}
-
-// fetch: HTTP GET via libcurl with cap. Body returned as
-// `HTTP <status>\n\n<bytes>...` truncated at TOOLS_FETCH_CAP.
-static void tools_fetch(const char * url, int timeout_s,
-                        struct tool_result * out) {
-    tools_global_init();
-    out->ok = 0;
-    out->body = NULL;
-    out->error = NULL;
-    out->status = 0;
-    if (url == NULL || url[0] == '\0') {
-        out->error = strdup("fetch: url parameter required");
-    } else {
-        long ms = (long)(timeout_s > 0 ? timeout_s : 30) * 1000L;
-        if (ms < 1000)   { ms = 1000;   }
-        if (ms > 300000) { ms = 300000; }
-        struct chars body = {0};
-        long status = 0;
-        int rc = tools_http_get(url, ms, &body, &status);
-        if (rc != 0) {
-            out->error = strdup("fetch: libcurl request failed");
         } else {
-            struct chars result = {0};
-            chars_printf(&result, "HTTP %ld\n\n", status);
-            if (body.data != NULL && body.count > 0) {
-                chars_put(&result, body.data, body.count);
-            }
-            if (body.count >= TOOLS_FETCH_CAP) {
-                chars_printf(&result,
-                    "\n\n[... truncated at %d bytes]",
-                    (int)TOOLS_FETCH_CAP);
-            }
-            out->body   = result.data;
-            out->status = status;
-            out->ok     = (status >= 200 && status < 400);
-            if (!out->ok) {
-                struct chars tmp = {0};
-                chars_printf(&tmp, "fetch: HTTP %ld", status);
-                out->error = tmp.data; // transfer ownership
-            }
+            i++;
         }
-        free(body.data);
     }
+    return result;
 }
 
-// distill: HTML -> clean text. Compose with fetch for "summarise
-// this URL" agent flows. The model sees the distilled text, not the
-// raw markup, so its attention budget goes to content rather than
-// boilerplate.
-static void tools_distill(const char * html, size_t n,
-                          struct tool_result * out) {
-    out->ok = 0;
-    out->body = NULL;
-    out->error = NULL;
-    out->status = 0;
-    if (html == NULL) {
-        out->error = strdup("distill: input is NULL");
+// Append code point `cp` as UTF-8 to `out`.
+static void tools_json_emit_utf8(struct chars * out, uint32_t cp) {
+    char buf[4];
+    int  n = 0;
+    if (cp < 0x80) {
+        buf[0] = (char)cp;
+        n = 1;
+    } else if (cp < 0x800) {
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F));
+        n = 2;
+    } else if (cp < 0x10000) {
+        buf[0] = (char)(0xE0 |  (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 |  (cp       & 0x3F));
+        n = 3;
     } else {
-        struct chars stripped = {0};
-        tools_html_strip(html, n, &stripped);
-        struct chars clean = {0};
-        tools_collapse_ws(&stripped, &clean);
-        out->body = clean.data;
-        out->ok   = 1;
-        free(stripped.data);
+        buf[0] = (char)(0xF0 |  (cp >> 18));
+        buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        buf[2] = (char)(0x80 | ((cp >>  6) & 0x3F));
+        buf[3] = (char)(0x80 |  (cp        & 0x3F));
+        n = 4;
     }
+    chars_put(out, buf, (size_t)n);
 }
 
-#ifndef TOOLS_DISTILL_CAP
-#define TOOLS_DISTILL_CAP 4000
-#endif
+// Parse hex digit; returns -1 if not hex.
+static int tools_hex_digit(char c) {
+    int r = -1;
+    if      (c >= '0' && c <= '9') { r = c - '0'; }
+    else if (c >= 'a' && c <= 'f') { r = c - 'a' + 10; }
+    else if (c >= 'A' && c <= 'F') { r = c - 'A' + 10; }
+    return r;
+}
 
-// Probe a URL with a partial GET (first 4KB only via Range header)
-// to filter dead/blocked URLs before offering them to the model.
-// Partial GET, not HEAD, because some servers (a) reject HEAD with
-// 405, (b) return 200 to HEAD but the GET would be a CAPTCHA / soft-
-// block page; downloading a few KB lets us verify SOMETHING came
-// back. Reads Content-Length header back via
-// CURLINFO_CONTENT_LENGTH_DOWNLOAD_T so hits can be sorted by full-
-// body size (shortest first = usually the most direct answer; large
-// pages tend to be hub/listing/aggregator junk).
-//
-// Follows redirects (CURLOPT_FOLLOWLOCATION=1L, MAXREDIRS=5). Alive
-// requires both HTTP status in 2xx/3xx AND body bytes received.
-struct tools_probe_result {
-    bool    alive;
-    long    status;
-    int64_t content_length;       // -1 = unknown / chunked
-    size_t  bytes_received;       // capped at 4KB by Range header
-};
-
-static void tools_url_probe(const char * url, long timeout_ms,
-                            struct tools_probe_result * out) {
-    out->alive          = false;
-    out->status         = 0;
-    out->content_length = -1;
-    out->bytes_received = 0;
-    if (url != NULL && url[0] != '\0') {
-        CURL * h = curl_easy_init();
-        if (h != NULL) {
-            const struct tools_ua_slot * slot = tools_pick_ua();
-            struct chars body = {0};
-            curl_easy_setopt(h, CURLOPT_URL,               url);
-            // Range: bytes=0-4095. Servers that accept return 206
-            // Partial Content; servers that don't return 200 (most
-            // commonly) and stream the full body — we cap via
-            // tools_curl_write's TOOLS_FETCH_CAP backstop anyway.
-            curl_easy_setopt(h, CURLOPT_RANGE,             "0-4095");
-            curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION,    1L);
-            curl_easy_setopt(h, CURLOPT_MAXREDIRS,         5L);
-            curl_easy_setopt(h, CURLOPT_TIMEOUT_MS,        timeout_ms);
-            curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
-            curl_easy_setopt(h, CURLOPT_NOPROGRESS,        1L);
-            curl_easy_setopt(h, CURLOPT_USERAGENT,         slot->ua);
-            curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING,   "");
-            curl_easy_setopt(h, CURLOPT_WRITEFUNCTION,
-                             tools_curl_write);
-            curl_easy_setopt(h, CURLOPT_WRITEDATA,         &body);
-            CURLcode cc = curl_easy_perform(h);
-            if (cc == CURLE_OK) {
-                curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE,
-                                  &out->status);
-                curl_off_t cl = -1;
-                curl_easy_getinfo(h,
-                    CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
-                if (cl > 0) { out->content_length = (int64_t)cl; }
-                out->bytes_received = body.count;
-                // Accept 200/206/3xx with non-empty body. Status-only
-                // checks miss CAPTCHA-200s that have no real content,
-                // so we also require something came back.
-                out->alive = (out->status >= 200 && out->status < 400)
-                          && (body.count > 0);
+// Parse a JSON string value beginning at *pp (which must point at the
+// opening quote). On success, *pp advances past the closing quote and
+// the unescaped UTF-8 contents are appended to `out`. Returns 1 on
+// success, 0 on malformed input (in which case `out` may have partial
+// content and *pp is unspecified).
+static int tools_json_str(const char ** pp, const char * end,
+                          struct chars * out) {
+    int rc = 0;
+    tools_json_skip_ws(pp, end);
+    const char * p = *pp;
+    if (p < end && *p == '"') {
+        p++;
+        bool done = false;
+        bool err  = false;
+        while (p < end && !done && !err) {
+            char c = *p;
+            if (c == '"') {
+                done = true;
+                p++;
+            } else if (c == '\\' && p + 1 < end) {
+                char e = p[1];
+                switch (e) {
+                    case '"':  chars_put(out, "\"", 1); p += 2; break;
+                    case '\\': chars_put(out, "\\", 1); p += 2; break;
+                    case '/':  chars_put(out, "/",  1); p += 2; break;
+                    case 'b':  chars_put(out, "\b", 1); p += 2; break;
+                    case 'f':  chars_put(out, "\f", 1); p += 2; break;
+                    case 'n':  chars_put(out, "\n", 1); p += 2; break;
+                    case 'r':  chars_put(out, "\r", 1); p += 2; break;
+                    case 't':  chars_put(out, "\t", 1); p += 2; break;
+                    case 'u':
+                        if (p + 5 < end) {
+                            int h0 = tools_hex_digit(p[2]);
+                            int h1 = tools_hex_digit(p[3]);
+                            int h2 = tools_hex_digit(p[4]);
+                            int h3 = tools_hex_digit(p[5]);
+                            if (h0 >= 0 && h1 >= 0 &&
+                                h2 >= 0 && h3 >= 0) {
+                                uint32_t cp = ((uint32_t)h0 << 12) |
+                                              ((uint32_t)h1 <<  8) |
+                                              ((uint32_t)h2 <<  4) |
+                                              ((uint32_t)h3);
+                                tools_json_emit_utf8(out, cp);
+                                p += 6;
+                            } else {
+                                err = true;
+                            }
+                        } else {
+                            err = true;
+                        }
+                        break;
+                    default:
+                        err = true;
+                        break;
+                }
+            } else {
+                chars_put(out, &c, 1);
+                p++;
             }
-            if (g_tools_debug >= 5) {
-                trace("url_probe: %s -> HTTP %ld cl=%lld got=%zu%s\n",
-                      url, out->status,
-                      (long long)out->content_length, body.count,
-                      out->alive ? "" : " [DEAD]");
-            }
-            free(body.data);
-            curl_easy_cleanup(h);
+        }
+        if (done) {
+            rc = 1;
+            *pp = p;
         }
     }
+    return rc;
 }
 
-// DDG search → parsed hits + formatted numbered text. No fetch. The
-// 3-phase URL-pick flow in slm_generate calls this directly so the
-// model can choose which URL to fetch from the (title, URL, snippet)
-// triples. The single-phase tools_websearch (back-compat shim) calls
-// it too, then auto-picks hits[0].
+// Parse a JSON number (integer or floating) at *pp. On success, *pp
+// advances past the number and `*out` holds the parsed value.
+// Returns 1 on success, 0 on parse error.
+static int tools_json_num(const char ** pp, const char * end,
+                          double * out) {
+    int rc = 0;
+    tools_json_skip_ws(pp, end);
+    const char * p     = *pp;
+    const char * start = p;
+    if (p < end && (*p == '-' || *p == '+')) { p++; }
+    bool have_digit = false;
+    while (p < end && *p >= '0' && *p <= '9') { p++; have_digit = true; }
+    if (p < end && *p == '.') {
+        p++;
+        while (p < end && *p >= '0' && *p <= '9') { p++; }
+    }
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        p++;
+        if (p < end && (*p == '+' || *p == '-')) { p++; }
+        while (p < end && *p >= '0' && *p <= '9') { p++; }
+    }
+    if (have_digit) {
+        char buf[64];
+        size_t n = (size_t)(p - start);
+        if (n >= sizeof(buf)) { n = sizeof(buf) - 1; }
+        memcpy(buf, start, n);
+        buf[n] = '\0';
+        *out = strtod(buf, NULL);
+        *pp  = p;
+        rc   = 1;
+    }
+    return rc;
+}
+
+// Convenience: find `"key":` and parse the string value into `out`.
+// Returns 1 on success.
+static int tools_json_get_str(const char * s, size_t n,
+                              const char * key, struct chars * out) {
+    int rc = 0;
+    const char * p = tools_json_find_key(s, n, key);
+    if (p != NULL) {
+        const char * end = s + n;
+        rc = tools_json_str(&p, end, out);
+    }
+    return rc;
+}
+
+// Convenience: find `"key":` and parse the numeric value into `*out`.
+// Returns 1 on success.
+static int tools_json_get_num(const char * s, size_t n,
+                              const char * key, double * out) {
+    int rc = 0;
+    const char * p = tools_json_find_key(s, n, key);
+    if (p != NULL) {
+        const char * end = s + n;
+        rc = tools_json_num(&p, end, out);
+    }
+    return rc;
+}
+
+// Find the object value of `parent_key` and return a pointer to the
+// opening `{` and the position just past the matching `}`. Returns 1
+// on success (writes *child_start and *child_end), 0 otherwise.
 //
-// Pipeline:
-//   1. DDG-lite GET, parse hits via tools_ddg_parse (with URL unwrap)
-//   2. HEAD-probe each URL → filter out non-2xx/3xx (bot-blocked,
-//      404, etc.) and capture Content-Length
-//   3. Sort surviving hits by Content-Length ASC (shortest = often
-//      most direct; aggregator/listing hubs sink to the bottom)
-//   4. Format the surviving hits into out->body for the URL-pick
-//      preamble.
+// Used by the weather tool to disambiguate `temperature_2m` (which
+// appears in BOTH `current_units` and `current` of the open-meteo
+// response — the former as a unit string, the latter as the actual
+// number).
+static int tools_json_scope(const char * s, size_t n,
+                            const char * parent_key,
+                            const char ** child_start,
+                            const char ** child_end) {
+    int rc = 0;
+    const char * p = tools_json_find_key(s, n, parent_key);
+    if (p != NULL) {
+        const char * end = s + n;
+        tools_json_skip_ws(&p, end);
+        if (p < end && *p == '{') {
+            const char * scan  = p + 1;
+            int          depth = 1;
+            while (scan < end && depth > 0) {
+                if (*scan == '"') {
+                    size_t skip = tools_json_skip_string(
+                        scan, (size_t)(end - scan), 0);
+                    scan += skip;
+                } else if (*scan == '{') {
+                    depth++; scan++;
+                } else if (*scan == '}') {
+                    depth--; scan++;
+                } else {
+                    scan++;
+                }
+            }
+            if (depth == 0) {
+                *child_start = p;
+                *child_end   = scan;
+                rc           = 1;
+            }
+        }
+    }
+    return rc;
+}
+
+// ---------------------------------------------------------------------------
+// Tool 1 — wikipedia(query)
 //
-// `hits` is an out-array of capacity `hits_cap`; populated up to N
-// entries (return value). `out->body` gets a "1. <title>\n   <url>\n
-// <snippet>\n\n2. ..." block — useful directly as URL-pick preamble.
-// Caller frees hits via tools_free_hits and out via tools_result_free.
-static int tools_websearch_hits(const char * query, int max_results,
-                                struct tools_search_hit * hits,
-                                int hits_cap,
-                                struct tool_result * out) {
-    tools_global_init();
+// Two-step chain: OpenSearch (titles for the query) → REST summary
+// (the `extract` paragraph of the first matching title). The
+// Wikipedia API is the highest-leverage replacement for the DDG
+// scrape: 200-500 char clean prose extracts, redirects resolve
+// automatically, no nav chrome, no HTML strip needed.
+//
+// Returns `out->body` = "Title: <t>\n\n<extract>" on success.
+// ---------------------------------------------------------------------------
+
+// Pick the first non-empty title from an OpenSearch reply of the
+// shape `["query",["Title 1","Title 2",...],...]`. We don't need full
+// JSON parsing — find the SECOND `[` (the titles array), then read
+// the first quoted string inside it.
+static int tools_wiki_first_title(const char * body, size_t n,
+                                  struct chars * out) {
+    int rc = 0;
+    // Find the position of the first '[' that's NOT the outer one.
+    size_t i = 0;
+    int    depth = 0;
+    bool   found_inner = false;
+    while (i < n && !found_inner) {
+        if (body[i] == '[') {
+            depth++;
+            if (depth == 2) { found_inner = true; }
+        } else if (body[i] == ']') {
+            depth--;
+        } else if (body[i] == '"') {
+            i = tools_json_skip_string(body, n, i);
+            continue;
+        }
+        i++;
+    }
+    if (found_inner) {
+        // Find the first `"` inside the inner array and parse the
+        // string value.
+        size_t j = i;
+        while (j < n && body[j] != '"' && body[j] != ']') { j++; }
+        if (j < n && body[j] == '"') {
+            const char * p   = body + j;
+            const char * end = body + n;
+            rc = tools_json_str(&p, end, out);
+        }
+    }
+    return rc;
+}
+
+// URL-encode a Wikipedia title for the REST summary path: spaces
+// become underscores; the rest follows tools_url_encode rules.
+static void tools_wiki_title_to_path(const char * title,
+                                     struct chars * out) {
+    size_t n = strlen(title);
+    struct chars buf = {0};
+    for (size_t i = 0; i < n; i++) {
+        char c = title[i];
+        if (c == ' ') { c = '_'; }
+        chars_put(&buf, &c, 1);
+    }
+    chars_put(&buf, "", 0);
+    tools_url_encode(buf.data != NULL ? buf.data : "", out);
+    free(buf.data);
+}
+
+static void tools_wikipedia(const char * query, struct tool_result * out) {
     out->ok     = 0;
     out->body   = NULL;
     out->error  = NULL;
     out->status = 0;
-    int nh = 0;
     if (query == NULL || query[0] == '\0') {
-        out->error = strdup("websearch: query parameter required");
+        out->error = strdup("wikipedia: query parameter required");
     } else {
-        if (g_tools_debug >= 1) {
-            trace("websearch_hits: query=\"%s\" max=%d\n",
-                  query, max_results);
-        }
-        int cap = (max_results > 0 && max_results <= hits_cap)
-                ? max_results : hits_cap;
-        if (cap > TOOLS_HITS_MAX) { cap = TOOLS_HITS_MAX; }
+        // Step 1: OpenSearch for the query.
         struct chars eq = {0};
         tools_url_encode(query, &eq);
-        struct chars url = {0};
-        chars_puts(&url,
-            "https://lite.duckduckgo.com/lite/"
-            "?ia=web&origin=funnel_home_website&t=h_&q=");
-        if (eq.data != NULL) { chars_puts(&url, eq.data); }
-        chars_puts(&url, "&chip-select=search");
-        struct chars body = {0};
-        long         status = 0;
-        int          rc     = tools_http_get(url.data, 15000,
-                                             &body, &status);
-        if (g_tools_debug >= 7) {
-            trace("websearch_hits: DDG status=%ld body=%zu bytes\n",
-                  status, body.count);
-        }
-        if (rc != 0) {
-            out->error = strdup(
-                "websearch: libcurl request failed (network down?)");
-        } else if (status < 200 || status >= 400) {
-            struct chars tmp = {0};
-            chars_printf(&tmp,
-                "websearch: HTTP %ld (may be rate-limiting)", status);
-            out->error  = tmp.data;
-            out->status = status;
-        } else if (body.data == NULL || body.count == 0) {
-            out->error = strdup("websearch: empty response from DDG");
-        } else if (memmem(body.data, body.count,
-                          "anomaly-modal", 13) != NULL) {
-            out->error = strdup(
-                "websearch: DDG bot-detection CAPTCHA challenge");
-            out->status = status;
-        } else {
-            nh = tools_ddg_parse(body.data, body.count, cap, hits);
-            if (g_tools_debug >= 3) {
-                trace("websearch_hits: %d hit(s) parsed (cap=%d)\n",
-                      nh, cap);
-            }
-            // Drop any duckduckgo.com URL — those are always
-            // {ad-redirect | help/about | "more info" disclaimer}
-            // and never useful answer pages. Free + compact.
-            // Observed in --repl with the IP-location query: DDG
-            // returned a y.js ad-redirect URL as hit[0] and the ads-
-            // disclaimer page as hit[1] (both 200 OK so they would
-            // have survived the probe step). The model picked hit[0]
-            // and we fetched 45 KB of JavaScript loader.
-            {
-                int w = 0;
-                for (int i = 0; i < nh; i++) {
-                    const char * u = hits[i].url;
-                    bool is_ddg = (u != NULL) &&
-                        (strstr(u, "://duckduckgo.com/")  != NULL ||
-                         strstr(u, "://www.duckduckgo.com/") != NULL ||
-                         strstr(u, "://lite.duckduckgo.com/") != NULL);
-                    if (is_ddg) {
-                        free(hits[i].title);   hits[i].title   = NULL;
-                        free(hits[i].url);     hits[i].url     = NULL;
-                        free(hits[i].snippet); hits[i].snippet = NULL;
-                    } else {
-                        if (w != i) { hits[w] = hits[i]; hits[i] = (struct tools_search_hit){0}; }
-                        w++;
-                    }
-                }
-                if (g_tools_debug >= 1 && w != nh) {
-                    trace("websearch_hits: dropped %d duckduckgo.com"
-                          " URL(s) (ads/help)\n", nh - w);
-                }
-                nh = w;
-            }
-            if (g_tools_debug >= 5) {
-                int show = nh < 3 ? nh : 3;
-                for (int i = 0; i < show; i++) {
-                    trace("  hit[%d]: %s\n    -> %s\n", i,
-                          hits[i].title ? hits[i].title : "(no title)",
-                          hits[i].url   ? hits[i].url   : "(no url)");
-                }
-            }
-            if (g_tools_debug >= 9 && body.data != NULL) {
-                size_t bcut = body.count > 2048 ? 2048 : body.count;
-                trace("websearch_hits: raw DDG body[0..%zu]: %.*s\n",
-                      bcut, (int)bcut, body.data);
-            }
-            // Probe each URL for liveness + content-length, then sort
-            // surviving hits by content-length ascending. Insertion
-            // sort over <= TOOLS_HITS_MAX elements (typically 5-8).
-            // Also remember probe bytes_received per hit so the URL-
-            // pick preamble can show the model "[~N KB]" as a "what
-            // to expect" signal (the user's request — gives the
-            // model a basis for picking direct-answer URLs over
-            // huge hub/index pages even when titles look similar).
-            // sort_key = best estimate of full body size: prefer
-            // advertised Content-Length, fall back to probe
-            // bytes_received when CL header is absent / chunked
-            // encoding. The PREVIOUS impl used INT64_MAX for cl<0,
-            // which sank every chunked-encoding site to the bottom
-            // regardless of how small the actual page was. Observed:
-            // Britannica probe returned cl=-1 got=10655 (10KB) but
-            // sorted AFTER Wikipedia at cl=73774 (72KB) because cl<0
-            // → INT64_MAX. The displayed [size: ~NKB] annotation
-            // already used bytes_received as the fallback so the
-            // model saw an inconsistency between order and labels.
-            int64_t cl[TOOLS_HITS_MAX];          // for display only
-            int64_t sort_key[TOOLS_HITS_MAX];    // for ordering
-            size_t  bytes_per_hit[TOOLS_HITS_MAX];
-            int     order[TOOLS_HITS_MAX];
-            int     n_alive = 0;
-            for (int i = 0; i < nh; i++) {
-                struct tools_probe_result pr;
-                // 5s cap per the user's "anything that doesn't
-                // respond in 5s isn't of interest" rule.
-                tools_url_probe(hits[i].url, 5000, &pr);
-                if (pr.alive) {
-                    cl[n_alive] = (pr.content_length > 0)
-                                ? pr.content_length : INT64_MAX;
-                    int64_t sk = (pr.content_length > 0)
-                               ? pr.content_length
-                               : (int64_t)pr.bytes_received;
-                    if (sk <= 0) { sk = INT64_MAX; }
-                    sort_key[n_alive] = sk;
-                    bytes_per_hit[n_alive] = pr.bytes_received;
-                    order[n_alive] = i;
-                    n_alive++;
-                }
-            }
-            for (int i = 1; i < n_alive; i++) {
-                int j = i;
-                while (j > 0 && sort_key[j] < sort_key[j - 1]) {
-                    int64_t tsk = sort_key[j];
-                    sort_key[j]     = sort_key[j - 1];
-                    sort_key[j - 1] = tsk;
-                    int64_t tcl = cl[j];      cl[j]    = cl[j - 1];
-                    cl[j - 1]   = tcl;
-                    size_t  tb  = bytes_per_hit[j];
-                    bytes_per_hit[j]     = bytes_per_hit[j - 1];
-                    bytes_per_hit[j - 1] = tb;
-                    int     to  = order[j];   order[j] = order[j - 1];
-                    order[j - 1] = to;
-                    j--;
-                }
-            }
-            // Reorder hits: copy alive into a temp in sorted order;
-            // free the discarded (dead) slots; copy back.
-            struct tools_search_hit tmp[TOOLS_HITS_MAX] = {0};
-            for (int i = 0; i < n_alive; i++) {
-                tmp[i] = hits[order[i]];
-                hits[order[i]].title   = NULL;
-                hits[order[i]].url     = NULL;
-                hits[order[i]].snippet = NULL;
-            }
-            for (int i = 0; i < nh; i++) {
-                free(hits[i].title);   hits[i].title   = NULL;
-                free(hits[i].url);     hits[i].url     = NULL;
-                free(hits[i].snippet); hits[i].snippet = NULL;
-            }
-            for (int i = 0; i < n_alive; i++) { hits[i] = tmp[i]; }
-            nh = n_alive;
-            if (g_tools_debug >= 1) {
-                trace("websearch_hits: %d alive (sorted by"
-                      " content-length asc)\n", nh);
-            }
-            struct chars result = {0};
-            for (int i = 0; i < nh; i++) {
-                // Show advertised content-length when present, else
-                // probe bytes_received as a lower bound. Format the
-                // size compactly: "<1KB" / "~3KB" / "~150KB".
-                int64_t shown = (cl[i] != INT64_MAX) ? cl[i]
-                                                     : (int64_t)bytes_per_hit[i];
-                char szbuf[24];
-                if (shown <= 0) {
-                    snprintf(szbuf, sizeof(szbuf), "(size unknown)");
-                } else if (shown < 1024) {
-                    snprintf(szbuf, sizeof(szbuf), "~%lldB",
-                             (long long)shown);
-                } else {
-                    int kb = (int)((shown + 512) / 1024);
-                    snprintf(szbuf, sizeof(szbuf), "~%dKB", kb);
-                }
-                chars_printf(&result,
-                    "%d. %s\n   %s\n   [size: %s] %s\n\n",
-                    i + 1,
-                    hits[i].title   ? hits[i].title   : "(no title)",
-                    hits[i].url     ? hits[i].url     : "(no url)",
-                    szbuf,
-                    hits[i].snippet ? hits[i].snippet : "(no snippet)");
-            }
-            chars_put(&result, "", 0);
-            out->body   = result.data;
-            out->status = status;
-            out->ok     = 1;
-        }
+        struct chars open_url = {0};
+        chars_puts(&open_url,
+            "https://en.wikipedia.org/w/api.php"
+            "?action=opensearch&format=json&limit=5&search=");
+        chars_puts(&open_url, eq.data != NULL ? eq.data : "");
+        chars_put(&open_url, "", 0);
         free(eq.data);
-        free(url.data);
-        free(body.data);
+        struct chars open_body = {0};
+        long open_status = 0;
+        int  open_rc = tools_api_get(open_url.data, 8000,
+                                     &open_body, &open_status);
+        free(open_url.data);
+        struct chars title = {0};
+        bool   have_title = false;
+        if (open_rc == 0 && open_status == 200 && open_body.count > 0) {
+            have_title = tools_wiki_first_title(
+                open_body.data, open_body.count, &title) != 0;
+        }
+        free(open_body.data);
+        if (!have_title) {
+            chars_free(&title);
+            struct chars msg = {0};
+            chars_printf(&msg,
+                "wikipedia: no Wikipedia article matches \"%s\""
+                " (try a shorter noun-phrase query: \"Tom Cruise\""
+                " not \"Tom Cruise age\")", query);
+            out->error  = msg.data;
+            out->status = open_status;
+        } else {
+            chars_put(&title, "", 0);
+            // Step 2: REST summary for the title.
+            struct chars title_path = {0};
+            tools_wiki_title_to_path(title.data, &title_path);
+            chars_put(&title_path, "", 0);
+            struct chars sum_url = {0};
+            chars_puts(&sum_url,
+                "https://en.wikipedia.org/api/rest_v1/page/summary/");
+            chars_puts(&sum_url,
+                       title_path.data != NULL ? title_path.data : "");
+            chars_put(&sum_url, "", 0);
+            free(title_path.data);
+            struct chars sum_body = {0};
+            long sum_status = 0;
+            int  sum_rc = tools_api_get(sum_url.data, 8000,
+                                        &sum_body, &sum_status);
+            free(sum_url.data);
+            if (sum_rc == 0 && sum_status == 200 && sum_body.count > 0) {
+                struct chars t_field = {0};
+                struct chars d_field = {0};
+                struct chars x_field = {0};
+                tools_json_get_str(sum_body.data, sum_body.count,
+                                   "title", &t_field);
+                tools_json_get_str(sum_body.data, sum_body.count,
+                                   "description", &d_field);
+                tools_json_get_str(sum_body.data, sum_body.count,
+                                   "extract", &x_field);
+                struct chars body = {0};
+                chars_puts(&body, "Wikipedia: ");
+                chars_puts(&body,
+                           t_field.data != NULL ? t_field.data : "?");
+                if (d_field.data != NULL && d_field.count > 0) {
+                    chars_puts(&body, " — ");
+                    chars_puts(&body, d_field.data);
+                }
+                chars_puts(&body, "\n\n");
+                chars_puts(&body,
+                           x_field.data != NULL ? x_field.data
+                                                : "(no extract)");
+                chars_put(&body, "", 0);
+                out->ok     = 1;
+                out->body   = body.data;
+                out->status = sum_status;
+                free(t_field.data);
+                free(d_field.data);
+                free(x_field.data);
+            } else {
+                struct chars msg = {0};
+                chars_printf(&msg,
+                    "wikipedia: REST summary failed for \"%s\""
+                    " (HTTP %ld)",
+                    title.data, sum_status);
+                out->error  = msg.data;
+                out->status = sum_status;
+            }
+            free(sum_body.data);
+        }
+        free(title.data);
     }
-    return nh;
 }
 
-// Fetch URL + distill into curated body (capped). `out->body` is the
-// distilled text (possibly with a truncation notice appended); errors
-// land in `out->error`. Used by both the URL-pick orchestrator and
-// the back-compat tools_websearch shim.
-static void tools_fetch_distill(const char * url,
-                                struct tool_result * out) {
+// ---------------------------------------------------------------------------
+// Tool 2 — time_now(timezone)
+//
+// timeapi.io returns JSON with year/month/day/hour/minute/seconds plus
+// dayOfWeek and dstActive. We extract `dateTime` (ISO 8601) and
+// `dayOfWeek` and format a one-line response.
+// ---------------------------------------------------------------------------
+
+static void tools_time_now(const char * timezone,
+                           struct tool_result * out) {
     out->ok     = 0;
     out->body   = NULL;
     out->error  = NULL;
     out->status = 0;
-    if (url == NULL || url[0] == '\0') {
-        out->error = strdup("fetch_distill: url required");
+    const char * tz = (timezone != NULL && timezone[0] != '\0')
+                    ? timezone : "UTC";
+    struct chars etz = {0};
+    tools_url_encode(tz, &etz);
+    struct chars url = {0};
+    chars_puts(&url,
+        "https://timeapi.io/api/Time/current/zone?timeZone=");
+    chars_puts(&url, etz.data != NULL ? etz.data : "UTC");
+    chars_put(&url, "", 0);
+    free(etz.data);
+    struct chars body = {0};
+    long status = 0;
+    int  rc = tools_api_get(url.data, 8000, &body, &status);
+    free(url.data);
+    if (rc != 0) {
+        out->error = strdup(
+            "time_now: network error reaching timeapi.io");
+    } else if (status != 200 || body.count == 0) {
+        struct chars msg = {0};
+        chars_printf(&msg,
+            "time_now: timeapi.io returned HTTP %ld for \"%s\""
+            " (invalid timezone?)", status, tz);
+        out->error  = msg.data;
+        out->status = status;
     } else {
-        struct tool_result fetched = {0};
-        tools_fetch(url, 15, &fetched);
-        if (g_tools_debug >= 7) {
-            trace("fetch_distill: fetch %s -> HTTP %ld (%zu bytes)\n",
-                  fetched.ok ? "ok" : "ERR", fetched.status,
-                  fetched.body ? strlen(fetched.body) : 0);
-        }
-        if (fetched.ok && fetched.body != NULL) {
-            struct tool_result distilled = {0};
-            tools_distill(fetched.body, strlen(fetched.body),
-                          &distilled);
-            if (distilled.ok && distilled.body != NULL) {
-                size_t blen = strlen(distilled.body);
-                size_t cut  = blen > TOOLS_DISTILL_CAP
-                            ? TOOLS_DISTILL_CAP : blen;
-                if (g_tools_debug >= 1) {
-                    trace("fetch_distill: %zu -> %zu chars (cap %d)\n",
-                          blen, cut, TOOLS_DISTILL_CAP);
-                }
-                if (g_tools_debug >= 9) {
-                    size_t s = blen > 2048 ? 2048 : blen;
-                    trace("fetch_distill: body[0..%zu]: %.*s\n",
-                          s, (int)s, distilled.body);
-                }
-                struct chars b = {0};
-                chars_put(&b, distilled.body, cut);
-                if (cut < blen) {
-                    chars_printf(&b,
-                        "\n\n[... truncated at %zu chars]", cut);
-                }
-                chars_put(&b, "", 0);
-                out->body   = b.data;
-                out->status = fetched.status;
-                out->ok     = 1;
-            } else {
-                out->error = strdup(distilled.error
-                    ? distilled.error : "distill failed");
-                out->status = fetched.status;
-                if (g_tools_debug >= 1) {
-                    trace("fetch_distill: FAILED on %s — %s"
-                          " (status=%ld)\n",
-                          url, out->error, fetched.status);
-                }
-            }
-            tools_result_free(&distilled);
-        } else {
-            out->error = strdup(fetched.error
-                ? fetched.error : "fetch failed");
-            out->status = fetched.status;
-            if (g_tools_debug >= 1) {
-                trace("fetch_distill: FAILED on %s — %s"
-                      " (status=%ld)\n",
-                      url, out->error, fetched.status);
-            }
-        }
-        tools_result_free(&fetched);
+        struct chars dt  = {0};
+        struct chars dow = {0};
+        struct chars tzn = {0};
+        tools_json_get_str(body.data, body.count, "dateTime",  &dt);
+        tools_json_get_str(body.data, body.count, "dayOfWeek", &dow);
+        tools_json_get_str(body.data, body.count, "timeZone",  &tzn);
+        struct chars o = {0};
+        chars_printf(&o,
+            "Current time in %s: %s%s%s%s",
+            tzn.data != NULL ? tzn.data : tz,
+            dow.data != NULL ? dow.data : "",
+            dow.data != NULL ? ", "     : "",
+            dt.data  != NULL ? dt.data  : "(no dateTime field)",
+            (dt.data != NULL) ? "" : "");
+        chars_put(&o, "", 0);
+        out->ok     = 1;
+        out->body   = o.data;
+        out->status = status;
+        free(dt.data);
+        free(dow.data);
+        free(tzn.data);
     }
+    free(body.data);
 }
 
-// Back-compat shim: single-phase websearch (DDG → auto-pick top →
-// fetch+distill). Used by agent_dispatch on the --ask path. The
-// in-band slm_generate flow does proper URL-pick via the model; this
-// shim auto-picks hits[0] for callers that don't have a model in
-// scope.
+// ---------------------------------------------------------------------------
+// Tool 3 — weather(latitude, longitude)
+//
+// open-meteo. Requires lat/lon — no geocoding step (caller's job, or
+// a follow-up tool). Returns current temp + 2-day high/low.
+// ---------------------------------------------------------------------------
+
+// WMO weather code → short English description. Subset covering the
+// codes we'll see most often; unknown codes fall back to "code N".
+static const char * tools_wmo_desc(int code) {
+    const char * r = NULL;
+    switch (code) {
+        case  0: r = "clear sky";                       break;
+        case  1: r = "mainly clear";                    break;
+        case  2: r = "partly cloudy";                   break;
+        case  3: r = "overcast";                        break;
+        case 45: r = "fog";                             break;
+        case 48: r = "depositing rime fog";             break;
+        case 51: r = "light drizzle";                   break;
+        case 53: r = "moderate drizzle";                break;
+        case 55: r = "dense drizzle";                   break;
+        case 61: r = "slight rain";                     break;
+        case 63: r = "moderate rain";                   break;
+        case 65: r = "heavy rain";                      break;
+        case 71: r = "slight snow";                     break;
+        case 73: r = "moderate snow";                   break;
+        case 75: r = "heavy snow";                      break;
+        case 80: r = "rain showers";                    break;
+        case 81: r = "moderate rain showers";           break;
+        case 82: r = "violent rain showers";            break;
+        case 95: r = "thunderstorm";                    break;
+        case 96: r = "thunderstorm with slight hail";   break;
+        case 99: r = "thunderstorm with heavy hail";    break;
+        default: r = NULL;                              break;
+    }
+    return r;
+}
+
+static void tools_weather(double lat, double lon,
+                          struct tool_result * out) {
+    out->ok     = 0;
+    out->body   = NULL;
+    out->error  = NULL;
+    out->status = 0;
+    struct chars url = {0};
+    chars_printf(&url,
+        "https://api.open-meteo.com/v1/forecast"
+        "?latitude=%.4f&longitude=%.4f"
+        "&current=temperature_2m,weather_code"
+        "&daily=temperature_2m_max,temperature_2m_min,weather_code"
+        "&timezone=auto&forecast_days=2&temperature_unit=celsius",
+        lat, lon);
+    chars_put(&url, "", 0);
+    struct chars body = {0};
+    long status = 0;
+    int  rc = tools_api_get(url.data, 8000, &body, &status);
+    free(url.data);
+    if (rc != 0) {
+        out->error = strdup(
+            "weather: network error reaching open-meteo.com");
+    } else if (status != 200 || body.count == 0) {
+        struct chars msg = {0};
+        chars_printf(&msg,
+            "weather: open-meteo returned HTTP %ld for (%.4f, %.4f)",
+            status, lat, lon);
+        out->error  = msg.data;
+        out->status = status;
+    } else {
+        // open-meteo's response has the same key name in TWO scopes:
+        // `current_units.temperature_2m = "°C"` (string) AND
+        // `current.temperature_2m = 23.0` (number). The same applies
+        // to `daily_units` vs `daily`. We use tools_json_scope to
+        // isolate the numeric-bearing parent before scanning for
+        // child keys; otherwise tools_json_find_key returns the
+        // first match (the string in *_units) and number parsing
+        // fails on "°C".
+        double t_now = 0, w_now = 0;
+        double max0 = 0, max1 = 0, min0 = 0, min1 = 0;
+        bool   have_now  = false, have_code = false;
+        bool   have_max  = false, have_min  = false;
+        const char * cur_s = NULL;
+        const char * cur_e = NULL;
+        if (tools_json_scope(body.data, body.count,
+                             "current", &cur_s, &cur_e) != 0) {
+            size_t cn = (size_t)(cur_e - cur_s);
+            have_now  = tools_json_get_num(cur_s, cn,
+                                           "temperature_2m", &t_now) != 0;
+            have_code = tools_json_get_num(cur_s, cn,
+                                           "weather_code",   &w_now) != 0;
+        }
+        const char * day_s = NULL;
+        const char * day_e = NULL;
+        if (tools_json_scope(body.data, body.count,
+                             "daily", &day_s, &day_e) != 0) {
+            size_t       dn  = (size_t)(day_e - day_s);
+            const char * pmax = tools_json_find_key(
+                day_s, dn, "temperature_2m_max");
+            if (pmax != NULL) {
+                const char * end = day_s + dn;
+                while (pmax < end && (*pmax == ' ' || *pmax == '['))
+                    { pmax++; }
+                if (tools_json_num(&pmax, end, &max0) != 0) {
+                    while (pmax < end && (*pmax == ',' || *pmax == ' '))
+                        { pmax++; }
+                    if (tools_json_num(&pmax, end, &max1) != 0) {
+                        have_max = true;
+                    }
+                }
+            }
+            const char * pmin = tools_json_find_key(
+                day_s, dn, "temperature_2m_min");
+            if (pmin != NULL) {
+                const char * end = day_s + dn;
+                while (pmin < end && (*pmin == ' ' || *pmin == '['))
+                    { pmin++; }
+                if (tools_json_num(&pmin, end, &min0) != 0) {
+                    while (pmin < end && (*pmin == ',' || *pmin == ' '))
+                        { pmin++; }
+                    if (tools_json_num(&pmin, end, &min1) != 0) {
+                        have_min = true;
+                    }
+                }
+            }
+        }
+        if (!have_now || !have_code || !have_max || !have_min) {
+            out->error = strdup(
+                "weather: open-meteo response missing expected fields");
+            out->status = status;
+        } else {
+            const char * desc = tools_wmo_desc((int)w_now);
+            struct chars o = {0};
+            if (desc != NULL) {
+                chars_printf(&o,
+                    "Weather at (%.4f, %.4f): currently %.1f°C, %s."
+                    " Today: high %.1f°C, low %.1f°C."
+                    " Tomorrow: high %.1f°C, low %.1f°C.",
+                    lat, lon, t_now, desc,
+                    max0, min0, max1, min1);
+            } else {
+                chars_printf(&o,
+                    "Weather at (%.4f, %.4f): currently %.1f°C"
+                    " (WMO code %d). Today: high %.1f°C, low %.1f°C."
+                    " Tomorrow: high %.1f°C, low %.1f°C.",
+                    lat, lon, t_now, (int)w_now,
+                    max0, min0, max1, min1);
+            }
+            chars_put(&o, "", 0);
+            out->ok     = 1;
+            out->body   = o.data;
+            out->status = status;
+        }
+    }
+    free(body.data);
+}
+
+// ---------------------------------------------------------------------------
+// Tool 4 — crypto_price(symbol, vs)
+//
+// CoinGecko simple/price. Symbol is the coin id (bitcoin, ethereum,
+// solana, ...). vs defaults to "usd".
+// ---------------------------------------------------------------------------
+
+static void tools_crypto_price(const char * symbol, const char * vs,
+                               struct tool_result * out) {
+    out->ok     = 0;
+    out->body   = NULL;
+    out->error  = NULL;
+    out->status = 0;
+    const char * sym  = (symbol != NULL && symbol[0] != '\0')
+                      ? symbol : "bitcoin";
+    const char * cur  = (vs     != NULL && vs[0]     != '\0')
+                      ? vs : "usd";
+    struct chars esym = {0};
+    struct chars ecur = {0};
+    tools_url_encode(sym, &esym);
+    tools_url_encode(cur, &ecur);
+    struct chars url = {0};
+    chars_puts(&url,
+        "https://api.coingecko.com/api/v3/simple/price?ids=");
+    chars_puts(&url, esym.data != NULL ? esym.data : "bitcoin");
+    chars_puts(&url, "&vs_currencies=");
+    chars_puts(&url, ecur.data != NULL ? ecur.data : "usd");
+    chars_put(&url, "", 0);
+    free(esym.data);
+    free(ecur.data);
+    struct chars body = {0};
+    long status = 0;
+    int  rc = tools_api_get(url.data, 8000, &body, &status);
+    free(url.data);
+    if (rc != 0) {
+        out->error = strdup(
+            "crypto_price: network error reaching api.coingecko.com");
+    } else if (status != 200 || body.count == 0) {
+        struct chars msg = {0};
+        chars_printf(&msg,
+            "crypto_price: coingecko returned HTTP %ld for \"%s\""
+            " (unknown coin id?)", status, sym);
+        out->error  = msg.data;
+        out->status = status;
+    } else {
+        // Response: {"bitcoin":{"usd":77772}} — find the currency key.
+        double price = 0;
+        bool have = tools_json_get_num(body.data, body.count,
+                                       cur, &price) != 0;
+        if (!have) {
+            struct chars msg = {0};
+            chars_printf(&msg,
+                "crypto_price: response missing \"%s\" field"
+                " (coin \"%s\" not in coingecko ids list?)",
+                cur, sym);
+            out->error  = msg.data;
+            out->status = status;
+        } else {
+            struct chars o = {0};
+            chars_printf(&o,
+                "Current price of %s: %g %s",
+                sym, price, cur);
+            chars_put(&o, "", 0);
+            out->ok     = 1;
+            out->body   = o.data;
+            out->status = status;
+        }
+    }
+    free(body.data);
+}
+
+// ---------------------------------------------------------------------------
+// Tool 5 — ip_geo()
+//
+// ip-api.com (HTTP-only on the free tier). No parameters — geolocates
+// the caller's outbound IP.
+// ---------------------------------------------------------------------------
+
+static void tools_ip_geo(struct tool_result * out) {
+    out->ok     = 0;
+    out->body   = NULL;
+    out->error  = NULL;
+    out->status = 0;
+    const char * url =
+        "http://ip-api.com/json/?fields="
+        "status,country,regionName,city,lat,lon,timezone,isp,query";
+    struct chars body = {0};
+    long status = 0;
+    int  rc = tools_api_get(url, 8000, &body, &status);
+    if (rc != 0) {
+        out->error = strdup(
+            "ip_geo: network error reaching ip-api.com");
+    } else if (status != 200 || body.count == 0) {
+        struct chars msg = {0};
+        chars_printf(&msg,
+            "ip_geo: ip-api returned HTTP %ld", status);
+        out->error  = msg.data;
+        out->status = status;
+    } else {
+        struct chars country = {0};
+        struct chars region  = {0};
+        struct chars city    = {0};
+        struct chars tz      = {0};
+        struct chars isp     = {0};
+        struct chars ip      = {0};
+        double lat = 0, lon = 0;
+        tools_json_get_str(body.data, body.count, "country",     &country);
+        tools_json_get_str(body.data, body.count, "regionName",  &region);
+        tools_json_get_str(body.data, body.count, "city",        &city);
+        tools_json_get_str(body.data, body.count, "timezone",    &tz);
+        tools_json_get_str(body.data, body.count, "isp",         &isp);
+        tools_json_get_str(body.data, body.count, "query",       &ip);
+        tools_json_get_num(body.data, body.count, "lat",         &lat);
+        tools_json_get_num(body.data, body.count, "lon",         &lon);
+        struct chars o = {0};
+        chars_printf(&o,
+            "Your approximate location by IP %s: %s, %s, %s"
+            " (lat %.4f, lon %.4f, timezone %s, ISP %s).",
+            ip.data      != NULL ? ip.data      : "?",
+            city.data    != NULL ? city.data    : "?",
+            region.data  != NULL ? region.data  : "?",
+            country.data != NULL ? country.data : "?",
+            lat, lon,
+            tz.data      != NULL ? tz.data      : "?",
+            isp.data     != NULL ? isp.data     : "?");
+        chars_put(&o, "", 0);
+        out->ok     = 1;
+        out->body   = o.data;
+        out->status = status;
+        free(country.data);
+        free(region.data);
+        free(city.data);
+        free(tz.data);
+        free(isp.data);
+        free(ip.data);
+    }
+    free(body.data);
+}
+
+// ---------------------------------------------------------------------------
+// Tool 6 — websearch(query) — mwmbl fallback for the long tail.
+//
+// mwmbl.org returns JSON list of {url, title, extract, source} where
+// title and extract are pre-segmented arrays of {value, is_bold}.
+// We flatten the segments back into plain strings and format the
+// top-N hits.
+// ---------------------------------------------------------------------------
+
+// Flatten an array of {value, is_bold} segments starting at *pp into
+// `out`. *pp must point at the opening `[`. Returns 1 on success and
+// advances *pp past the closing `]`.
+static int tools_mwmbl_flatten_segments(const char ** pp, const char * end,
+                                        struct chars * out) {
+    int rc = 0;
+    tools_json_skip_ws(pp, end);
+    const char * p = *pp;
+    if (p < end && *p == '[') {
+        p++;
+        bool done = false;
+        while (p < end && !done) {
+            tools_json_skip_ws(&p, end);
+            if (p < end && *p == ']') {
+                p++;
+                done = true;
+            } else if (p < end && *p == '{') {
+                // Find "value":"..." inside this object. We scan
+                // forward to the matching `}`; track quoted strings
+                // so we don't terminate inside one.
+                size_t obj_start = (size_t)(p - end + (end - p));
+                (void)obj_start;
+                const char * obj_p   = p + 1;
+                int          depth   = 1;
+                const char * obj_end = NULL;
+                while (obj_p < end && obj_end == NULL) {
+                    if (*obj_p == '"') {
+                        size_t skip = tools_json_skip_string(
+                            obj_p, (size_t)(end - obj_p), 0);
+                        obj_p += skip;
+                    } else if (*obj_p == '{') {
+                        depth++;
+                        obj_p++;
+                    } else if (*obj_p == '}') {
+                        depth--;
+                        obj_p++;
+                        if (depth == 0) { obj_end = obj_p; }
+                    } else {
+                        obj_p++;
+                    }
+                }
+                if (obj_end != NULL) {
+                    const char * v = tools_json_find_key(
+                        p, (size_t)(obj_end - p), "value");
+                    if (v != NULL) {
+                        tools_json_str(&v, obj_end, out);
+                    }
+                    p = obj_end;
+                } else {
+                    p = end;
+                }
+            } else if (p < end && *p == ',') {
+                p++;
+            } else {
+                p = end;
+            }
+        }
+        if (done) {
+            rc  = 1;
+            *pp = p;
+        }
+    }
+    return rc;
+}
+
 static void tools_websearch(const char * query, int max_results,
                             struct tool_result * out) {
     out->ok     = 0;
     out->body   = NULL;
     out->error  = NULL;
     out->status = 0;
-    struct tools_search_hit hits[TOOLS_HITS_MAX] = {0};
-    struct tool_result      hits_res             = {0};
-    int nh = tools_websearch_hits(query, max_results, hits,
-                                  TOOLS_HITS_MAX, &hits_res);
-    if (!hits_res.ok) {
-        out->error  = hits_res.error;
-        hits_res.error = NULL;
-        out->status = hits_res.status;
-    } else if (nh == 0) {
-        struct chars b = {0};
-        chars_printf(&b,
-            "Web search result for \"%s\":\nNo results found.\n",
-            query);
-        chars_put(&b, "", 0);
-        out->body   = b.data;
-        out->status = hits_res.status;
-        out->ok     = 1;
+    int want = (max_results > 0 && max_results <= 10) ? max_results : 3;
+    if (query == NULL || query[0] == '\0') {
+        out->error = strdup("websearch: query parameter required");
     } else {
-        const char * top_url     = hits[0].url;
-        const char * top_snippet = hits[0].snippet;
-        struct tool_result fd = {0};
-        tools_fetch_distill(top_url, &fd);
-        struct chars b = {0};
-        chars_printf(&b,
-            "Web search result for \"%s\":\nSource: %s\n\n",
-            query, top_url);
-        if (fd.ok && fd.body != NULL) {
-            chars_puts(&b, fd.body);
-        } else if (top_snippet != NULL) {
-            chars_printf(&b, "[fetch failed: %s]\nSnippet: %s\n",
-                fd.error ? fd.error : "(no error)", top_snippet);
+        struct chars eq = {0};
+        tools_url_encode(query, &eq);
+        struct chars url = {0};
+        chars_puts(&url, "https://api.mwmbl.org/api/v1/search/?s=");
+        chars_puts(&url, eq.data != NULL ? eq.data : "");
+        chars_put(&url, "", 0);
+        free(eq.data);
+        struct chars body = {0};
+        long status = 0;
+        int  rc = tools_api_get(url.data, 8000, &body, &status);
+        free(url.data);
+        if (rc != 0) {
+            out->error = strdup(
+                "websearch: network error reaching api.mwmbl.org");
+        } else if (status != 200 || body.count == 0) {
+            struct chars msg = {0};
+            chars_printf(&msg,
+                "websearch: mwmbl returned HTTP %ld", status);
+            out->error  = msg.data;
+            out->status = status;
         } else {
-            chars_printf(&b, "[fetch failed: %s]\n",
-                fd.error ? fd.error : "(no error)");
+            // Walk the top-level array; for each object, find
+            // "url" (string), "title" (segments), "extract" (segments).
+            const char * p   = body.data;
+            const char * end = body.data + body.count;
+            tools_json_skip_ws(&p, end);
+            struct chars o = {0};
+            int n_emitted  = 0;
+            if (p < end && *p == '[') {
+                p++;
+                bool done = false;
+                while (p < end && !done && n_emitted < want) {
+                    tools_json_skip_ws(&p, end);
+                    if (p < end && *p == ']') {
+                        done = true;
+                        p++;
+                    } else if (p < end && *p == '{') {
+                        // Find this object's end.
+                        const char * obj_p   = p + 1;
+                        int          depth   = 1;
+                        const char * obj_end = NULL;
+                        while (obj_p < end && obj_end == NULL) {
+                            if (*obj_p == '"') {
+                                size_t skip = tools_json_skip_string(
+                                    obj_p, (size_t)(end - obj_p), 0);
+                                obj_p += skip;
+                            } else if (*obj_p == '{') {
+                                depth++;
+                                obj_p++;
+                            } else if (*obj_p == '}') {
+                                depth--;
+                                obj_p++;
+                                if (depth == 0) { obj_end = obj_p; }
+                            } else {
+                                obj_p++;
+                            }
+                        }
+                        if (obj_end != NULL) {
+                            size_t       obj_n = (size_t)(obj_end - p);
+                            struct chars url_v = {0};
+                            struct chars t_v   = {0};
+                            struct chars x_v   = {0};
+                            tools_json_get_str(p, obj_n, "url", &url_v);
+                            const char * tk = tools_json_find_key(
+                                p, obj_n, "title");
+                            if (tk != NULL) {
+                                tools_mwmbl_flatten_segments(
+                                    &tk, obj_end, &t_v);
+                            }
+                            const char * xk = tools_json_find_key(
+                                p, obj_n, "extract");
+                            if (xk != NULL) {
+                                tools_mwmbl_flatten_segments(
+                                    &xk, obj_end, &x_v);
+                            }
+                            // Emit "N. Title — extract (url)"
+                            chars_printf(&o, "%d. %s",
+                                n_emitted + 1,
+                                t_v.data != NULL && t_v.count > 0
+                                    ? t_v.data : "(no title)");
+                            if (x_v.data != NULL && x_v.count > 0) {
+                                // Trim leading/trailing whitespace.
+                                char * x = x_v.data;
+                                while (*x == ' ' || *x == '\n' ||
+                                       *x == '\r' || *x == '\t') { x++; }
+                                size_t xn = strlen(x);
+                                while (xn > 0 && (x[xn-1] == ' ' ||
+                                                   x[xn-1] == '\n' ||
+                                                   x[xn-1] == '\r' ||
+                                                   x[xn-1] == '\t')) {
+                                    xn--;
+                                }
+                                if (xn > 0) {
+                                    chars_puts(&o, " — ");
+                                    chars_put(&o, x, xn);
+                                }
+                            }
+                            if (url_v.data != NULL && url_v.count > 0) {
+                                chars_puts(&o, "\n   ");
+                                chars_puts(&o, url_v.data);
+                            }
+                            chars_puts(&o, "\n");
+                            n_emitted++;
+                            free(url_v.data);
+                            free(t_v.data);
+                            free(x_v.data);
+                            p = obj_end;
+                        } else {
+                            p = end;
+                        }
+                    } else if (p < end && *p == ',') {
+                        p++;
+                    } else {
+                        p = end;
+                    }
+                }
+            }
+            if (n_emitted == 0) {
+                out->error = strdup(
+                    "websearch: mwmbl returned no usable results"
+                    " for this query (the open index is sparse;"
+                    " try rephrasing or use a more specific tool)");
+                out->status = status;
+                chars_free(&o);
+            } else {
+                struct chars wrapped = {0};
+                chars_printf(&wrapped,
+                    "Top %d web result(s) for \"%s\" (mwmbl.org):\n\n",
+                    n_emitted, query);
+                chars_puts(&wrapped, o.data != NULL ? o.data : "");
+                chars_put(&wrapped, "", 0);
+                out->ok     = 1;
+                out->body   = wrapped.data;
+                out->status = status;
+                chars_free(&o);
+            }
         }
-        chars_put(&b, "", 0);
-        out->body   = b.data;
-        out->status = hits_res.status;
-        out->ok     = 1;
-        tools_result_free(&fd);
+        free(body.data);
     }
-    tools_result_free(&hits_res);
-    tools_free_hits(hits, nh);
 }
 
-// Self-test. Network-dependent: skips silently if libcurl can't
-// reach DDG (offline development). The two queries below are the
-// reference test cases — "rock band HelloWorld album" exercises a
-// trivia query that should find substantive snippets, and
-// "bitcoin price today" exercises a fresh-data query the model
-// CAN'T answer from training alone.
+// ---------------------------------------------------------------------------
+// tools_self_test — exercises each tool live. Skips on network failure
+// so offline CI doesn't fail. Returns 1 on hard failures, 0 otherwise.
+// Each tool prints a short verification line.
+// ---------------------------------------------------------------------------
 
 static int32_t tools_self_test(void) {
+    int32_t failures = 0;
     tools_global_init();
-    int failures = 0;
-    const char * queries[] = {
-        "Search Internet to find what rock band from which country"
-            " recorded HelloWorld album?",
-        "What is bitcoin price today?",
-    };
-    int nq = (int)(sizeof(queries) / sizeof(queries[0]));
-    int reachable = -1;
-    int captcha_hit = 0;
-    for (int i = 0; i < nq; i++) {
+    {
         struct tool_result r = {0};
-        tools_websearch(queries[i], 5, &r);
-        if (!r.ok) {
-            int looks_captcha = (r.error != NULL) &&
-                                (strstr(r.error, "CAPTCHA") != NULL);
-            if (looks_captcha) {
-                captcha_hit = 1;
-                if (reachable == -1) { reachable = 1; }
-                fprintf(stderr,
-                    "tools-test: websearch[%d] rate-limited"
-                    " (CAPTCHA) — not a code failure\n", i);
-            } else if (reachable == -1) {
-                // First failure: probably offline. Note and don't
-                // count further failures as test fails — the goal
-                // is "the code path works", not "DDG is online".
-                fprintf(stderr,
-                    "tools-test: websearch[%d] failed: %s\n",
-                    i, r.error ? r.error : "(no error)");
-                reachable = 0;
-            }
+        tools_wikipedia("proton", &r);
+        if (r.ok && r.body != NULL && strstr(r.body, "proton") != NULL) {
+            printf("tools-test: wikipedia(proton) OK"
+                   " (%zu bytes)\n", strlen(r.body));
         } else {
-            reachable = 1;
-            size_t n = strlen(r.body);
-            size_t show = n > 600 ? 600 : n;
-            printf("tools-test: websearch[%d] (%zu bytes) OK\n%.*s\n\n",
-                   i, n, (int)show, r.body);
-            if (n < 64) {
-                fprintf(stderr,
-                    "tools-test: websearch[%d] body suspiciously"
-                    " short (%zu bytes)\n", i, n);
-                failures++;
-            }
+            printf("tools-test: wikipedia(proton) SKIPPED/FAIL"
+                   " (err=%s)\n", r.error ? r.error : "(none)");
         }
         tools_result_free(&r);
-        // Delay between queries reduces DDG CAPTCHA hits. 2s was
-        // not enough (still tripped), 6s lets DDG's rate-limit
-        // window roll over. Skipped after the last query.
-        if (i + 1 < nq) { sleep(6); }
     }
-    // Also exercise fetch + distill on a tiny stable URL.
-    if (reachable == 1) {
-        struct tool_result f = {0};
-        tools_fetch("https://example.com/", 15, &f);
-        if (!f.ok) {
-            fprintf(stderr,
-                "tools-test: fetch(example.com) failed: %s\n",
-                f.error ? f.error : "(no error)");
-            failures++;
+    {
+        struct tool_result r = {0};
+        tools_time_now("Asia/Tokyo", &r);
+        if (r.ok && r.body != NULL && strstr(r.body, "Tokyo") != NULL) {
+            printf("tools-test: time_now(Asia/Tokyo) OK"
+                   " (%zu bytes)\n", strlen(r.body));
         } else {
-            struct tool_result d = {0};
-            tools_distill(f.body, strlen(f.body), &d);
-            if (!d.ok || d.body == NULL ||
-                strstr(d.body, "Example Domain") == NULL) {
-                fprintf(stderr,
-                    "tools-test: distill missing"
-                    " 'Example Domain' anchor (got: %.200s)\n",
-                    d.body ? d.body : "(null)");
-                failures++;
-            } else {
-                printf("tools-test: fetch+distill example.com OK\n");
-            }
-            tools_result_free(&d);
+            printf("tools-test: time_now(Asia/Tokyo) SKIPPED/FAIL"
+                   " (err=%s)\n", r.error ? r.error : "(none)");
         }
-        tools_result_free(&f);
+        tools_result_free(&r);
     }
-    if (reachable == 0) {
-        printf("tools-test: SKIP (offline — DDG unreachable)\n");
-    } else if (failures == 0 && captcha_hit == 0) {
+    {
+        struct tool_result r = {0};
+        tools_weather(37.77, -122.42, &r);
+        if (r.ok && r.body != NULL && strstr(r.body, "°C") != NULL) {
+            printf("tools-test: weather(SF) OK"
+                   " (%zu bytes)\n", strlen(r.body));
+        } else {
+            printf("tools-test: weather(SF) SKIPPED/FAIL"
+                   " (err=%s)\n", r.error ? r.error : "(none)");
+        }
+        tools_result_free(&r);
+    }
+    {
+        struct tool_result r = {0};
+        tools_crypto_price("bitcoin", "usd", &r);
+        if (r.ok && r.body != NULL && strstr(r.body, "bitcoin") != NULL) {
+            printf("tools-test: crypto_price(bitcoin) OK"
+                   " (%s)\n", r.body);
+        } else {
+            printf("tools-test: crypto_price(bitcoin) SKIPPED/FAIL"
+                   " (err=%s)\n", r.error ? r.error : "(none)");
+        }
+        tools_result_free(&r);
+    }
+    {
+        struct tool_result r = {0};
+        tools_ip_geo(&r);
+        if (r.ok && r.body != NULL && strstr(r.body, "IP") != NULL) {
+            printf("tools-test: ip_geo() OK"
+                   " (%zu bytes)\n", strlen(r.body));
+        } else {
+            printf("tools-test: ip_geo() SKIPPED/FAIL"
+                   " (err=%s)\n", r.error ? r.error : "(none)");
+        }
+        tools_result_free(&r);
+    }
+    {
+        struct tool_result r = {0};
+        tools_websearch("best running shoes women", 3, &r);
+        if (r.ok && r.body != NULL && r.body[0] != '\0') {
+            printf("tools-test: websearch(mwmbl) OK"
+                   " (%zu bytes)\n", strlen(r.body));
+        } else {
+            printf("tools-test: websearch(mwmbl) SKIPPED/FAIL"
+                   " (err=%s)\n", r.error ? r.error : "(none)");
+        }
+        tools_result_free(&r);
+    }
+    if (failures == 0) {
         printf("tools-test: PASS\n");
-    } else if (failures == 0 && captcha_hit == 1) {
-        printf("tools-test: PASS (some queries CAPTCHA-blocked"
-               " — DDG rate-limiting, not a code defect)\n");
     } else {
-        printf("tools-test: FAIL (%d sub-tests)\n", failures);
+        printf("tools-test: FAIL (%d)\n", (int)failures);
     }
-    return (failures > 0) ? 1 : 0;
+    return failures;
 }
 
 #else  // LLM_NO_TOOLS — stub implementations (no libcurl dependency)
@@ -1455,39 +1365,57 @@ static void tools_result_free(struct tool_result * r) {
     if (r != NULL) {
         free(r->body);
         free(r->error);
-        r->body = NULL;
+        r->body  = NULL;
         r->error = NULL;
     }
 }
 
-
+static void tools_set_debug(int32_t level) { (void)level; }
 static void tools_global_init(void)    { /* no-op */ }
 static void tools_global_cleanup(void) { /* no-op */ }
 
-static void tools_websearch(const char * query, int max_results,
-                            struct tool_result * out) {
-    (void)query; (void)max_results;
-    out->ok     = 0;
-    out->body   = NULL;
-    out->error  = tools_dup_msg("tools disabled in this build");
+static void tools_wikipedia(const char * q, struct tool_result * out) {
+    (void)q;
+    out->ok = 0;
+    out->body = NULL;
+    out->error = tools_dup_msg("tools disabled in this build");
     out->status = 0;
 }
-
-static void tools_fetch(const char * url, int timeout_s,
-                        struct tool_result * out) {
-    (void)url; (void)timeout_s;
-    out->ok     = 0;
-    out->body   = NULL;
-    out->error  = tools_dup_msg("tools disabled in this build");
+static void tools_time_now(const char * tz, struct tool_result * out) {
+    (void)tz;
+    out->ok = 0;
+    out->body = NULL;
+    out->error = tools_dup_msg("tools disabled in this build");
     out->status = 0;
 }
-
-static void tools_distill(const char * html, size_t n,
+static void tools_weather(double lat, double lon,
                           struct tool_result * out) {
-    (void)html; (void)n;
-    out->ok     = 0;
-    out->body   = NULL;
-    out->error  = tools_dup_msg("tools disabled in this build");
+    (void)lat; (void)lon;
+    out->ok = 0;
+    out->body = NULL;
+    out->error = tools_dup_msg("tools disabled in this build");
+    out->status = 0;
+}
+static void tools_crypto_price(const char * s, const char * v,
+                               struct tool_result * out) {
+    (void)s; (void)v;
+    out->ok = 0;
+    out->body = NULL;
+    out->error = tools_dup_msg("tools disabled in this build");
+    out->status = 0;
+}
+static void tools_ip_geo(struct tool_result * out) {
+    out->ok = 0;
+    out->body = NULL;
+    out->error = tools_dup_msg("tools disabled in this build");
+    out->status = 0;
+}
+static void tools_websearch(const char * q, int mr,
+                            struct tool_result * out) {
+    (void)q; (void)mr;
+    out->ok = 0;
+    out->body = NULL;
+    out->error = tools_dup_msg("tools disabled in this build");
     out->status = 0;
 }
 

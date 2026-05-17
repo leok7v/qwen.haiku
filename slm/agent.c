@@ -61,43 +61,93 @@ struct agent_call {
 // (not generated from a schema lib — keeps the dep surface zero).
 // The Jinja's `tool | tojson` would pretty-print these; we ship the
 // already-serialized string and the Jinja just embeds it verbatim.
+// Six narrow, intent-routed tools. Each returns a small structured
+// answer; no HTML pipeline, no URL-pick second pass. Replaced the
+// pre-2026-05-17 (websearch + fetch + distill) trio that depended on
+// DDG HTML scraping. See `rnd/WEBSEARCH.md` for the R&D notes.
+
+static const char * AGENT_TOOL_WIKIPEDIA =
+    "{\"type\":\"function\",\"function\":{"
+    "\"name\":\"wikipedia\","
+    "\"description\":\"Look up an English Wikipedia article by topic"
+    " and return the article's summary paragraph (typically 200-500"
+    " characters of clean prose). Use for facts, definitions,"
+    " biographies, concepts, places, organisms, historical events."
+    " The query should be a NOUN PHRASE (e.g. 'Tom Cruise', 'capital"
+    " of Australia', 'proton', 'James Madison') — NOT a sentence or"
+    " question. Don't include words like 'definition', 'meaning',"
+    " 'price', 'age', 'symptoms' in the query.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{"
+    "\"query\":{\"type\":\"string\","
+    "\"description\":\"Wikipedia article title or topic to look up"
+    " (noun phrase only, no stop words).\"}},"
+    "\"required\":[\"query\"]}}}";
+
+static const char * AGENT_TOOL_TIME_NOW =
+    "{\"type\":\"function\",\"function\":{"
+    "\"name\":\"time_now\","
+    "\"description\":\"Return the current local time for a given IANA"
+    " timezone (e.g. 'Asia/Tokyo', 'America/Los_Angeles', 'UTC',"
+    " 'Europe/Paris'). Use whenever the user asks 'what time is it"
+    " (in X)'.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{"
+    "\"timezone\":{\"type\":\"string\","
+    "\"description\":\"IANA timezone name like 'Asia/Tokyo' or 'UTC'."
+    " Default 'UTC'.\"}},"
+    "\"required\":[]}}}";
+
+static const char * AGENT_TOOL_WEATHER =
+    "{\"type\":\"function\",\"function\":{"
+    "\"name\":\"weather\","
+    "\"description\":\"Return the current temperature and 2-day"
+    " forecast for a geographic point given as latitude / longitude"
+    " in decimal degrees. Use for any weather question. If the user"
+    " names a city but not coordinates, first call wikipedia(city)"
+    " to find approximate coordinates, then call weather.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{"
+    "\"latitude\":{\"type\":\"number\","
+    "\"description\":\"Latitude in decimal degrees (-90 to 90).\"},"
+    "\"longitude\":{\"type\":\"number\","
+    "\"description\":\"Longitude in decimal degrees (-180 to 180).\"}},"
+    "\"required\":[\"latitude\",\"longitude\"]}}}";
+
+static const char * AGENT_TOOL_CRYPTO_PRICE =
+    "{\"type\":\"function\",\"function\":{"
+    "\"name\":\"crypto_price\","
+    "\"description\":\"Return the current price of a cryptocurrency."
+    " Use for 'price of bitcoin', 'how much is ETH', etc.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{"
+    "\"symbol\":{\"type\":\"string\","
+    "\"description\":\"CoinGecko coin id, lowercase. Examples:"
+    " 'bitcoin', 'ethereum', 'solana', 'dogecoin'.\"},"
+    "\"vs\":{\"type\":\"string\","
+    "\"description\":\"Quote currency code, lowercase. Default 'usd'.\"}},"
+    "\"required\":[\"symbol\"]}}}";
+
+static const char * AGENT_TOOL_IP_GEO =
+    "{\"type\":\"function\",\"function\":{"
+    "\"name\":\"ip_geo\","
+    "\"description\":\"Return the approximate geographic location"
+    " (city, region, country, timezone, lat/lon, ISP) of the caller's"
+    " current public IP address. Use when the user asks 'where am I',"
+    " 'my IP', 'my location', or anything that depends on knowing the"
+    " user's locale without an explicitly-stated city.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{},"
+    "\"required\":[]}}}";
+
 static const char * AGENT_TOOL_WEBSEARCH =
     "{\"type\":\"function\",\"function\":{"
     "\"name\":\"websearch\","
-    "\"description\":\"Search the web with DuckDuckGo."
-    " Returns a plain-text list of result titles and snippets."
-    " Use this to find information not in your training data.\","
+    "\"description\":\"Open-source web search (mwmbl.org). Returns"
+    " the top 3 titles + snippet extracts. Use ONLY as a last resort"
+    " when no specialized tool fits the question (i.e. NOT for facts"
+    " — use wikipedia; NOT for time — use time_now; NOT for weather"
+    " — use weather; NOT for crypto prices — use crypto_price; NOT"
+    " for the user's own location — use ip_geo).\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{"
     "\"query\":{\"type\":\"string\","
-    "\"description\":\"The search query (a natural-language question"
-    " or keywords).\"},"
-    "\"max_results\":{\"type\":\"integer\","
-    "\"description\":\"Maximum number of results to return."
-    " Default 5, max 16.\"}},"
+    "\"description\":\"Free-form search query.\"}},"
     "\"required\":[\"query\"]}}}";
-
-static const char * AGENT_TOOL_FETCH =
-    "{\"type\":\"function\",\"function\":{"
-    "\"name\":\"fetch\","
-    "\"description\":\"HTTP GET a URL and return the raw response"
-    " body (HTML, JSON, plain text). Body is truncated at 200 KB.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{"
-    "\"url\":{\"type\":\"string\","
-    "\"description\":\"The full URL to fetch (must include http(s)://).\"},"
-    "\"timeout\":{\"type\":\"integer\","
-    "\"description\":\"Seconds to wait before giving up. Default 30.\"}},"
-    "\"required\":[\"url\"]}}}";
-
-static const char * AGENT_TOOL_DISTILL =
-    "{\"type\":\"function\",\"function\":{"
-    "\"name\":\"distill\","
-    "\"description\":\"Strip HTML tags and collapse whitespace,"
-    " returning the meaningful text content of a page. Compose with"
-    " fetch when you want the body of a URL as plain text.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{"
-    "\"html\":{\"type\":\"string\","
-    "\"description\":\"The HTML string to distill.\"}},"
-    "\"required\":[\"html\"]}}}";
 
 // Look up a parameter by name in a parsed call. Returns NULL if not
 // present. Linear scan — call->n_params is small (rarely > 4).
@@ -528,28 +578,40 @@ static void agent_dispatch(const struct agent_call * call,
     out->status = 0;
     if (call->name == NULL) {
         out->error = strdup("agent: tool call missing function name");
+    } else if (strcmp(call->name, "wikipedia") == 0) {
+        const char * q = agent_call_param(call, "query");
+        tools_wikipedia(q != NULL ? q : "", out);
+    } else if (strcmp(call->name, "time_now") == 0) {
+        const char * tz = agent_call_param(call, "timezone");
+        tools_time_now(tz, out);
+    } else if (strcmp(call->name, "weather") == 0) {
+        const char * lat_s = agent_call_param(call, "latitude");
+        const char * lon_s = agent_call_param(call, "longitude");
+        double lat = (lat_s != NULL) ? strtod(lat_s, NULL) : 0.0;
+        double lon = (lon_s != NULL) ? strtod(lon_s, NULL) : 0.0;
+        if (lat_s == NULL || lon_s == NULL) {
+            out->error = strdup(
+                "weather: both latitude and longitude required"
+                " (call wikipedia(city) first if you don't have"
+                " coordinates)");
+        } else {
+            tools_weather(lat, lon, out);
+        }
+    } else if (strcmp(call->name, "crypto_price") == 0) {
+        const char * sym = agent_call_param(call, "symbol");
+        const char * vs  = agent_call_param(call, "vs");
+        tools_crypto_price(sym, vs, out);
+    } else if (strcmp(call->name, "ip_geo") == 0) {
+        tools_ip_geo(out);
     } else if (strcmp(call->name, "websearch") == 0) {
         const char * q = agent_call_param(call, "query");
-        const char * mr_s = agent_call_param(call, "max_results");
-        int mr = (mr_s != NULL) ? atoi(mr_s) : 5;
-        tools_websearch(q != NULL ? q : "", mr, out);
-    } else if (strcmp(call->name, "fetch") == 0) {
-        const char * url = agent_call_param(call, "url");
-        const char * to_s = agent_call_param(call, "timeout");
-        int to = (to_s != NULL) ? atoi(to_s) : 30;
-        tools_fetch(url != NULL ? url : "", to, out);
-    } else if (strcmp(call->name, "distill") == 0) {
-        const char * html = agent_call_param(call, "html");
-        if (html == NULL) {
-            out->error = strdup("distill: html parameter required");
-        } else {
-            tools_distill(html, strlen(html), out);
-        }
+        tools_websearch(q != NULL ? q : "", 3, out);
     } else {
         struct chars tmp = {0};
         chars_printf(&tmp,
                      "agent: unknown function '%s' (available:"
-                     " websearch, fetch, distill)", call->name);
+                     " wikipedia, time_now, weather, crypto_price,"
+                     " ip_geo, websearch)", call->name);
         out->error = tmp.data;     // transfer ownership; no chars_free
     }
 }
@@ -593,9 +655,12 @@ static char * agent_run(struct slm_model * model,
                         int max_iters, int max_new,
                         int print_trace) {
     struct jinja_tool tools[] = {
+        { AGENT_TOOL_WIKIPEDIA },
+        { AGENT_TOOL_TIME_NOW },
+        { AGENT_TOOL_WEATHER },
+        { AGENT_TOOL_CRYPTO_PRICE },
+        { AGENT_TOOL_IP_GEO },
         { AGENT_TOOL_WEBSEARCH },
-        { AGENT_TOOL_FETCH },
-        { AGENT_TOOL_DISTILL },
     };
     int n_tools = (int)(sizeof(tools) / sizeof(tools[0]));
     enum { MAX_MSGS = 64 };
