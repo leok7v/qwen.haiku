@@ -875,17 +875,33 @@ int slm_generate(struct slm_ctx * c,
                  uint64_t seed,
                  struct slm_stream_callback * cb) {
     assert(c != NULL && c->system_committed);
-    bool with_tools = c->ctrl.tools;
-    bool with_debug = (c->ctrl.debug > 0);
-    int  total_gen  = 0;
+    bool    with_tools = c->ctrl.tools;
+    bool    with_debug = (c->ctrl.debug > 0);
+    int32_t debug_lv   = c->ctrl.debug;
+    int     total_gen  = 0;
     // Push user prompt into messages — not part of the rollback set.
     const char * user_text = (prompt != NULL) ? prompt : "";
     text_puts(&c->messages, user_text);
+    if (debug_lv >= 1) {
+        size_t qn = strlen(user_text);
+        trace("turn: prompt %zu chars, tools=%d, think=%d\n",
+              qn, with_tools ? 1 : 0, c->ctrl.think ? 1 : 0);
+    }
+    if (debug_lv >= 7) {
+        size_t qn = strlen(user_text);
+        size_t cut = qn > 240 ? 240 : qn;
+        trace("turn: prompt[0..%zu]: %.*s%s\n",
+              cut, (int)cut, user_text, cut < qn ? "..." : "");
+    }
     // Snapshot pre-turn state. Restored if the model emits a tool_call
     // so the second pass replays from the same conversation point but
     // with curated tool output baked into the prompt.
     struct slm_snapshot * snap = with_tools
                                  ? slm_ctx_snapshot(c) : NULL;
+    if (debug_lv >= 1 && snap != NULL) {
+        trace("snapshot: pos=%d ids=%zu (pre-turn rollback point)\n",
+              c->pos, c->ids.count);
+    }
     // Format the user turn delta and tokenize it.
     char *    delta   = jinja_format_turn_delta(user_text, c->ctrl.think);
     int32_t * cur_ids = NULL;
@@ -936,7 +952,29 @@ int slm_generate(struct slm_ctx * c,
             chars_put(&wrapped, "", 0);
             struct agent_call calls[4];
             int nc = agent_parse_tool_calls(wrapped.data, calls, 4);
+            if (debug_lv >= 1) {
+                trace("tool_call: %d call(s) parsed\n", nc);
+            }
+            if (debug_lv >= 3) {
+                for (int i = 0; i < nc; i++) {
+                    trace("tool_call[%d]: %s\n", i,
+                          calls[i].name != NULL ? calls[i].name : "?");
+                    for (int p = 0; p < calls[i].n_params; p++) {
+                        const char * v = calls[i].params[p].value;
+                        size_t vlen = v != NULL ? strlen(v) : 0;
+                        size_t vcut = vlen > 160 ? 160 : vlen;
+                        trace("  %s = %.*s%s\n",
+                              calls[i].params[p].name,
+                              (int)vcut, v != NULL ? v : "",
+                              vcut < vlen ? "..." : "");
+                    }
+                }
+            }
             chars_free(&wrapped);
+            // Propagate debug level into the tools.c primitives for
+            // the duration of this dispatch round; reset to silent
+            // immediately after so unrelated callers don't inherit it.
+            tools_set_debug(debug_lv);
             struct chars result = {0};
             for (int i = 0; i < nc; i++) {
                 struct tool_result r = {0};
@@ -945,10 +983,17 @@ int slm_generate(struct slm_ctx * c,
                     r.ok && r.body != NULL ? r.body
                   : r.error != NULL        ? r.error
                                            : "(no result)";
+                if (debug_lv >= 1) {
+                    trace("tool_call[%d]: %s -> %s (%zu bytes)\n",
+                          i, calls[i].name != NULL ? calls[i].name : "?",
+                          r.ok ? "ok" : "ERR",
+                          payload != NULL ? strlen(payload) : 0);
+                }
                 if (i > 0) { chars_put(&result, "\n\n", 2); }
                 chars_put(&result, payload, strlen(payload));
                 tools_result_free(&r);
             }
+            tools_set_debug(0);
             chars_put(&result, "", 0);
             agent_free_calls(calls, nc);
             if (result.data != NULL && with_debug) {
@@ -959,6 +1004,10 @@ int slm_generate(struct slm_ctx * c,
             // Atomic rollback: tool_call emission is wiped from KV/
             // SSM/pos/ids. From the model's perspective the turn
             // hasn't started yet.
+            if (debug_lv >= 1) {
+                trace("restore: rolling ctx back to pos=%d\n",
+                      snap->pos);
+            }
             slm_ctx_restore(c, snap);
             slm_snapshot_free(snap);
             snap = NULL;
@@ -978,6 +1027,16 @@ int slm_generate(struct slm_ctx * c,
                 "Now I will answer the user's question.\n\n",
                 result.data ? result.data : "");
             chars_put(&inject, "", 0);
+            if (debug_lv >= 1) {
+                trace("preamble: %zu chars, replaying turn with"
+                      " curated content\n", inject.count);
+            }
+            if (debug_lv >= 7) {
+                size_t pcut = inject.count > 240 ? 240 : inject.count;
+                trace("preamble[0..%zu]: %.*s%s\n",
+                      pcut, (int)pcut, inject.data,
+                      pcut < inject.count ? "..." : "");
+            }
             size_t    cap2  = inject.count + 16;
             int32_t * ids   = (int32_t *)oom(
                 calloc(cap2, sizeof(int32_t)));
@@ -1129,6 +1188,7 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
                         const struct slm_sampler * sp, uint64_t seed,
                         int32_t max_new, int32_t min_new,
                         int32_t dump_layer, int32_t verbose,
+                        int32_t debug_level,
                         bool with_tools, bool with_think,
                         bool trace_tokens) {
     (void)verbose;
@@ -1148,6 +1208,7 @@ static int32_t run_chat(const char ** prompts, int32_t n_prompts,
             slm_ctx_ctrl(c)->think        = with_think;
             slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
             slm_ctx_ctrl(c)->dump_layer   = dump_layer;
+            slm_ctx_ctrl(c)->debug        = debug_level;
             slm_ctx_system_prompt(c, sys, NULL);
             struct capture_cb_box capbox = {0};
             capbox.base.callback = capture_cb_fn;
@@ -1332,6 +1393,7 @@ static int32_t run_ask(const char * question,
 static int32_t run_single(const char * prompt, int32_t max_new,
                           int32_t min_new, int32_t dump_layer,
                           int32_t verbose,
+                          int32_t debug_level,
                           const struct slm_sampler * sp, uint64_t seed,
                           bool with_tools, bool with_think,
                           bool trace_tokens) {
@@ -1366,6 +1428,7 @@ static int32_t run_single(const char * prompt, int32_t max_new,
             slm_ctx_ctrl(c)->think        = with_think;
             slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
             slm_ctx_ctrl(c)->dump_layer   = dump_layer;
+            slm_ctx_ctrl(c)->debug        = debug_level;
             slm_ctx_system_prompt(c, "", NULL);
             struct print_cb_box pbox = {0};
             pbox.base.callback = repl_cb_fn;
@@ -1450,6 +1513,7 @@ static int32_t run_bench(int32_t dump_layer, bool trace_tokens) {
 static int32_t run_repl(const struct slm_sampler * sp,
                         uint64_t seed, int32_t max_new, int32_t min_new,
                         int32_t dump_layer, int32_t verbose,
+                        int32_t debug_level,
                         bool with_tools, bool with_think,
                         bool trace_tokens) {
     struct slm_model * m = slm_model_load(slm_cli_gguf_path());
@@ -1467,6 +1531,7 @@ static int32_t run_repl(const struct slm_sampler * sp,
             slm_ctx_ctrl(c)->think        = with_think;
             slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
             slm_ctx_ctrl(c)->dump_layer   = dump_layer;
+            slm_ctx_ctrl(c)->debug        = debug_level;
             slm_ctx_system_prompt(c, "You are a helpful assistant.",
                                   NULL);
             struct print_cb_box pbox = {0};
@@ -1533,6 +1598,7 @@ int main(int argc, char ** argv) {
     bool     with_tools   = false;     // CLI --tools / --no-tools
     bool     with_think   = false;     // CLI --think / --no-think
     int32_t  verbose      = 0;         // CLI --verbose
+    int32_t  debug_level  = 1;         // CLI --debug N (0..9)
     bool     repl_max_new_set = false; // user set --max-new explicitly
     for (int32_t i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--self-test") == 0) {
@@ -1606,6 +1672,11 @@ int main(int argc, char ** argv) {
             trace_agent = 1;
         } else if (strcmp(argv[i], "--verbose") == 0) {
             verbose = 1;
+        } else if (strcmp(argv[i], "--debug") == 0 && i + 1 < argc) {
+            int v = atoi(argv[++i]);
+            if (v < 0) { v = 0; }
+            if (v > 9) { v = 9; }
+            debug_level = (int32_t)v;
         } else if (strcmp(argv[i], "--tools") == 0) {
             with_tools = true;
         } else if (strcmp(argv[i], "--no-tools") == 0) {
@@ -1650,9 +1721,11 @@ int main(int argc, char ** argv) {
         rc = chunked_self_test();
     } else if (mode == CLI_SINGLE) {
         rc = run_single(prompt, max_new, min_new, dump_layer, verbose,
+                        debug_level,
                         &sp, seed, with_tools, with_think, trace_tokens);
     } else if (mode == CLI_REPL) {
         rc = run_repl(&sp, seed, max_new, min_new, dump_layer, verbose,
+                      debug_level,
                       with_tools, with_think, trace_tokens);
     } else if (mode == CLI_CHAT) {
         if (chat_n == 0) {
@@ -1661,7 +1734,8 @@ int main(int argc, char ** argv) {
         } else {
             rc = run_chat(chat_prompts, chat_n, system_prompt,
                           &sp, seed, max_new, min_new, dump_layer,
-                          verbose, with_tools, with_think, trace_tokens);
+                          verbose, debug_level,
+                          with_tools, with_think, trace_tokens);
         }
     } else if (mode == CLI_CHAT_TEST) {
         rc = run_chat_test(max_new, min_new, dump_layer, trace_tokens);
@@ -1718,6 +1792,9 @@ int main(int argc, char ** argv) {
                        " (must stay off for --tools per Tool-Calling.md)\n"
                "  --verbose                         stream every signal"
                        " (content + reasoning + tool dialogue) to stdout\n"
+               "  --debug N                         trace verbosity 0..9"
+                       " (1=events, 3=tool args, 5=hits, 7=prompts,"
+                       " 9=raw bodies)\n"
                "\n"
                "sampler flags:\n"
                "  --temperature T                   0 = greedy, >0 = softmax T\n"

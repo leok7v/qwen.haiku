@@ -89,7 +89,11 @@ final class SLMViewModel {
     var messages:     [ChatMessage] = []
     var think:        Bool          = false
     var tools:        Bool          = false
-    var debug:        Bool          = true
+    // Graduated trace verbosity 0..9. 0 = silent, 1 = high-level
+    // events, 3 = tool args, 5 = top hits, 7 = prompt/preamble text,
+    // 9 = raw web bodies. Mutable on the fly; changes take effect on
+    // the next slm_generate call.
+    var debug:        Int32         = 1
 
     // Throughput from the most recent completed generation.
     // Zero before the first one finishes.
@@ -161,7 +165,7 @@ final class SLMViewModel {
                                       minNew:            8)
             let toolsOn = self.tools
             let thinkOn = self.think
-            let debugLv: Int32 = self.debug ? 1 : 0
+            let debugLv = self.debug
             let sysText = self.systemPrompt
             do {
                 let loaded = try await Task.detached(priority: .userInitiated) {
@@ -199,8 +203,8 @@ final class SLMViewModel {
             self.prefilling    = true
             // Debug is the only ctrl knob safe to flip mid-conversation
             // (tools/think are frozen after prefillSystem). Push it
-            // down so the next generate() sees the current toggle.
-            self.slm?.ctrl.pointee.debug = self.debug ? 1 : 0
+            // down so the next generate() sees the current level.
+            self.slm?.ctrl.pointee.debug = self.debug
             await self.streamAssistant(prompt: trimmedUser,
                                        at: assistantIdx,
                                        id: assistantID)
@@ -210,7 +214,7 @@ final class SLMViewModel {
     private func streamAssistant(prompt: String, at idx: Int,
                                  id: UUID) async {
         if let slm = self.slm {
-            let debugOn = self.debug
+            let debugLv = self.debug
             let thinkOn = self.think
             await Task.detached(priority: .userInitiated) { [weak self] in
                 // The C side already strips <think>...</think> /
@@ -246,7 +250,8 @@ final class SLMViewModel {
                             }
                         }
                     case .toolCall(let body):
-                        if debugOn {
+                        // tool-call surfaced from debug level 1+.
+                        if debugLv >= 1 {
                             let line = "\n[tool: " + body + "]\n"
                             DispatchQueue.main.async {
                                 self?.appendAssistant(line, at: idx,
@@ -254,8 +259,16 @@ final class SLMViewModel {
                             }
                         }
                     case .toolResponse(let body):
-                        if debugOn {
-                            let n = min(body.count, 400)
+                        // Higher debug level -> show more of the body
+                        // inline. Sized to roughly match the trace
+                        // ring's per-level budget.
+                        if debugLv >= 1 {
+                            let cap: Int = debugLv >= 9 ? 4000
+                                         : debugLv >= 7 ? 1200
+                                         : debugLv >= 5 ?  400
+                                         : debugLv >= 3 ?  120
+                                                        :   40
+                            let n = min(body.count, cap)
                             let prefix = String(body.prefix(n))
                             let line = "\n[result: " + prefix + "]\n"
                             DispatchQueue.main.async {
@@ -330,7 +343,7 @@ final class SLMViewModel {
             let sysText = self.systemPrompt
             let toolsOn = self.tools
             let thinkOn = self.think
-            let debugLv: Int32 = self.debug ? 1 : 0
+            let debugLv = self.debug
             do {
                 try slm.newConversation()
                 slm.ctrl.pointee.tools  = toolsOn
@@ -517,8 +530,11 @@ struct ChatView: View {
         }
     }
 
-    // Row 2: tools / think / debug toggle chips. Their own row so they
-    // get a full-width budget and the labels never wrap.
+    // Row 2: tools / think chips + debug-level stepper. Their own
+    // row so they get a full-width budget and the labels never wrap.
+    // Debug is a 0..9 stepper (replacing the on/off chip) so the user
+    // can gradually open up the trace fire-hose: 1 = events only,
+    // 9 = raw HTML bodies + full distill output.
     @ViewBuilder
     private var toggleRow: some View {
         HStack(spacing: 8) {
@@ -526,7 +542,15 @@ struct ChatView: View {
                 .disabled(vm.state == .generating)
             ChipToggle("Think", isOn: $vm.think)
                 .disabled(vm.state == .generating)
-            ChipToggle("Debug", isOn: $vm.debug)
+            Stepper(value: $vm.debug, in: Int32(0) ... Int32(9)) {
+                Text("Debug \(vm.debug)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .controlSize(.small)
+            .fixedSize()
             Spacer()
         }
     }

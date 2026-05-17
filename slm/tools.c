@@ -65,6 +65,18 @@
 #define TOOLS_FETCH_CAP (200 * 1024)
 #endif
 
+// Debug verbosity for tool internals. slm_generate sets this from
+// c->ctrl.debug right before dispatching a tool; the level gates how
+// chatty tools_websearch / tools_fetch are at each call. File-scoped
+// (not per-ctx) because tools_* are pure C functions with no ctx
+// parameter — passing debug through every primitive would balloon the
+// signatures for one diagnostic knob.
+static int32_t g_tools_debug = 0;
+
+static void tools_set_debug(int32_t level) {
+    g_tools_debug = level;
+}
+
 struct tool_result {
     int    ok;       // 1 on success, 0 on error
     char * body;     // heap-allocated UTF-8 (caller frees), may be NULL
@@ -654,6 +666,10 @@ static void tools_websearch(const char * query, int max_results,
     if (query == NULL || query[0] == '\0') {
         out->error = strdup("websearch: query parameter required");
     } else {
+        if (g_tools_debug >= 1) {
+            trace("websearch: query=\"%s\" max_results=%d\n",
+                  query, max_results);
+        }
         int cap = (max_results > 0 && max_results <= TOOLS_HITS_MAX)
                 ? max_results : TOOLS_HITS_MAX;
         struct chars eq = {0};
@@ -672,6 +688,10 @@ static void tools_websearch(const char * query, int max_results,
         struct chars body  = {0};
         long status        = 0;
         int  rc            = tools_http_get(url.data, 15000, &body, &status);
+        if (g_tools_debug >= 7) {
+            trace("websearch: DDG status=%ld body=%zu bytes\n",
+                  status, body.count);
+        }
         if (rc != 0) {
             out->error = strdup(
                 "websearch: libcurl request failed (network down?)");
@@ -695,6 +715,22 @@ static void tools_websearch(const char * query, int max_results,
         } else {
             struct tools_search_hit hits[TOOLS_HITS_MAX] = {0};
             int nh = tools_ddg_parse(body.data, body.count, cap, hits);
+            if (g_tools_debug >= 3) {
+                trace("websearch: %d hit(s) parsed (cap=%d)\n", nh, cap);
+            }
+            if (g_tools_debug >= 5) {
+                int show = nh < 3 ? nh : 3;
+                for (int i = 0; i < show; i++) {
+                    trace("  hit[%d]: %s\n    -> %s\n", i,
+                          hits[i].title != NULL ? hits[i].title : "(no title)",
+                          hits[i].url   != NULL ? hits[i].url   : "(no url)");
+                }
+            }
+            if (g_tools_debug >= 9 && body.data != NULL) {
+                size_t bcut = body.count > 2048 ? 2048 : body.count;
+                trace("websearch: raw DDG body[0..%zu]: %.*s\n",
+                      bcut, (int)bcut, body.data);
+            }
             struct chars result = {0};
             chars_printf(&result, "Web search result for \"%s\":\n", query);
             if (nh == 0) {
@@ -702,9 +738,17 @@ static void tools_websearch(const char * query, int max_results,
             } else {
                 const char * top_url     = hits[0].url;
                 const char * top_snippet = hits[0].snippet;
+                if (g_tools_debug >= 3) {
+                    trace("websearch: top URL = %s\n", top_url);
+                }
                 chars_printf(&result, "Source: %s\n\n", top_url);
                 struct tool_result fetched = {0};
                 tools_fetch(top_url, 15, &fetched);
+                if (g_tools_debug >= 7) {
+                    trace("websearch: fetch %s -> HTTP %ld (%zu bytes)\n",
+                          fetched.ok ? "ok" : "ERR", fetched.status,
+                          fetched.body != NULL ? strlen(fetched.body) : 0);
+                }
                 if (fetched.ok && fetched.body != NULL) {
                     struct tool_result distilled = {0};
                     tools_distill(fetched.body, strlen(fetched.body),
@@ -713,6 +757,16 @@ static void tools_websearch(const char * query, int max_results,
                         size_t blen = strlen(distilled.body);
                         size_t cut  = blen > TOOLS_DISTILL_CAP
                                     ? TOOLS_DISTILL_CAP : blen;
+                        if (g_tools_debug >= 1) {
+                            trace("websearch: distill %zu -> %zu chars"
+                                  " (cap %d)\n", blen, cut,
+                                  TOOLS_DISTILL_CAP);
+                        }
+                        if (g_tools_debug >= 9) {
+                            size_t dshow = blen > 2048 ? 2048 : blen;
+                            trace("websearch: distill[0..%zu]: %.*s\n",
+                                  dshow, (int)dshow, distilled.body);
+                        }
                         chars_put(&result, distilled.body, cut);
                         if (cut < blen) {
                             chars_printf(&result,

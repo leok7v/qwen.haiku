@@ -163,7 +163,16 @@ struct slm_ctrl {
 //
 // (4) debug: verbosity level (0 = quiet, 9 = chatty). Free to flip
 //     on the fly between generate calls. Gates whether tool-call /
-//     tool-response visibility chunks fire in the stream callback.
+//     tool-response visibility chunks fire in the stream callback,
+//     and how chatty the internal trace() ring is during a turn.
+//     Graduated thresholds:
+//       0  silent except errors
+//       1+ turn-start, snapshot/restore, tool dispatch ok/err
+//       3+ tool args, hit count, chosen URL
+//       5+ top-3 hit titles
+//       7+ user prompt prefix, preamble prefix, DDG body size,
+//          fetch HTTP status
+//       9+ raw DDG body excerpt, distill output excerpt
 //
 // (5) trace_tokens: when set, slm_generate prints each sampled token
 //     id to stderr as "[tok] %d\n". Used by tools/bench.sh's token-
