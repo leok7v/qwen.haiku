@@ -731,56 +731,54 @@ static void tools_distill(const char * html, size_t n,
     }
 }
 
-// websearch: atomic DDG -> pick top -> fetch -> distill chain. The
-// 0.8B model gets confused juggling multiple tool calls, so we do
-// the full agentic walk in C and hand back curated content the model
-// can summarise in one decode pass. Returns a body of the shape:
-//
-//   Web search result for "<query>":
-//   Source: <top_url>
-//
-//   <distilled body, capped at TOOLS_DISTILL_CAP chars>
-//
-// On hits with empty body or distill failure we fall back to the
-// DDG snippet so the caller still has something to summarise.
 #ifndef TOOLS_DISTILL_CAP
 #define TOOLS_DISTILL_CAP 4000
 #endif
 
-static void tools_websearch(const char * query, int max_results,
-                            struct tool_result * out) {
+// DDG search → parsed hits + formatted numbered text. No fetch. The
+// 3-phase URL-pick flow in slm_generate calls this directly so the
+// model can choose which URL to fetch from the (title, URL, snippet)
+// triples. The single-phase tools_websearch (back-compat shim) calls
+// it too, then auto-picks hits[0].
+//
+// `hits` is an out-array of capacity `hits_cap`; populated up to N
+// entries (return value). `out->body` gets a "1. <title>\n   <url>\n
+// <snippet>\n\n2. ..." block — useful directly as URL-pick preamble.
+// Caller frees hits via tools_free_hits and out via tools_result_free.
+static int tools_websearch_hits(const char * query, int max_results,
+                                struct tools_search_hit * hits,
+                                int hits_cap,
+                                struct tool_result * out) {
     tools_global_init();
     out->ok     = 0;
     out->body   = NULL;
     out->error  = NULL;
     out->status = 0;
+    int nh = 0;
     if (query == NULL || query[0] == '\0') {
         out->error = strdup("websearch: query parameter required");
     } else {
         if (g_tools_debug >= 1) {
-            trace("websearch: query=\"%s\" max_results=%d\n",
+            trace("websearch_hits: query=\"%s\" max=%d\n",
                   query, max_results);
         }
-        int cap = (max_results > 0 && max_results <= TOOLS_HITS_MAX)
-                ? max_results : TOOLS_HITS_MAX;
+        int cap = (max_results > 0 && max_results <= hits_cap)
+                ? max_results : hits_cap;
+        if (cap > TOOLS_HITS_MAX) { cap = TOOLS_HITS_MAX; }
         struct chars eq = {0};
         tools_url_encode(query, &eq);
         struct chars url = {0};
-        // URL shape captured from Safari Incognito navigating DDG home
-        // (organic-funnel profile: ia=web, origin=funnel_home_website,
-        // t=h_, chip-select=search). Lite endpoint accepts bare ?q=,
-        // but the funnel params match an organic-navigation
-        // fingerprint and pass DDG's bot-detection more often.
         chars_puts(&url,
             "https://lite.duckduckgo.com/lite/"
             "?ia=web&origin=funnel_home_website&t=h_&q=");
         if (eq.data != NULL) { chars_puts(&url, eq.data); }
         chars_puts(&url, "&chip-select=search");
-        struct chars body  = {0};
-        long status        = 0;
-        int  rc            = tools_http_get(url.data, 15000, &body, &status);
+        struct chars body = {0};
+        long         status = 0;
+        int          rc     = tools_http_get(url.data, 15000,
+                                             &body, &status);
         if (g_tools_debug >= 7) {
-            trace("websearch: DDG status=%ld body=%zu bytes\n",
+            trace("websearch_hits: DDG status=%ld body=%zu bytes\n",
                   status, body.count);
         }
         if (rc != 0) {
@@ -796,89 +794,37 @@ static void tools_websearch(const char * query, int max_results,
             out->error = strdup("websearch: empty response from DDG");
         } else if (memmem(body.data, body.count,
                           "anomaly-modal", 13) != NULL) {
-            // DDG bot-detection CAPTCHA page returns 200 with no
-            // results. Surface as a distinct error so the caller can
-            // retry after a delay.
             out->error = strdup(
-                "websearch: DDG bot-detection CAPTCHA challenge"
-                " (rate-limited - try again in a few minutes)");
+                "websearch: DDG bot-detection CAPTCHA challenge");
             out->status = status;
         } else {
-            struct tools_search_hit hits[TOOLS_HITS_MAX] = {0};
-            int nh = tools_ddg_parse(body.data, body.count, cap, hits);
+            nh = tools_ddg_parse(body.data, body.count, cap, hits);
             if (g_tools_debug >= 3) {
-                trace("websearch: %d hit(s) parsed (cap=%d)\n", nh, cap);
+                trace("websearch_hits: %d hit(s) parsed (cap=%d)\n",
+                      nh, cap);
             }
             if (g_tools_debug >= 5) {
                 int show = nh < 3 ? nh : 3;
                 for (int i = 0; i < show; i++) {
                     trace("  hit[%d]: %s\n    -> %s\n", i,
-                          hits[i].title != NULL ? hits[i].title : "(no title)",
-                          hits[i].url   != NULL ? hits[i].url   : "(no url)");
+                          hits[i].title ? hits[i].title : "(no title)",
+                          hits[i].url   ? hits[i].url   : "(no url)");
                 }
             }
             if (g_tools_debug >= 9 && body.data != NULL) {
                 size_t bcut = body.count > 2048 ? 2048 : body.count;
-                trace("websearch: raw DDG body[0..%zu]: %.*s\n",
+                trace("websearch_hits: raw DDG body[0..%zu]: %.*s\n",
                       bcut, (int)bcut, body.data);
             }
             struct chars result = {0};
-            chars_printf(&result, "Web search result for \"%s\":\n", query);
-            if (nh == 0) {
-                chars_puts(&result, "No results found.\n");
-            } else {
-                const char * top_url     = hits[0].url;
-                const char * top_snippet = hits[0].snippet;
-                if (g_tools_debug >= 3) {
-                    trace("websearch: top URL = %s\n", top_url);
-                }
-                chars_printf(&result, "Source: %s\n\n", top_url);
-                struct tool_result fetched = {0};
-                tools_fetch(top_url, 15, &fetched);
-                if (g_tools_debug >= 7) {
-                    trace("websearch: fetch %s -> HTTP %ld (%zu bytes)\n",
-                          fetched.ok ? "ok" : "ERR", fetched.status,
-                          fetched.body != NULL ? strlen(fetched.body) : 0);
-                }
-                if (fetched.ok && fetched.body != NULL) {
-                    struct tool_result distilled = {0};
-                    tools_distill(fetched.body, strlen(fetched.body),
-                                  &distilled);
-                    if (distilled.ok && distilled.body != NULL) {
-                        size_t blen = strlen(distilled.body);
-                        size_t cut  = blen > TOOLS_DISTILL_CAP
-                                    ? TOOLS_DISTILL_CAP : blen;
-                        if (g_tools_debug >= 1) {
-                            trace("websearch: distill %zu -> %zu chars"
-                                  " (cap %d)\n", blen, cut,
-                                  TOOLS_DISTILL_CAP);
-                        }
-                        if (g_tools_debug >= 9) {
-                            size_t dshow = blen > 2048 ? 2048 : blen;
-                            trace("websearch: distill[0..%zu]: %.*s\n",
-                                  dshow, (int)dshow, distilled.body);
-                        }
-                        chars_put(&result, distilled.body, cut);
-                        if (cut < blen) {
-                            chars_printf(&result,
-                                "\n\n[... truncated at %zu chars]", cut);
-                        }
-                    } else if (top_snippet != NULL) {
-                        chars_printf(&result, "Snippet: %s\n", top_snippet);
-                    }
-                    tools_result_free(&distilled);
-                } else if (top_snippet != NULL) {
-                    chars_printf(&result,
-                        "[fetch failed: %s]\nSnippet: %s\n",
-                        fetched.error ? fetched.error : "(no error)",
-                        top_snippet);
-                } else {
-                    chars_printf(&result, "[fetch failed: %s]\n",
-                        fetched.error ? fetched.error : "(no error)");
-                }
-                tools_result_free(&fetched);
+            for (int i = 0; i < nh; i++) {
+                chars_printf(&result, "%d. %s\n   %s\n   %s\n\n",
+                    i + 1,
+                    hits[i].title   ? hits[i].title   : "(no title)",
+                    hits[i].url     ? hits[i].url     : "(no url)",
+                    hits[i].snippet ? hits[i].snippet : "(no snippet)");
             }
-            tools_free_hits(hits, nh);
+            chars_put(&result, "", 0);
             out->body   = result.data;
             out->status = status;
             out->ok     = 1;
@@ -887,6 +833,125 @@ static void tools_websearch(const char * query, int max_results,
         free(url.data);
         free(body.data);
     }
+    return nh;
+}
+
+// Fetch URL + distill into curated body (capped). `out->body` is the
+// distilled text (possibly with a truncation notice appended); errors
+// land in `out->error`. Used by both the URL-pick orchestrator and
+// the back-compat tools_websearch shim.
+static void tools_fetch_distill(const char * url,
+                                struct tool_result * out) {
+    out->ok     = 0;
+    out->body   = NULL;
+    out->error  = NULL;
+    out->status = 0;
+    if (url == NULL || url[0] == '\0') {
+        out->error = strdup("fetch_distill: url required");
+    } else {
+        struct tool_result fetched = {0};
+        tools_fetch(url, 15, &fetched);
+        if (g_tools_debug >= 7) {
+            trace("fetch_distill: fetch %s -> HTTP %ld (%zu bytes)\n",
+                  fetched.ok ? "ok" : "ERR", fetched.status,
+                  fetched.body ? strlen(fetched.body) : 0);
+        }
+        if (fetched.ok && fetched.body != NULL) {
+            struct tool_result distilled = {0};
+            tools_distill(fetched.body, strlen(fetched.body),
+                          &distilled);
+            if (distilled.ok && distilled.body != NULL) {
+                size_t blen = strlen(distilled.body);
+                size_t cut  = blen > TOOLS_DISTILL_CAP
+                            ? TOOLS_DISTILL_CAP : blen;
+                if (g_tools_debug >= 1) {
+                    trace("fetch_distill: %zu -> %zu chars (cap %d)\n",
+                          blen, cut, TOOLS_DISTILL_CAP);
+                }
+                if (g_tools_debug >= 9) {
+                    size_t s = blen > 2048 ? 2048 : blen;
+                    trace("fetch_distill: body[0..%zu]: %.*s\n",
+                          s, (int)s, distilled.body);
+                }
+                struct chars b = {0};
+                chars_put(&b, distilled.body, cut);
+                if (cut < blen) {
+                    chars_printf(&b,
+                        "\n\n[... truncated at %zu chars]", cut);
+                }
+                chars_put(&b, "", 0);
+                out->body   = b.data;
+                out->status = fetched.status;
+                out->ok     = 1;
+            } else {
+                out->error = strdup(distilled.error
+                    ? distilled.error : "distill failed");
+                out->status = fetched.status;
+            }
+            tools_result_free(&distilled);
+        } else {
+            out->error = strdup(fetched.error
+                ? fetched.error : "fetch failed");
+            out->status = fetched.status;
+        }
+        tools_result_free(&fetched);
+    }
+}
+
+// Back-compat shim: single-phase websearch (DDG → auto-pick top →
+// fetch+distill). Used by agent_dispatch on the --ask path. The
+// in-band slm_generate flow does proper URL-pick via the model; this
+// shim auto-picks hits[0] for callers that don't have a model in
+// scope.
+static void tools_websearch(const char * query, int max_results,
+                            struct tool_result * out) {
+    out->ok     = 0;
+    out->body   = NULL;
+    out->error  = NULL;
+    out->status = 0;
+    struct tools_search_hit hits[TOOLS_HITS_MAX] = {0};
+    struct tool_result      hits_res             = {0};
+    int nh = tools_websearch_hits(query, max_results, hits,
+                                  TOOLS_HITS_MAX, &hits_res);
+    if (!hits_res.ok) {
+        out->error  = hits_res.error;
+        hits_res.error = NULL;
+        out->status = hits_res.status;
+    } else if (nh == 0) {
+        struct chars b = {0};
+        chars_printf(&b,
+            "Web search result for \"%s\":\nNo results found.\n",
+            query);
+        chars_put(&b, "", 0);
+        out->body   = b.data;
+        out->status = hits_res.status;
+        out->ok     = 1;
+    } else {
+        const char * top_url     = hits[0].url;
+        const char * top_snippet = hits[0].snippet;
+        struct tool_result fd = {0};
+        tools_fetch_distill(top_url, &fd);
+        struct chars b = {0};
+        chars_printf(&b,
+            "Web search result for \"%s\":\nSource: %s\n\n",
+            query, top_url);
+        if (fd.ok && fd.body != NULL) {
+            chars_puts(&b, fd.body);
+        } else if (top_snippet != NULL) {
+            chars_printf(&b, "[fetch failed: %s]\nSnippet: %s\n",
+                fd.error ? fd.error : "(no error)", top_snippet);
+        } else {
+            chars_printf(&b, "[fetch failed: %s]\n",
+                fd.error ? fd.error : "(no error)");
+        }
+        chars_put(&b, "", 0);
+        out->body   = b.data;
+        out->status = hits_res.status;
+        out->ok     = 1;
+        tools_result_free(&fd);
+    }
+    tools_result_free(&hits_res);
+    tools_free_hits(hits, nh);
 }
 
 // Self-test. Network-dependent: skips silently if libcurl can't

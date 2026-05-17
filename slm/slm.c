@@ -693,6 +693,32 @@ static int slm_capture_cb_fn(const struct slm_stream_callback * cb) {
     return rc;
 }
 
+// Scan a text buffer for the first ASCII integer, return it if it
+// falls in [1..max_n], else 0. Used by the URL-pick phase to extract
+// the model's chosen hit number from its short reply. Tolerant of
+// leading whitespace, punctuation, or English chatter prefix.
+static int slm_parse_pick_number(const char * s, size_t n, int max_n) {
+    int  result = 0;
+    int  value  = 0;
+    bool found  = false;
+    size_t i    = 0;
+    while (i < n && !found) {
+        if (s[i] >= '0' && s[i] <= '9') {
+            while (i < n && s[i] >= '0' && s[i] <= '9' && value < 1000000) {
+                value = value * 10 + (s[i] - '0');
+                i++;
+            }
+            found = true;
+        } else {
+            i++;
+        }
+    }
+    if (found && value >= 1 && value <= max_n) {
+        result = value;
+    }
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // Think-filter self-test
 // ---------------------------------------------------------------------------
@@ -987,13 +1013,16 @@ int slm_generate(struct slm_ctx * c,
         slm_trace_long("turn: user prompt",
                        user_text, strlen(user_text));
     }
-    // At debug >= 9 wrap the user's cb so we can re-emit the full
-    // content + reasoning streams via slm_trace_long at end of turn.
+    // Wrap the user's cb with our capture box whenever tools is on
+    // (the URL-pick phase needs to read the model's reply to pick a
+    // hit) or when debug>=9 (which dumps the full content/reasoning
+    // streams at end of turn). The wrapper is transparent — every
+    // chunk is forwarded to `cb` unchanged.
     struct slm_capture_box capture = {0};
     capture.base.callback          = slm_capture_cb_fn;
     capture.forward                = cb;
     struct slm_stream_callback * effective_cb =
-        (debug_lv >= 9) ? &capture.base : cb;
+        (with_tools || debug_lv >= 9) ? &capture.base : cb;
     // Snapshot taken at the model's "decision point" — after the user
     // delta is prefilled into KV but BEFORE the decode loop starts.
     // Set by slm_snap_capture_fn via slm_generate_raw's after_prefill
@@ -1081,63 +1110,182 @@ int slm_generate(struct slm_ctx * c,
                 }
             }
             chars_free(&wrapped);
-            // Propagate debug level into the tools.c primitives for
-            // the duration of this dispatch round; reset to silent
-            // immediately after so unrelated callers don't inherit it.
+            // Detect "single websearch call" — the URL-pick fast path.
+            // Multi-call or non-websearch falls through to the legacy
+            // single-phase dispatch below.
+            bool websearch_only = (nc == 1 && calls[0].name != NULL &&
+                                   strcmp(calls[0].name, "websearch") == 0);
+            // Propagate debug level into the tools.c primitives.
             tools_set_debug(debug_lv);
-            struct chars result = {0};
-            for (int i = 0; i < nc; i++) {
-                struct tool_result r = {0};
-                agent_dispatch(&calls[i], &r);
-                const char * payload =
-                    r.ok && r.body != NULL ? r.body
-                  : r.error != NULL        ? r.error
-                                           : "(no result)";
+            struct chars inject = {0};
+            if (websearch_only) {
+                // ===== URL-pick: 3 phases inside ONE outer iter =====
+                // Phase A: DDG search → hits[].
+                // Phase B: model picks a number (1..N) from the hit
+                //          list. We run an inline slm_generate_raw
+                //          here with a short budget, capture the
+                //          reply, parse the digit (fallback to 1 if
+                //          the model doesn't emit a clean number).
+                // Phase C: fetch+distill the picked URL.
+                // Then we hand a "Source: <url>\n\n<distilled>\n\n
+                // Concise answer:\n" preamble to the outer loop's
+                // next iter for the final-answer decode.
+                const char * query =
+                    agent_call_param(&calls[0], "query");
+                struct tools_search_hit hits[TOOLS_HITS_MAX] = {0};
+                struct tool_result      hits_res             = {0};
+                int nh = tools_websearch_hits(
+                    query, 5, hits, TOOLS_HITS_MAX, &hits_res);
                 if (debug_lv >= 1) {
-                    trace("tool_call[%d]: %s -> %s (%zu bytes)\n",
-                          i, calls[i].name != NULL ? calls[i].name : "?",
-                          r.ok ? "ok" : "ERR",
-                          payload != NULL ? strlen(payload) : 0);
+                    trace("websearch: %d hit(s) for \"%s\"\n",
+                          nh, query ? query : "");
                 }
-                if (i > 0) { chars_put(&result, "\n\n", 2); }
-                chars_put(&result, payload, strlen(payload));
-                tools_result_free(&r);
+                int picked = 0;        // 1-based; 0 = fallback to top
+                if (nh > 0 && hits_res.ok) {
+                    // -- Phase B: ask the model to pick a URL --
+                    slm_ctx_restore(c, snap);
+                    chars_free(&capture.content);
+                    capture.content = (struct chars){0};
+                    struct chars pick_p = {0};
+                    chars_printf(&pick_p,
+                        "Search results:\n\n%s"
+                        "Pick the URL most likely to answer the"
+                        " user's question. Reply with ONLY the"
+                        " number (1-%d).\n\n",
+                        hits_res.body ? hits_res.body : "",
+                        nh);
+                    chars_put(&pick_p, "", 0);
+                    if (debug_lv >= 1) {
+                        trace("url_pick: asking model"
+                              " (preamble %zu chars, budget 64)\n",
+                              pick_p.count);
+                    }
+                    if (debug_lv >= 9) {
+                        slm_trace_long("url_pick preamble",
+                                       pick_p.data, pick_p.count);
+                    }
+                    cur.count = 0;
+                    tokenizer_encode(&c->model->tok,
+                                     pick_p.data, &cur);
+                    slm_ctx_ids_append(c, cur.data, cur.count);
+                    chars_free(&pick_p);
+                    struct slm_split_box pick_box = {0};
+                    slm_think_filter_init(&pick_box.filter);
+                    pick_box.filter.recognize_tool_calls = false;
+                    pick_box.filter.emit_visibility      = false;
+                    pick_box.cb = effective_cb;
+                    int pick_budget = 64;
+                    if (pick_budget > max_new - total_gen) {
+                        pick_budget = max_new - total_gen;
+                    }
+                    slm_generate_raw(c, cur.data, (int32_t)cur.count,
+                                     pick_budget, 0,
+                                     sampler_in, seed,
+                                     slm_split_trampoline, &pick_box,
+                                     effective_cb, NULL);
+                    slm_think_filter_finish(&pick_box.filter,
+                                            effective_cb);
+                    chars_free(&pick_box.filter.tool_call);
+                    cur.count = 0;
+                    picked = slm_parse_pick_number(
+                        capture.content.data, capture.content.count,
+                        nh);
+                    if (debug_lv >= 1) {
+                        trace("url_pick: model reply %zu chars,"
+                              " parsed=%d (1=fallback)\n",
+                              capture.content.count,
+                              picked > 0 ? picked : 1);
+                    }
+                    if (debug_lv >= 9) {
+                        slm_trace_long("url_pick reply",
+                                       capture.content.data,
+                                       capture.content.count);
+                    }
+                    chars_free(&capture.content);
+                    capture.content = (struct chars){0};
+                    chars_free(&capture.reasoning);
+                    capture.reasoning = (struct chars){0};
+                }
+                if (picked < 1) { picked = 1; }
+                const char * picked_url = (nh > 0)
+                    ? hits[picked - 1].url : NULL;
+                if (debug_lv >= 1 && nh > 0) {
+                    trace("url_pick: chose [%d] %s\n",
+                          picked, picked_url ? picked_url : "?");
+                }
+                // -- Phase C: fetch+distill the chosen URL --
+                struct tool_result fd = {0};
+                if (picked_url != NULL) {
+                    tools_fetch_distill(picked_url, &fd);
+                }
+                // Restore again, build final preamble.
+                slm_ctx_restore(c, snap);
+                if (with_debug && fd.body != NULL) {
+                    text_puts(&c->messages, fd.body);
+                    slm_cb_emit(effective_cb, NULL, NULL, NULL,
+                                fd.body, false, 0, 0);
+                }
+                chars_printf(&inject,
+                    "I searched the web and fetched %s.\n\n%s\n\n"
+                    "Based on this, here is a concise answer to the"
+                    " user's question:\n\n",
+                    picked_url ? picked_url : "(no URL)",
+                    fd.ok && fd.body != NULL ? fd.body
+                  : fd.error    != NULL      ? fd.error
+                                             : "(no content)");
+                chars_put(&inject, "", 0);
+                tools_result_free(&fd);
+                tools_result_free(&hits_res);
+                tools_free_hits(hits, nh);
+            } else {
+                // ===== Legacy single-phase (fetch / distill / multi-
+                // call) — keep the original agent_dispatch loop. =====
+                struct chars result = {0};
+                for (int i = 0; i < nc; i++) {
+                    struct tool_result r = {0};
+                    agent_dispatch(&calls[i], &r);
+                    const char * payload =
+                        r.ok && r.body != NULL ? r.body
+                      : r.error != NULL        ? r.error
+                                               : "(no result)";
+                    if (debug_lv >= 1) {
+                        trace("tool_call[%d]: %s -> %s (%zu bytes)\n",
+                              i,
+                              calls[i].name ? calls[i].name : "?",
+                              r.ok ? "ok" : "ERR",
+                              payload ? strlen(payload) : 0);
+                    }
+                    if (i > 0) { chars_put(&result, "\n\n", 2); }
+                    chars_put(&result, payload, strlen(payload));
+                    tools_result_free(&r);
+                }
+                chars_put(&result, "", 0);
+                if (result.data != NULL && with_debug) {
+                    text_puts(&c->messages, result.data);
+                    slm_cb_emit(effective_cb, NULL, NULL, NULL,
+                                result.data, false, 0, 0);
+                }
+                slm_ctx_restore(c, snap);
+                chars_printf(&inject,
+                    "I ran a tool. Here is the result:\n\n%s\n\n"
+                    "Based on the above, here is a concise answer to"
+                    " the user's question:\n\n",
+                    result.data ? result.data : "");
+                chars_put(&inject, "", 0);
+                chars_free(&result);
             }
             tools_set_debug(0);
-            chars_put(&result, "", 0);
             agent_free_calls(calls, nc);
-            if (result.data != NULL && with_debug) {
-                text_puts(&c->messages, result.data);
-                slm_cb_emit(effective_cb, NULL, NULL, NULL, result.data,
-                            false, 0, 0);
-            }
-            // Atomic rollback: tool_call emission is wiped from KV/
-            // SSM/pos/ids back to the post-prefill snapshot point.
-            // The user delta + assistant prefix REMAIN in KV (they
-            // were prefilled before the snapshot fired), so we only
-            // need to append the curated preamble — no re-tokenize
-            // of the original turn delta.
             if (debug_lv >= 1) {
                 trace("restore: rolling ctx back to pos=%d\n",
                       snap->pos);
             }
-            slm_ctx_restore(c, snap);
             slm_snapshot_free(snap);
             snap       = NULL;
             tool_round = false;     // one tool round per turn
-            // Preamble: the curated search results followed by a
-            // direct request to summarize. Continues the assistant
-            // turn (KV ends at <think></think>\n\n after restore).
-            struct chars inject = {0};
-            chars_printf(&inject,
-                "I searched the web. Here are the results:\n\n%s\n\n"
-                "Based on the above, here is a concise answer to the"
-                " user's question:\n\n",
-                result.data ? result.data : "");
-            chars_put(&inject, "", 0);
             if (debug_lv >= 1) {
-                trace("preamble: %zu chars, replaying turn with"
-                      " curated content\n", inject.count);
+                trace("preamble: %zu chars, queueing final answer\n",
+                      inject.count);
             }
             if (debug_lv >= 7 && debug_lv < 9) {
                 size_t pcut = inject.count > 240 ? 240 : inject.count;
@@ -1149,13 +1297,12 @@ int slm_generate(struct slm_ctx * c,
                 slm_trace_long("preamble (full)",
                                inject.data, inject.count);
             }
+            cur.count = 0;
             tokenizer_encode(&c->model->tok, inject.data, &cur);
             slm_ctx_ids_append(c, cur.data, cur.count);
             chars_free(&inject);
-            chars_free(&result);
-            // Reset the visible-tokens counter: the aborted tool_call
-            // emission doesn't count toward max_new. The second pass
-            // gets the full budget for the actual answer.
+            // Reset the visible-tokens counter so the final-answer
+            // pass gets the full budget.
             total_gen = 0;
         } else {
             if (debug_lv >= 1 && snap != NULL) {
