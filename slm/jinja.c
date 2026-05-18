@@ -342,13 +342,18 @@ static void jinja_emit_tools_prelude(struct chars * b,
     chars_puts(b, "\n</tools>");
     chars_puts(b, K_TOOL_INSTRUCTIONS);
     // Behavioral nudge appended AFTER the structural rules. The
-    // 0.8B often commits to "I don't have access to real-time
-    // information" instead of calling websearch, and once that
-    // pattern is in KV the model anchors to it across the rest of
-    // a --repl session. Explicit "do not refuse, call websearch"
-    // language tips the next-token distribution toward the tool
-    // marker. Kept outside K_TOOL_INSTRUCTIONS so the official
-    // jinja text stays bit-stable.
+    // 0.8B's default failure modes here are:
+    //  (1) refuse with "I don't have access to real-time information"
+    //      instead of calling the appropriate tool;
+    //  (2) on the post-tool answer-back turn, second-guess its own
+    //      tool call and refuse anyway, ignoring the <tool_response>
+    //      body in front of it.
+    // The HARD RULES below name those failures and the fix
+    // explicitly. Tool-agnostic wording (we don't reference any
+    // particular tool by name) because the advertised tool surface
+    // changes — naming "websearch" anchored the model to that one
+    // tool even after we added wikipedia/time_now/weather/etc.,
+    // which fought the per-tool descriptions in the <tools> block.
     //
     // Wording aligned with the community "qwen3.5-enhanced.jinja"
     // (allanchan339/vLLM-Qwen3-3.5-3.6-chat-template-fix) which
@@ -364,14 +369,17 @@ static void jinja_emit_tools_prelude(struct chars * b,
     chars_puts(b,
         "\n\n"
         "HARD RULES for tool use:\n"
-        "- If a suitable tool exists for the user's request, use it"
-        " instead of answering from memory or training data.\n"
-        "- Use the websearch function for any question that depends"
-        " on current or real-time information: time, dates, prices,"
-        " news, weather, schedules, traffic, scores, exchange rates,"
-        " or anything that may have changed since your training.\n"
-        "- Do NOT tell the user you lack access to real-time data —"
-        " call websearch instead.\n"
+        "- If a suitable tool listed above exists for the user's"
+        " request, call that tool instead of answering from memory"
+        " or training data. Pick the most specific tool that fits"
+        " the question.\n"
+        "- After a tool returns a result via <tool_response>, USE"
+        " that result as the source of truth in your next answer."
+        " Do NOT refuse, do NOT claim you lack access to that"
+        " information, and do NOT call the same tool again. Trust"
+        " the numbers, dates, names, and text in the tool response.\n"
+        "- Do NOT tell the user you lack access to real-time data"
+        " — there is a tool for that situation. Call it.\n"
         "- Do NOT output any reasoning, natural-language commentary,"
         " or filler text before or after the <tool_call> block."
         " Emit the <tool_call> directly.");

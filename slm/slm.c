@@ -1293,8 +1293,15 @@ struct tools_e2e_capture {
 
 static int tools_e2e_cb_fn(const struct slm_stream_callback * cb) {
     struct tools_e2e_capture * box = (struct tools_e2e_capture *)cb;
-    if (cb->content != NULL && box->out != NULL) {
-        chars_puts(box->out, cb->content);
+    if (box->out != NULL) {
+        if (cb->content   != NULL) { chars_puts(box->out, cb->content); }
+        // Also capture reasoning. Without this, a model that
+        // re-opens <think>...</think> on the post-tool answer-back
+        // iter routes all its output to .reasoning and the test
+        // captures 0 chars even though the model actually wrote a
+        // complete answer (which the user would see in repl as
+        // [think] markers).
+        if (cb->reasoning != NULL) { chars_puts(box->out, cb->reasoning); }
     }
     return 0;
 }
@@ -1850,8 +1857,16 @@ static int32_t run_repl(const struct slm_sampler * sp,
             slm_ctx_ctrl(c)->trace_tokens = trace_tokens;
             slm_ctx_ctrl(c)->dump_layer   = dump_layer;
             slm_ctx_ctrl(c)->debug        = debug_level;
-            slm_ctx_system_prompt(c, "You are a helpful assistant.",
-                                  NULL);
+            // Empty system text. With tools advertised, the system
+            // block already carries the # Tools section, official
+            // K_TOOL_INSTRUCTIONS, and the HARD RULES nudge from
+            // jinja_emit_tools_prelude — adding "You are a helpful
+            // assistant." on top of that nudged the 0.8B toward
+            // training-style "I'm sorry, I can't..." refusals
+            // instead of using <tool_response> data. --single and
+            // the e2e test use "" and answer correctly; --repl with
+            // the boilerplate refused on the same prompt.
+            slm_ctx_system_prompt(c, "", NULL);
             struct print_cb_box pbox = {0};
             pbox.base.callback = repl_cb_fn;
             pbox.verbose       = verbose;
