@@ -396,6 +396,15 @@ struct slm_think_filter {
     bool                tool_call_ready;
     bool                recognize_tool_calls;
     bool                emit_visibility;
+    // When true, recognize <tool_call>...</tool_call> markers AND
+    // absorb them out of the visible content stream, but do NOT
+    // signal tool_call_ready and do NOT short-circuit decoding.
+    // Used on the post-tool answer-back iter (iter 1+) so any stray
+    // tool_call markup the model emits gets silently filtered
+    // without halting generation. With recognize=true + discard=false
+    // (the iter-0 default) the markers DO halt generation so the
+    // caller can dispatch.
+    bool                discard_tool_calls;
 };
 
 struct slm_think_marker {
@@ -422,6 +431,7 @@ static void slm_think_filter_init(struct slm_think_filter * f) {
     f->tool_call_ready = false;
     f->recognize_tool_calls = true;
     f->emit_visibility      = true;
+    f->discard_tool_calls   = false;
 }
 
 // Emit `[start, start+n)` bytes through `cb`, tagging the chunk
@@ -569,15 +579,25 @@ int slm_think_filter_push(struct slm_think_filter * f,
                     }
                     if (prev_mode == THINK_MODE_TOOL_CALL &&
                         f->mode  != THINK_MODE_TOOL_CALL) {
-                        if (cb != NULL && f->tool_call.count > 0 &&
-                            f->emit_visibility) {
-                            char * call_text = f->tool_call.data;
-                            slm_cb_emit(cb, NULL, NULL, call_text,
-                                        NULL, false, 0, 0);
+                        if (f->discard_tool_calls) {
+                            // Silently absorb a stray tool_call
+                            // (post-dispatch iter): clear the
+                            // internal buffer and keep decoding.
+                            f->tool_call.count = 0;
+                            if (f->tool_call.data != NULL) {
+                                f->tool_call.data[0] = '\0';
+                            }
+                        } else {
+                            if (cb != NULL && f->tool_call.count > 0 &&
+                                f->emit_visibility) {
+                                char * call_text = f->tool_call.data;
+                                slm_cb_emit(cb, NULL, NULL, call_text,
+                                            NULL, false, 0, 0);
+                            }
+                            f->tool_call_ready = true;
+                            rc = 1;
+                            more = false;
                         }
-                        f->tool_call_ready = true;
-                        rc = 1;
-                        more = false;
                     }
                     if (prev_mode != THINK_MODE_TOOL_CALL &&
                         f->mode  == THINK_MODE_TOOL_CALL) {
@@ -1038,7 +1058,18 @@ int slm_generate(struct slm_ctx * c,
            total_gen < max_new) {
         struct slm_split_box box = {0};
         slm_think_filter_init(&box.filter);
-        box.filter.recognize_tool_calls = tool_round;
+        // Recognize tool-call markers across ALL iters when tools
+        // were advertised this turn. On the tool-eligible first iter
+        // (tool_round=true), recognising halts decoding so the caller
+        // can dispatch. On post-tool answer-back iters (tool_round=
+        // false), we still want the markers filtered OUT of visible
+        // content (so a stray <tool_call> the model emits on iter 1
+        // doesn't leak as raw markup) but we MUST NOT halt decoding
+        // — otherwise the final answer never gets generated. The
+        // discard_tool_calls flag below tells the filter "absorb
+        // and keep going" on those iters.
+        box.filter.recognize_tool_calls = with_tools;
+        box.filter.discard_tool_calls   = with_tools && !tool_round;
         box.filter.emit_visibility      = with_debug;
         box.cb = effective_cb;
         int budget = max_new - total_gen;
@@ -1096,6 +1127,15 @@ int slm_generate(struct slm_ctx * c,
                     }
                 }
             }
+            // Snapshot the wrapped call text BEFORE freeing — we
+            // re-emit it into the post-restore context below so the
+            // model sees the canonical Qwen tool-response framing
+            // (assistant turn that contains the <tool_call> →
+            // user turn with <tool_response> → fresh assistant
+            // gen-prompt).
+            struct chars call_echo = {0};
+            chars_put(&call_echo, wrapped.data, wrapped.count);
+            chars_put(&call_echo, "", 0);
             chars_free(&wrapped);
             // Propagate debug level into the tools.c primitives.
             tools_set_debug(debug_lv);
@@ -1141,13 +1181,36 @@ int slm_generate(struct slm_ctx * c,
                             result.data, false, 0, 0);
             }
             slm_ctx_restore(c, snap);
-            chars_printf(&inject,
-                "Tool result:\n\n%s\n\n"
-                "Answer the user's original question using the tool"
-                " result above. Be concise (1-3 sentences for simple"
-                " queries) and respond in plain prose. Do NOT call"
-                " any more tools.\n\n",
-                result.data ? result.data : "");
+            // Post-tool preamble — CANONICAL QWEN tool-response
+            // framing. After slm_ctx_restore, the KV cursor sits at
+            // the end of the assistant gen-prompt
+            // (`<|im_start|>assistant\n<think>\n\n</think>\n\n`).
+            // We complete the assistant turn with the captured
+            // <tool_call> block, then emit a user turn that wraps
+            // the tool output in <tool_response>...</tool_response>,
+            // then open a fresh assistant gen-prompt for the answer.
+            // This matches the Qwen3.5 chat template's tool path —
+            // the model was trained on this shape so it responds
+            // with an answer rather than emitting another tool_call.
+            //
+            // Earlier drafts injected raw "Tool result:\n\n..." text
+            // instead. That left the context off-distribution (no
+            // <tool_response> tags, assistant turn never properly
+            // closed) and the 0.8B routinely emitted a duplicate
+            // <tool_call> as its "answer". Tightening text hints in
+            // the preamble didn't fix it; the framing was the cause.
+            chars_puts(&inject, call_echo.data != NULL
+                       ? call_echo.data : "<tool_call></tool_call>");
+            chars_puts(&inject, "<|im_end|>\n");
+            chars_puts(&inject, "<|im_start|>user\n<tool_response>\n");
+            chars_puts(&inject, result.data != NULL
+                       ? result.data : "(no result)");
+            chars_puts(&inject, "\n</tool_response><|im_end|>\n");
+            // Fresh assistant gen-prompt. Always with closed-think
+            // because tools turns are clamped to think=false.
+            chars_puts(&inject,
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+            chars_free(&call_echo);
             chars_put(&inject, "", 0);
             chars_free(&result);
             tools_set_debug(0);
