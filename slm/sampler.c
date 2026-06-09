@@ -95,6 +95,7 @@ static int32_t topk_collect(const struct tensor * logits, int32_t k,
 // Softmax over `filled` candidates with temperature; writes the
 // normalized probability into `val` (replacing logits).
 static void topk_softmax(float * val, int32_t filled, float temperature) {
+    assert(filled > 0); // topk_collect fills >=1 over a non-empty vocabulary
     float m = val[0];
     for (int32_t j = 1; j < filled; j++) {
         if (val[j] > m) { m = val[j]; }
